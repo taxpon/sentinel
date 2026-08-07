@@ -53,5 +53,5 @@ restates.
 
 ## Related
 
-- [`README.md`](../README.md) — project summary and quick start
+- `README.md` — project summary and quick start (not written yet; task T44)
 - [Devin API reference](https://docs.devin.ai/api-reference/overview) — upstream source for every API claim in [05](./05-devin-integration.md)
