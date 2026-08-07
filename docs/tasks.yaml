@@ -1,0 +1,549 @@
+# Sentinel implementation task graph — the single source of truth for the work breakdown.
+#
+# Consumed by:
+#   - scripts/seed_issues.py        creates and updates the GitHub task issues
+#   - .claude/hooks/session-init.sh reports ready-to-start tasks at session start
+#   - docs/implementation-plan.md   the human-readable view of this file
+#
+# Rules
+#   - `depends_on` means "that task's PR is merged", not "started".
+#   - Tasks in the same wave are independent of each other and may run in parallel.
+#   - `owns` is exclusive: a task must not modify files owned by another task.
+#   - `adrs` links decision records; keep in sync with docs/adr/ front matter.
+
+meta:
+  repo: taxpon/sentinel
+  target_repo: taxpon/superset
+  target_base_branch: master
+
+areas:
+  - ops
+  - data
+  - devin
+  - github
+  - pipeline
+  - api
+  - analytics
+  - dashboard
+  - remediation
+
+tasks:
+  # ---------------------------------------------------------------- wave 0
+  - id: T01
+    title: Repository scaffolding and tooling
+    wave: 0
+    area: ops
+    spec: docs/09-operations.md#configuration
+    owns:
+      - pyproject.toml
+      - Makefile
+      - Dockerfile
+      - .dockerignore
+      - docker-compose.yml
+      - .env.example
+    depends_on: []
+    adrs: []
+    notes: >-
+      Sets up uv, ruff, mypy, pytest, and the three-service Compose topology
+      (api / worker / poller / db). Everything else branches from this, so keep
+      it small and merge it first.
+
+  - id: T02
+    title: Configuration module
+    wave: 0
+    area: ops
+    spec: docs/09-operations.md#configuration
+    owns:
+      - src/sentinel/config.py
+      - tests/test_config.py
+    depends_on: [T01]
+    adrs: []
+    notes: pydantic-settings. Every variable in the operations table, with the documented defaults.
+
+  - id: T03
+    title: Database layer, models and initial migration
+    wave: 0
+    area: data
+    spec: docs/03-data-model.md
+    owns:
+      - src/sentinel/db.py
+      - src/sentinel/models.py
+      - alembic.ini
+      - alembic/
+    depends_on: [T02]
+    adrs: [2026-08-07-transitions-are-append-only-events]
+    notes: >-
+      Sole owner of alembic/versions — creates exactly one initial migration.
+      Later tasks needing schema changes must coordinate through this issue.
+
+  - id: T04
+    title: Test harness and fixtures
+    wave: 0
+    area: ops
+    spec: docs/08-testing.md#orchestrator-tests
+    owns:
+      - tests/conftest.py
+      - tests/factories.py
+      - tests/fixtures/github/
+    depends_on: [T03]
+    adrs: []
+    notes: >-
+      Real Postgres from Compose (SKIP LOCKED cannot be emulated by SQLite),
+      respx fixtures, httpx ASGITransport client, recorded GitHub payloads.
+
+  - id: T05
+    title: CI workflow for this repository
+    wave: 0
+    area: ops
+    spec: docs/08-testing.md#ci-for-this-repository
+    owns:
+      - .github/workflows/ci.yml
+    depends_on: [T01]
+    adrs: []
+    notes: >-
+      ruff, mypy, pytest on a Postgres service, dashboard build and tests,
+      compose config validation. Also enforces P1: a change under src/sentinel/**
+      must come with a change under tests/**.
+
+  - id: T06
+    title: Claude Code collaboration setup
+    wave: 0
+    area: ops
+    spec: docs/implementation-plan.md#parallel-sessions
+    owns:
+      - CLAUDE.md
+      - .claude/settings.json
+      - .claude/hooks/
+      - .claude/rules/
+      - .claude/commands/
+      - .github/pull_request_template.md
+    depends_on: [T01]
+    adrs: [2026-08-07-enforce-workflow-with-hooks]
+    notes: >-
+      SessionStart hook injects live task state; PreToolUse hook blocks
+      `gh pr create` without a fresh review marker.
+
+  - id: T07
+    title: ADR framework, generated index and back-filled decisions
+    wave: 0
+    area: ops
+    spec: docs/adr/index.md
+    owns:
+      - docs/adr/
+      - scripts/gen_adr_index.py
+    depends_on: []
+    adrs: []
+    notes: >-
+      Also adds links from the Design decisions table in docs/02-architecture.md
+      to the corresponding ADRs.
+
+  # ---------------------------------------------------------------- wave 1
+  - id: T10
+    title: Webhook signature verification
+    wave: 1
+    area: github
+    spec: docs/06-event-pipeline.md#signature-verification
+    owns:
+      - src/sentinel/security/hmac.py
+      - tests/test_hmac.py
+    depends_on: [T01]
+    adrs: []
+    notes: Pure function over raw bytes. Constant-time compare. Known-vector tests.
+
+  - id: T11
+    title: Devin API v3 client
+    wave: 1
+    area: devin
+    spec: docs/05-devin-integration.md#endpoints-used
+    owns:
+      - src/sentinel/devin/client.py
+      - src/sentinel/devin/schemas.py
+      - tests/test_devin_client.py
+    depends_on: [T02, T04]
+    adrs: [2026-08-07-devin-v3-only]
+    notes: >-
+      v3 endpoints only. Tests must assert the captured request body, not just
+      that a call was made — the tag set and structured_output_schema are part
+      of the contract reviewers verify.
+
+  - id: T12
+    title: GitHub API client
+    wave: 1
+    area: github
+    spec: docs/06-event-pipeline.md#subscribed-events
+    owns:
+      - src/sentinel/github/client.py
+      - tests/test_github_client.py
+    depends_on: [T02, T04]
+    adrs: []
+    notes: Issues, comments, labels, pull requests, check runs and job logs. Never merges.
+
+  - id: T13
+    title: Postgres-backed job queue
+    wave: 1
+    area: pipeline
+    spec: docs/06-event-pipeline.md#jobs-and-claiming
+    owns:
+      - src/sentinel/queue.py
+      - tests/test_queue.py
+    depends_on: [T03, T04]
+    adrs: [2026-08-07-postgres-as-job-queue]
+    notes: FOR UPDATE SKIP LOCKED claiming, lease reclaim, exponential backoff with jitter.
+
+  - id: T14
+    title: Remediation state machine
+    wave: 1
+    area: pipeline
+    spec: docs/04-state-machine.md
+    owns:
+      - src/sentinel/pipeline/state.py
+      - tests/test_state.py
+    depends_on: [T01]
+    adrs: []
+    notes: >-
+      Pure and table-driven. Illegal transitions raise. Terminal states absorb
+      late webhooks. Tests iterate the full transition matrix.
+
+  - id: T15
+    title: Playbooks, prompts and structured output schema
+    wave: 1
+    area: devin
+    spec: docs/05-devin-integration.md#structured-output
+    owns:
+      - src/sentinel/devin/playbooks.py
+      - tests/test_playbooks.py
+    depends_on: [T01]
+    adrs: [2026-08-07-delegate-task-not-steps]
+    notes: >-
+      Per-class ACU caps and baseline hours, the JSON Schema, the prompt
+      template and the resume-message template.
+
+  - id: T16
+    title: Analytics computation
+    wave: 1
+    area: analytics
+    spec: docs/07-observability.md#metric-definitions
+    owns:
+      - src/sentinel/analytics/metrics.py
+      - tests/test_analytics.py
+    depends_on: [T03, T04]
+    adrs: []
+    notes: >-
+      Pure functions over seeded rows. Every metric in the definitions table,
+      with hand-computed expected values in the tests.
+
+  - id: T17
+    title: Structured logging and Prometheus metrics
+    wave: 1
+    area: ops
+    spec: docs/07-observability.md#logging
+    owns:
+      - src/sentinel/observability/logging.py
+      - src/sentinel/observability/prom.py
+      - tests/test_logging.py
+    depends_on: [T02]
+    adrs: []
+    notes: JSON lines keyed by the GitHub delivery id. Secrets must never be logged.
+
+  # ---------------------------------------------------------------- wave 2
+  - id: T20
+    title: Webhook event to intent mapping
+    wave: 2
+    area: github
+    spec: docs/06-event-pipeline.md#subscribed-events
+    owns:
+      - src/sentinel/github/events.py
+      - tests/test_events.py
+    depends_on: [T14, T04]
+    adrs: []
+    notes: Unknown events map to "ignored" and must never raise.
+
+  - id: T21
+    title: Policy — deduplication, concurrency and ACU budget
+    wave: 2
+    area: pipeline
+    spec: docs/06-event-pipeline.md#reliability-policy
+    owns:
+      - src/sentinel/policy/
+      - tests/test_policy.py
+    depends_on: [T03, T11, T13]
+    adrs: [2026-08-07-two-layer-deduplication]
+    notes: Deferral must not consume the retry budget. Budget exhaustion escalates rather than failing silently.
+
+  - id: T22
+    title: Webhook endpoint
+    wave: 2
+    area: api
+    spec: docs/06-event-pipeline.md#ingress-path
+    owns:
+      - src/sentinel/api/webhooks.py
+      - tests/test_webhooks.py
+    depends_on: [T10, T13, T20]
+    adrs: [2026-08-07-respond-202-before-external-calls]
+    notes: Exports a router; registration is owned by T26. No external call on the request path.
+
+  - id: T23
+    title: Worker and job handlers
+    wave: 2
+    area: pipeline
+    spec: docs/04-state-machine.md#transitions
+    owns:
+      - src/sentinel/pipeline/worker.py
+      - src/sentinel/pipeline/handlers.py
+      - tests/test_worker.py
+    depends_on: [T11, T12, T13, T14, T15, T21]
+    adrs: [2026-08-07-reuse-resumable-sessions]
+    notes: >-
+      Includes the review-fix loop: gather CI logs or review comments and resume
+      the existing session rather than creating a new one.
+
+  - id: T24
+    title: Devin session poller
+    wave: 2
+    area: pipeline
+    spec: docs/02-architecture.md#design-decisions
+    owns:
+      - src/sentinel/pipeline/poller.py
+      - tests/test_poller.py
+    depends_on: [T11, T14]
+    adrs: [2026-08-07-poller-drives-state-machine]
+    notes: Reconciliation must be idempotent and cover all seven Devin session statuses.
+
+  - id: T25
+    title: Analytics API
+    wave: 2
+    area: api
+    spec: docs/07-observability.md#analytics-api
+    owns:
+      - src/sentinel/api/analytics.py
+      - tests/test_analytics_api.py
+    depends_on: [T16]
+    adrs: []
+    notes: Response shape is already fixed in the spec; the dashboard is built against it.
+
+  - id: T26
+    title: Application wiring and health endpoint
+    wave: 2
+    area: api
+    spec: docs/02-architecture.md#runtime-processes
+    owns:
+      - src/sentinel/api/main.py
+      - src/sentinel/api/health.py
+      - src/sentinel/__main__.py
+      - tests/test_health.py
+    depends_on: [T22, T25, T17]
+    adrs: []
+    notes: Sole owner of router registration. Other tasks export routers only.
+
+  # ---------------------------------------------------------------- wave 3
+  - id: T30
+    title: Dashboard scaffold
+    wave: 3
+    area: dashboard
+    spec: docs/07-observability.md#dashboard
+    owns:
+      - dashboard/package.json
+      - dashboard/vite.config.ts
+      - dashboard/tsconfig.json
+      - dashboard/index.html
+      - dashboard/src/main.tsx
+      - dashboard/src/App.tsx
+      - dashboard/src/api.ts
+      - dashboard/src/theme.css
+    depends_on: [T01]
+    adrs: []
+    ui: true
+    notes: >-
+      Buildable against the API contract in the spec, before T25 exists.
+      Includes the 5-second polling loop and the freshness indicator.
+
+  - id: T31
+    title: Dashboard — KPI row, funnel and throughput
+    wave: 3
+    area: dashboard
+    spec: docs/07-observability.md#dashboard
+    owns:
+      - dashboard/src/panels/Kpi.tsx
+      - dashboard/src/panels/Funnel.tsx
+      - dashboard/src/panels/Throughput.tsx
+    depends_on: [T30]
+    adrs: []
+    ui: true
+
+  - id: T32
+    title: Dashboard — durations, cost, autonomy and failures
+    wave: 3
+    area: dashboard
+    spec: docs/07-observability.md#dashboard
+    owns:
+      - dashboard/src/panels/Durations.tsx
+      - dashboard/src/panels/Cost.tsx
+      - dashboard/src/panels/Autonomy.tsx
+      - dashboard/src/panels/Failures.tsx
+    depends_on: [T30]
+    adrs: []
+    ui: true
+    notes: The cost panel must show whether the figure came from Devin or was derived locally.
+
+  - id: T33
+    title: Dashboard — live remediation table and timeline
+    wave: 3
+    area: dashboard
+    spec: docs/07-observability.md#dashboard
+    owns:
+      - dashboard/src/panels/LiveTable.tsx
+      - dashboard/src/panels/Timeline.tsx
+    depends_on: [T30]
+    adrs: []
+    ui: true
+    notes: Every row links to both the Devin session and the pull request.
+
+  - id: T34
+    title: End-to-end test including the review-fix loop
+    wave: 3
+    area: pipeline
+    spec: docs/08-testing.md#orchestrator-tests
+    owns:
+      - tests/test_e2e.py
+    depends_on: [T23, T24, T26]
+    adrs: []
+    notes: >-
+      label -> job -> fake Devin -> PR -> CI failure -> resume with cycle:1 ->
+      CI success -> merged, then assert the analytics response.
+
+  # ---------------------------------------------------------------- wave 4
+  - id: T40
+    title: Devin bootstrap script
+    wave: 4
+    area: devin
+    spec: docs/09-operations.md#bootstrap
+    owns:
+      - scripts/bootstrap_devin.py
+      - tests/test_bootstrap_devin.py
+    depends_on: [T11, T15]
+    adrs: []
+    notes: >-
+      Registers the tag vocabulary, seeds knowledge notes, creates the nightly
+      schedule, and probes which enterprise-scoped endpoints are reachable so
+      the degradation path is known before the demo (B5, B6, B7).
+
+  - id: T41
+    title: GitHub bootstrap script
+    wave: 4
+    area: github
+    spec: docs/09-operations.md#bootstrap
+    owns:
+      - scripts/bootstrap_github.py
+      - tests/test_bootstrap_github.py
+    depends_on: [T12]
+    adrs: []
+    notes: Enables issues on the fork (B1), creates labels, registers the webhook.
+
+  - id: T42
+    title: Lightweight CI workflow on the fork
+    wave: 4
+    area: remediation
+    spec: docs/08-testing.md#ci-on-the-fork
+    owns:
+      - "taxpon/superset:.github/workflows/devin-autofix-ci.yml"
+    depends_on: []
+    adrs: [2026-08-07-scoped-ci-on-the-fork]
+    notes: >-
+      Lives in the fork, not this repository. Also opens one throwaway PR to
+      register the fork's workflows (B2).
+
+  - id: T43
+    title: Vulnerability scanner that files issues
+    wave: 4
+    area: remediation
+    spec: docs/05-devin-integration.md#scheduled-sweep
+    owns:
+      - src/sentinel/scanner/audit.py
+      - tests/test_scanner.py
+    depends_on: [T12]
+    adrs: []
+    notes: Must not open duplicates for findings already tracked.
+
+  - id: T44
+    title: README
+    wave: 4
+    area: ops
+    spec: docs/index.md
+    owns:
+      - README.md
+    depends_on: [T26, T34]
+    adrs: []
+    notes: >-
+      Architecture summary, quick start, and an explicit statement that pull
+      requests are merged within the fork rather than upstream (B10).
+
+  # ---------------------------------------------------------------- wave 5
+  - id: T50
+    title: Triage Superset and select eight remediation targets
+    wave: 5
+    area: remediation
+    spec: docs/01-overview.md#issue-classes
+    owns:
+      - docs/remediation-candidates.md
+    depends_on: []
+    adrs: []
+    notes: >-
+      Independent of the orchestrator — start this in parallel with T01.
+      At least six distinct classes, at least two requiring real diagnosis
+      rather than a version bump.
+
+  - id: T51
+    title: File the eight remediation issues on the fork
+    wave: 5
+    area: remediation
+    spec: docs/01-overview.md#issue-classes
+    owns: []
+    depends_on: [T50, T41]
+    adrs: []
+
+  - id: T52
+    title: Execute and monitor the remediation runs
+    wave: 5
+    area: remediation
+    spec: docs/09-operations.md#demo-runbook
+    owns:
+      - docs/run-log.md
+    depends_on: [T51, T34, T40]
+    adrs: []
+    notes: >-
+      Blocked on Devin credentials (B8). Record stalls and failures rather than
+      cleaning them up — the audit trail is part of the deliverable.
+
+  - id: T53
+    title: Calibrate ACU caps from measured runs
+    wave: 5
+    area: devin
+    spec: docs/05-devin-integration.md#playbooks-and-acu-caps
+    owns: []
+    depends_on: [T52]
+    adrs: []
+    notes: Resolves B11. Updates the provisional caps in the spec with measured values.
+
+  # ---------------------------------------------------------------- wave 6
+  - id: T60
+    title: Pre-publication audit and make the repository public
+    wave: 6
+    area: ops
+    spec: docs/09-operations.md#before-making-the-repository-public
+    owns: []
+    depends_on: [T44]
+    adrs: []
+    notes: Resolves B12 and B13. Audit the whole history, not just the working tree.
+
+  - id: T61
+    title: Presentation structure and script
+    wave: 6
+    area: ops
+    spec: docs/01-overview.md
+    owns:
+      - docs/presentation.md
+    depends_on: [T52]
+    adrs: []
+    notes: >-
+      Quantified business impact, the explicit "why Devin" argument, and an
+      honest account of what stalled or was not remediated.

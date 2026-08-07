@@ -1,0 +1,32 @@
+# Assignment brief and personal notes — must never be published
+requirements/
+CLAUDE.local.md
+
+# Local-only Claude Code settings. The rest of .claude/ is committed on purpose:
+# hooks, rules and commands are how parallel sessions stay coordinated.
+.claude/settings.local.json
+
+# Pre-PR review markers (see .claude/hooks/guard-pr-create.sh)
+.sentinel-review/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+dashboard/dist/
+
+# OS
+.DS_Store

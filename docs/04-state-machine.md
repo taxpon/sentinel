@@ -1,0 +1,125 @@
+# Remediation lifecycle
+
+> **Status:** Design · **Answers:** What states can a remediation be in, what moves it between them, and how does the review-fix loop work?
+
+## States
+
+```mermaid
+stateDiagram-v2
+    [*] --> QUEUED
+    QUEUED --> SESSION_CREATED
+    SESSION_CREATED --> RUNNING
+    RUNNING --> PR_OPENED
+    PR_OPENED --> CI_RUNNING
+    CI_RUNNING --> CI_FAILED
+    CI_RUNNING --> CI_PASSED
+    CI_FAILED --> RUNNING : resume, cycle + 1
+    CI_PASSED --> IN_REVIEW
+    IN_REVIEW --> CHANGES_REQUESTED
+    CHANGES_REQUESTED --> RUNNING : resume, cycle + 1
+    IN_REVIEW --> MERGED
+    QUEUED --> BLOCKED
+    RUNNING --> BLOCKED
+    CI_FAILED --> FAILED
+    CHANGES_REQUESTED --> FAILED
+    RUNNING --> FAILED
+    MERGED --> [*]
+    BLOCKED --> [*]
+    FAILED --> [*]
+```
+
+| State | Meaning |
+|---|---|
+| `QUEUED` | Issue accepted, job enqueued, no Devin session yet |
+| `SESSION_CREATED` | Devin session exists; work has not been observed starting |
+| `RUNNING` | Devin is working (session status `running`/`claimed`/`resuming`) |
+| `PR_OPENED` | A pull request attributable to this remediation exists |
+| `CI_RUNNING` | A check suite is in progress on the head SHA |
+| `CI_FAILED` | The check suite failed — the loop trigger |
+| `CI_PASSED` | All required checks green |
+| `IN_REVIEW` | Awaiting human review |
+| `CHANGES_REQUESTED` | A reviewer requested changes — the second loop trigger |
+| `MERGED` | **Terminal, success.** |
+| `BLOCKED` | **Terminal.** Devin reported it cannot proceed, or a policy limit stopped us. Escalated to a human. |
+| `FAILED` | **Terminal.** Session errored, or the cycle limit was exhausted. |
+
+## Transitions
+
+| From | To | Trigger | Side effects |
+|---|---|---|---|
+| — | `QUEUED` | `issues.labeled` with `devin:autofix` | Create `remediation`, enqueue `create_session` |
+| `QUEUED` | `SESSION_CREATED` | Worker created the session | `POST /v3/…/sessions`; store `devin_session_id`, `session_created_at` |
+| `QUEUED` | `BLOCKED` | Daily ACU budget exhausted, or issue class unrecognised | Comment on issue, add `needs-human` |
+| `SESSION_CREATED` | `RUNNING` | Poller sees status `running` | — |
+| `RUNNING` | `PR_OPENED` | `pull_request.opened` from Devin's bot, or `pull_requests[]` on the session | Link PR to remediation, set `pr_opened_at` |
+| `PR_OPENED` | `CI_RUNNING` | `check_suite.requested` on the head SHA | — |
+| `CI_RUNNING` | `CI_PASSED` | `check_suite.completed`, conclusion `success` | Set `ci_green_at` |
+| `CI_RUNNING` | `CI_FAILED` | `check_suite.completed`, conclusion `failure`/`timed_out` | Enqueue `resume_session` |
+| **`CI_FAILED`** | **`RUNNING`** | Worker resumed the session | Fetch failing job logs, `POST /v3/…/messages`, increment `cycle`, append tag `cycle:N` |
+| `CI_PASSED` | `IN_REVIEW` | Entering `CI_PASSED` | Request review; post the structured-output summary as a PR comment |
+| `IN_REVIEW` | `CHANGES_REQUESTED` | `pull_request_review.submitted`, state `changes_requested` | Enqueue `resume_session` |
+| **`CHANGES_REQUESTED`** | **`RUNNING`** | Worker resumed the session | Forward review body and inline comments via `POST /v3/…/messages`, increment `cycle` |
+| `IN_REVIEW` | `MERGED` | `pull_request.closed` with `merged: true` | Set `merged_at`, append tag `outcome:merged`, close the issue |
+| any | `BLOCKED` | `structured_output.outcome == "blocked"` | Store `blocked_reason`, comment on issue, add `needs-human` |
+| any | `FAILED` | Session status `error`, ACU cap hit, or `cycle > MAX_FIX_CYCLES` | Store reason, comment on issue, add `needs-human` |
+
+## The review-fix loop
+
+The two loop edges — `CI_FAILED → RUNNING` and `CHANGES_REQUESTED → RUNNING` — are the substance of
+the system. They reuse the **existing** session (`resumable: true`) so Devin retains the context of
+its own change instead of rediscovering it.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant GH as GitHub
+    participant API as api
+    participant W as worker
+    participant D as Devin session
+
+    GH->>API: check_suite.completed — failure
+    API->>API: resolve head SHA to remediation
+    alt cycle >= MAX_FIX_CYCLES
+        API->>GH: comment + needs-human label
+        Note over API: state = FAILED
+    else
+        API->>W: enqueue resume_session
+        W->>GH: fetch failing jobs and log excerpt
+        W->>D: POST /v3/.../sessions/{id}/messages
+        Note right of W: "CI failed on <sha>.<br/>Failing job: <name>.<br/>Excerpt: <log>.<br/>Diagnose and push a fix."
+        W->>D: POST /v3/.../sessions/{id}/tags — cycle:N
+        Note over W: state = RUNNING, cycle + 1
+        D->>GH: push fix commit
+        GH->>API: check_suite.completed — success
+        Note over API: state = CI_PASSED
+    end
+```
+
+The message states the failure and the goal; it does not prescribe the fix. Steering Devin
+line-by-line would defeat the purpose and is explicitly avoided ([05](./05-devin-integration.md)).
+
+## Invariants
+
+1. **Terminal states are absorbing.** No transition leaves `MERGED`, `BLOCKED` or `FAILED`. A
+   webhook arriving after a terminal state is recorded in `remediation_event` and otherwise ignored.
+2. **One session per remediation.** Guaranteed by `UNIQUE (repo, issue_number)` plus
+   `INSERT … ON CONFLICT DO NOTHING` ([03](./03-data-model.md)).
+3. **`cycle` only increases,** and only on a transition into `RUNNING` from `CI_FAILED` or
+   `CHANGES_REQUESTED`. `cycle > MAX_FIX_CYCLES` forces `FAILED`.
+4. **Every transition writes exactly one `remediation_event`,** in the same transaction as the
+   state column update. The log can never disagree with the column.
+5. **Illegal transitions raise** rather than silently no-op, and are asserted in the test matrix
+   ([08](./08-testing.md)).
+
+## Escalation
+
+`BLOCKED` and `FAILED` both escalate rather than terminate quietly:
+
+- a comment on the originating issue containing Devin's `blocked_reason` or the policy reason, plus
+  a link to the session;
+- the `needs-human` label;
+- the remediation stays visible on the dashboard's failure-breakdown panel
+  ([07](./07-observability.md)).
+
+Escalated work is **not** deleted or retried automatically. An unresolved item is a real signal
+about the system's limits and is reported as such.

@@ -1,0 +1,117 @@
+# Observability
+
+> **Status:** Design · **Answers:** How is each metric defined, and what does the dashboard actually tell an engineering leader?
+
+The question this has to answer is *"if I were an engineering leader, how would I know this is
+working?"* — which a count of sessions does not answer. Every panel below is chosen because a
+leader would act differently depending on its value.
+
+## Metric definitions
+
+All figures derive from `remediation` and the append-only `remediation_event` log
+([03](./03-data-model.md)), scoped to a time window on `labeled_at`.
+
+| Metric | Definition | Why a leader cares |
+|---|---|---|
+| **Funnel** | Counts at each stage: labelled → session created → PR opened → CI green → merged | Shows *where* work is lost, not just that it was |
+| **Success rate** | `merged / labelled` | End-to-end effectiveness |
+| **Merge rate** | `merged / pr_opened` | Quality of what the agent produces, isolated from whether it produced anything |
+| **Time to PR** | percentile of `pr_opened_at − labeled_at`, p50 and p90 | How fast the backlog starts moving |
+| **MTTR** | percentile of `merged_at − labeled_at`, p50 and p90 | The headline number: issue to fix in production-ready form |
+| **Review latency** | percentile of `merged_at − ci_green_at` | Isolates the new bottleneck — human review, not implementation |
+| **Throughput** | merged per day, split by `issue_class` | Sustained capacity, and whether it is concentrated in one easy class |
+| **ACU spend** | `sum(acus_consumed)`, and daily series from `acu_ledger` | Run cost |
+| **ACU per merged fix** | `sum(acus_consumed) / merged` | Unit economics; the number that must fall over time |
+| **Cost per fix** | ACU per merged fix × `ACU_UNIT_COST_USD` | Directly comparable to engineer cost |
+| **Fix cycles** | mean count of `remediation_event` rows where `to_state = RUNNING` and `from_state ∈ {CI_FAILED, CHANGES_REQUESTED}` | How much self-correction each fix needed |
+| **Autonomy rate** | `merged with cycle = 0 and human_message_count = 0 / merged` | Share needing no human intervention at all — the delegation signal |
+| **Failure breakdown** | count grouped by `blocked_reason`, for `state ∈ {BLOCKED, FAILED}` | Where the system's limits actually are |
+| **Engineer-hours saved** | `Σ (baseline_hours[class] × merged_in_class)` | Business impact — a **stated assumption**, labelled as such |
+
+Two deliberate choices:
+
+- **Merge rate is separate from success rate.** Together they distinguish "the agent rarely
+  finishes" from "the agent finishes but the work is not mergeable" — different problems with
+  different fixes.
+- **Blocked is not hidden.** Escalations appear as their own funnel outcome and their own panel.
+  A system that hides its failures cannot be evaluated.
+
+## Analytics API
+
+`GET /api/analytics/summary?window=7d` — everything the dashboard needs in one response.
+
+```jsonc
+{
+  "window": { "from": "2026-08-01T00:00:00Z", "to": "2026-08-08T00:00:00Z" },
+  "funnel": { "labelled": 8, "session_created": 8, "pr_opened": 7, "ci_green": 6, "merged": 5 },
+  "rates":  { "success": 0.625, "merge": 0.714, "autonomy": 0.60 },
+  "durations_seconds": {
+    "to_pr":          { "p50": 1980, "p90": 3600 },
+    "to_merge":       { "p50": 6480, "p90": 14400 },
+    "review_latency": { "p50": 2700, "p90": 7200 }
+  },
+  "cost": {
+    "acus_total": 61.4,
+    "acus_per_merged_fix": 12.3,
+    "usd_per_fix": 27.6,
+    "unit_cost_usd": 2.25,
+    "source": "devin_consumption_api"     // or "derived" when the fallback is in use
+  },
+  "cycles": { "mean": 0.8, "distribution": { "0": 3, "1": 1, "2": 1 } },
+  "throughput": [ { "day": "2026-08-06", "by_class": { "security": 1, "flaky-test": 1 } } ],
+  "failures":  [ { "reason": "requires_upstream_decision", "count": 1, "issues": [37] } ],
+  "impact":    { "hours_saved": 21.0, "assumption": "baseline hours per issue class; see docs/05" },
+  "generated_at": "2026-08-08T04:12:03Z"
+}
+```
+
+Supporting endpoints:
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/remediations` | Live table rows: state, class, cycle, ACUs, elapsed, Devin session URL, PR URL |
+| `GET /api/remediations/{id}` | Full `remediation_event` timeline for one remediation |
+| `GET /metrics` | Prometheus exposition — job queue depth, poller lag, Devin API latency and error rate |
+| `GET /healthz` | Liveness, plus `acu_ledger.synced_at` age |
+
+`cost.source` is surfaced deliberately: the reader can always tell which numbers came from Devin
+and which Sentinel derived when an enterprise-scoped endpoint was unavailable
+([05](./05-devin-integration.md)).
+
+## Dashboard
+
+React + Vite SPA served by `api`, polling `/api/analytics/summary` and `/api/remediations` every
+5 seconds. Freshness is shown explicitly — `generated_at` rendered as "updated Ns ago", turning
+amber past 30 s. A dashboard that only updates when someone re-runs a script is not observability.
+
+| Panel | Question it answers |
+|---|---|
+| KPI row — success rate, merge rate, MTTR p50, cost per fix | Is this working, and what does it cost? |
+| Funnel | Where does work stop? |
+| Throughput by day, stacked by class | Is capacity sustained, and is it spread across real problem types? |
+| Duration distribution — to-PR vs to-merge vs review latency | Where is the time going now? |
+| Autonomy — cycle distribution and intervention rate | How much human attention does each fix still need? |
+| Cost — ACU per fix over time | Are the unit economics improving? |
+| **Failure breakdown** | What can it *not* do? |
+| Impact — hours saved, with the assumption stated inline | What is this worth? |
+| Live remediation table | What is happening right now, and where do I click to verify it? |
+
+Every row in the live table links to both the Devin session and the pull request, so any claim on
+the dashboard can be independently checked at source.
+
+Layout constraints: one screen at 1440px without scrolling to reach the KPI row; no chart taller
+than 240px; a single accent colour with class colours reserved for the stacked series.
+
+## Logging
+
+Structured JSON to stdout, one event per line.
+
+```jsonc
+{ "ts": "…", "level": "info", "event": "devin.session.created",
+  "run": "8f1c…", "remediation_id": 12, "issue": 42, "class": "security",
+  "session_id": "devin-…", "duration_ms": 812 }
+```
+
+`run` is the GitHub delivery id, the same value carried as the `run:` Devin tag
+([06](./06-event-pipeline.md)) — one identifier joins GitHub, Sentinel and the Devin dashboard.
+Tokens and webhook secrets are never logged, at any level.
