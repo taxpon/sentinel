@@ -12,6 +12,7 @@ question. See [when to write one](../implementation-plan.md#adrs).
 
 | Date | Decision | Type | Status | Areas |
 |---|---|---|---|---|
+| 2026-08-07 | [Manage dependencies with uv and a committed lock file](./2026-08-07-uv-for-dependencies-and-the-image.md) | process | accepted | ops |
 | 2026-08-07 | [Deduplicate at both the delivery and the remediation layer](./2026-08-07-two-layer-deduplication.md) | architecture | accepted | pipeline, data |
 | 2026-08-07 | [Record every state transition as an append-only event](./2026-08-07-transitions-are-append-only-events.md) | architecture | accepted | data, analytics |
 | 2026-08-07 | [Keep the task graph in one machine-readable file](./2026-08-07-tasks-yaml-single-source.md) | process | accepted | ops |
@@ -33,7 +34,7 @@ question. See [when to write one](../implementation-plan.md#adrs).
 - **api** — [Acknowledge webhooks with 202 before making any external call](./2026-08-07-respond-202-before-external-calls.md)
 - **data** — [Use Postgres as the job queue instead of adding Redis](./2026-08-07-postgres-as-job-queue.md), [Record every state transition as an append-only event](./2026-08-07-transitions-are-append-only-events.md), [Deduplicate at both the delivery and the remediation layer](./2026-08-07-two-layer-deduplication.md)
 - **devin** — [Give Devin the objective and constraints, not the steps](./2026-08-07-delegate-task-not-steps.md), [Use the Devin v3 API exclusively](./2026-08-07-devin-v3-only.md), [Resume the existing Devin session on CI failure rather than starting a new one](./2026-08-07-reuse-resumable-sessions.md)
-- **ops** — [Enforce the pre-PR review step with a hook, not with CLAUDE.md alone](./2026-08-07-enforce-workflow-with-hooks.md), [Write every artifact in English, regardless of the working language](./2026-08-07-english-for-artifacts.md), [Isolate parallel sessions with git worktrees and exclusive file ownership](./2026-08-07-parallel-sessions-via-worktrees.md), [Keep the task graph in one machine-readable file](./2026-08-07-tasks-yaml-single-source.md)
+- **ops** — [Enforce the pre-PR review step with a hook, not with CLAUDE.md alone](./2026-08-07-enforce-workflow-with-hooks.md), [Write every artifact in English, regardless of the working language](./2026-08-07-english-for-artifacts.md), [Isolate parallel sessions with git worktrees and exclusive file ownership](./2026-08-07-parallel-sessions-via-worktrees.md), [Keep the task graph in one machine-readable file](./2026-08-07-tasks-yaml-single-source.md), [Manage dependencies with uv and a committed lock file](./2026-08-07-uv-for-dependencies-and-the-image.md)
 - **pipeline** — [Drive the remediation state machine from a poller, not from Devin callbacks](./2026-08-07-poller-drives-state-machine.md), [Use Postgres as the job queue instead of adding Redis](./2026-08-07-postgres-as-job-queue.md), [Resume the existing Devin session on CI failure rather than starting a new one](./2026-08-07-reuse-resumable-sessions.md), [Deduplicate at both the delivery and the remediation layer](./2026-08-07-two-layer-deduplication.md)
 - **remediation** — [Require human approval for every merge](./2026-08-07-humans-approve-every-merge.md), [Add a narrow CI workflow to the fork instead of running Superset full suite](./2026-08-07-scoped-ci-on-the-fork.md)
 
@@ -43,7 +44,9 @@ Look up your task id before starting work.
 
 | Task | Decisions that constrain it |
 |---|---|
+| T01 | [Manage dependencies with uv and a committed lock file](./2026-08-07-uv-for-dependencies-and-the-image.md) |
 | T03 | [Record every state transition as an append-only event](./2026-08-07-transitions-are-append-only-events.md) |
+| T05 | [Manage dependencies with uv and a committed lock file](./2026-08-07-uv-for-dependencies-and-the-image.md) |
 | T06 | [Enforce the pre-PR review step with a hook, not with CLAUDE.md alone](./2026-08-07-enforce-workflow-with-hooks.md) |
 | T11 | [Use the Devin v3 API exclusively](./2026-08-07-devin-v3-only.md) |
 | T13 | [Use Postgres as the job queue instead of adding Redis](./2026-08-07-postgres-as-job-queue.md) |

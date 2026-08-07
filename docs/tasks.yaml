@@ -36,17 +36,22 @@ tasks:
     spec: docs/09-operations.md#configuration
     owns:
       - pyproject.toml
+      - uv.lock
+      - .python-version
       - Makefile
       - Dockerfile
       - .dockerignore
       - docker-compose.yml
       - .env.example
+      - src/sentinel/__init__.py
+      - tests/test_env_example.py
     depends_on: []
-    adrs: []
+    adrs: [2026-08-07-uv-for-dependencies-and-the-image]
     notes: >-
       Sets up uv, ruff, mypy, pytest, and the three-service Compose topology
       (api / worker / poller / db). Everything else branches from this, so keep
-      it small and merge it first.
+      it small and merge it first. tests/test_env_example.py holds .env.example
+      and the configuration table in docs/09-operations.md to each other.
 
   - id: T02
     title: Configuration module
@@ -117,6 +122,8 @@ tasks:
       - .claude/rules/
       - .claude/commands/
       - .github/pull_request_template.md
+      - scripts/session_context.py
+      - scripts/seed_issues.py
     depends_on: [T01]
     adrs: [2026-08-07-enforce-workflow-with-hooks]
     notes: >-
