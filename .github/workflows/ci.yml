@@ -27,7 +27,6 @@ jobs:
       - run: make install
       - run: make lint
       - run: make typecheck
-      - run: make adr-check
 
   test:
     name: Tests
@@ -124,5 +123,27 @@ jobs:
           if grep -q '^src/sentinel/' "$RUNNER_TEMP/changed.txt" \
             && ! grep -q '^tests/' "$RUNNER_TEMP/changed.txt"; then
             echo "::error title=Missing tests::This pull request changes src/sentinel/ without changing anything under tests/. Every change to the orchestrator ships with the tests for it (CLAUDE.md, rule 1)."
+            exit 1
+          fi
+
+  generated-files-untouched:
+    name: Generated files are left to main
+    # docs/adr/index.md and .claude/rules/adr-pointers.md are regenerated on main by
+    # adr-index.yml. A branch that also edits them re-creates the conflict this arrangement
+    # exists to remove, so the rule is enforced rather than written down.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Diff the pull request against its base
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          changed=$(git diff --name-only "$BASE_SHA" HEAD)
+          echo "$changed"
+          if echo "$changed" | grep -qE '^(docs/adr/index\.md|\.claude/rules/adr-pointers\.md)$'; then
+            echo "::error title=Generated file edited::docs/adr/index.md and .claude/rules/adr-pointers.md are regenerated on main after this merges. Revert them on this branch: git checkout origin/main -- docs/adr/index.md .claude/rules/adr-pointers.md"
             exit 1
           fi
