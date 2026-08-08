@@ -33,6 +33,11 @@ function tile(label: string): HTMLElement {
   return screen.getByRole('group', { name: label })
 }
 
+/** A tile's lines, so an assertion can say which line a claim was attached to. */
+function tileLines(label: string): string[] {
+  return [...tile(label).querySelectorAll('p')].map((line) => line.textContent ?? '')
+}
+
 describe('the panel contract', () => {
   it('mounts into the KPI slot with a title', () => {
     expect(slot).toBe('kpi')
@@ -79,19 +84,37 @@ describe('the four figures', () => {
     expect(tile('MTTR p50')).not.toHaveTextContent('33m')
   })
 
-  it('shows cost per fix in dollars, with the ACU figure and the provenance behind it', () => {
+  it('shows cost per fix in dollars, over the ACU figure it was priced from', () => {
     render(<Kpi state={ready(summaryFixture)} />)
 
-    expect(tile('Cost per fix')).toHaveTextContent('$27.60')
-    expect(tile('Cost per fix')).toHaveTextContent('12.3 ACU per fix')
-    expect(tile('Cost per fix')).toHaveTextContent('from Devin')
+    expect(tileLines('Cost per fix')).toEqual([
+      'Cost per fix',
+      '$27.60',
+      '12.3 ACU per fix from Devin',
+      'priced locally at $2.25 per ACU',
+    ])
   })
 
-  it('labels a cost Sentinel derived rather than one Devin reported', () => {
+  it('attributes only the ACU count to Devin, never the dollars', () => {
+    // `cost.source` says where the ACU figure came from and nothing else: the dollars are always
+    // acus × ACU_UNIT_COST_USD, and docs/09-operations.md has that constant set from the reader's
+    // own contract. A provenance badge on the dollar line would be a claim Devin never made — and
+    // one the cost panel contradicts on the same screen.
+    render(<Kpi state={ready(summaryFixture)} />)
+
+    const lines = tileLines('Cost per fix')
+    expect(lines.filter((line) => line.includes('Devin'))).toEqual(['12.3 ACU per fix from Devin'])
+    expect(lines.filter((line) => line.includes('$27.60'))).toEqual(['$27.60'])
+    expect(lines).toContain('priced locally at $2.25 per ACU')
+  })
+
+  it('labels an ACU count Sentinel derived rather than one Devin reported', () => {
     render(<Kpi state={ready(busyWindowSummaryFixture)} />)
 
-    expect(tile('Cost per fix')).toHaveTextContent('derived by Sentinel')
+    expect(tile('Cost per fix')).toHaveTextContent('26.7 ACU per fix derived by Sentinel')
     expect(tile('Cost per fix')).not.toHaveTextContent('from Devin')
+    // The conversion is local whichever way the ACU count was obtained.
+    expect(tile('Cost per fix')).toHaveTextContent('priced locally at $2.25 per ACU')
   })
 })
 
@@ -134,8 +157,9 @@ describe('the empty window', () => {
     expect(tile('Merge rate')).toHaveTextContent('—')
     expect(tile('Merge rate')).toHaveTextContent('no pull requests opened')
     expect(tile('MTTR p50')).toHaveTextContent('—')
-    expect(tile('Cost per fix')).toHaveTextContent('—')
     expect(screen.getAllByText('nothing merged yet')).toHaveLength(2)
+    // Nothing was priced, so the tile does not explain a conversion it did not make.
+    expect(tileLines('Cost per fix')).toEqual(['Cost per fix', '—', 'nothing merged yet'])
   })
 
   it('shows no NaN, no Infinity and no blank tile', () => {

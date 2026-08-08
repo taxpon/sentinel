@@ -34,8 +34,16 @@ interface TileProps {
   label: string
   value: string
   caption: string
+  /** A second line, where one figure needs two sentences to be read honestly. */
+  note?: string
 }
 
+/**
+ * Where the *ACU count* came from. `cost.source` describes nothing else: the dollars are always
+ * `acus × ACU_UNIT_COST_USD`, and docs/09-operations.md has that constant set from the reader's own
+ * contract, so no dollar figure on this dashboard is ever Devin's. The label therefore attaches to
+ * the ACU line, and the tile states the conversion separately.
+ */
 function sourceLabel(source: CostSource): string {
   return source === 'devin_consumption_api' ? 'from Devin' : 'derived by Sentinel'
 }
@@ -87,18 +95,23 @@ function tiles(summary: AnalyticsSummary): TileProps[] {
       value: funnel.merged > 0 ? formatUsd(cost.usd_per_fix) : NO_VALUE,
       caption:
         funnel.merged > 0
-          ? `${formatNumber(cost.acus_per_merged_fix)} ACU per fix · ${sourceLabel(cost.source)}`
+          ? `${formatNumber(cost.acus_per_merged_fix)} ACU per fix ${sourceLabel(cost.source)}`
           : 'nothing merged yet',
+      note:
+        funnel.merged > 0
+          ? `priced locally at ${formatUsd(cost.unit_cost_usd)} per ACU`
+          : undefined,
     },
   ]
 }
 
-function Tile({ label, value, caption }: TileProps) {
+function Tile({ label, value, caption, note }: TileProps) {
   return (
     <div className="kpi-tile" role="group" aria-label={label}>
       <p style={LABEL}>{label}</p>
       <p style={VALUE}>{value}</p>
       <p style={CAPTION}>{caption}</p>
+      {note === undefined ? null : <p style={CAPTION}>{note}</p>}
     </div>
   )
 }

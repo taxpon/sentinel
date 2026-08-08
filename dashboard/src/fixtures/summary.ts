@@ -227,6 +227,10 @@ export const unmergedSummaryFixture: AnalyticsSummary = {
     { reason: 'max_fix_cycles_exceeded', count: 1, issues: [41] },
   ],
   impact: { hours_saved: 0, assumption: 'baseline hours per issue class; see docs/05' },
+  generated_at: '2026-08-08T04:12:03Z',
+}
+
+/**
  * A busier window (T31). Added because one payload cannot show a formatting or an ordering defect:
  * this one has durations that cross into days, a cost figure the API says is `derived`, and a
  * `throughput` series whose days arrive out of order and whose issue classes differ from day to
