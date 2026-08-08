@@ -30,9 +30,14 @@ one issue.
 
 ## Decision
 
-An absorbed observation writes nothing: no column, no `remediation_event`, no job. Only a transition
-whose `moved` is true is recorded, and it is recorded exactly once, in the same transaction as the
-column update.
+An absorbed trigger writes no `remediation_event` and no job. Only a transition whose `moved` is
+true is recorded, and it is recorded exactly once, in the same transaction as the column update.
+
+The observed columns are a separate matter and are reconciled on every tick, moved or not.
+`devin_status`, `devin_session_url`, `acus_consumed` and `structured_output` are the observation
+itself rather than a record of a change, and the row is what the dashboard reads and what the ACU
+cap is judged against. A column whose value is unchanged is not re-assigned, so a tick that saw
+nothing new still issues no `UPDATE`.
 
 The absorption itself still happens in `state.transition()` rather than in the poller. `PR_OPENED`
 is applied on every tick that sees `pull_requests[]`, and the state machine's
@@ -41,7 +46,10 @@ whether a pull request is already linked and skip the trigger, because that woul
 of a rule that has to stay identical to the first.
 
 Invariant 4 of [`04`](../04-state-machine.md) — "every transition writes exactly one
-`remediation_event`" — is unaffected: an absorbed trigger is not a transition.
+`remediation_event`" — is unaffected: an absorbed trigger is not a transition. The sentence in the
+review-fix loop section of that document which said a repeat *poller* observation "is recorded as an
+event and otherwise ignored" is amended in the same change, because it is the one this record
+overturns.
 
 ## Alternatives considered
 

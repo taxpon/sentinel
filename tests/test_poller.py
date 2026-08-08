@@ -26,13 +26,14 @@ from typing import Any
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from conftest import DEVIN_TOKEN, FakeAPI
-from factories import a_remediation
+from factories import ISSUE_CLASS, a_remediation
 from sentinel.config import Settings
 from sentinel.devin.client import SESSION, DevinClient
+from sentinel.devin.playbooks import acu_cap_for
 from sentinel.devin.schemas import SessionStatus
 from sentinel.models import Job, Remediation, RemediationEvent
 from sentinel.observability.prom import Metrics
@@ -53,17 +54,24 @@ REPORT: dict[str, Any] = {
     "risk": "low",
 }
 
-# What each of the seven Devin statuses leaves a remediation in, starting from `SESSION_CREATED`.
-# `new` is the only one that moves nothing: the session exists and nothing has claimed it yet.
+# What each of the seven Devin statuses leaves a remediation in, starting from `SESSION_CREATED`,
+# for a session carrying nothing else: no pull request, no report, no ACUs spent.
+#
+# `new` moves nothing — the session exists and nothing has claimed it yet. `exit` and `error` are
+# Devin saying it is finished with the session, and one that finished with nothing to show leaves
+# the remediation nowhere to go. `suspended` is not finished, so it does not.
 STATE_FOR_STATUS: dict[SessionStatus, State] = {
     SessionStatus.NEW: State.SESSION_CREATED,
     SessionStatus.CLAIMED: State.RUNNING,
     SessionStatus.RUNNING: State.RUNNING,
     SessionStatus.RESUMING: State.RUNNING,
     SessionStatus.SUSPENDED: State.RUNNING,
-    SessionStatus.EXIT: State.RUNNING,
+    SessionStatus.EXIT: State.FAILED,
     SessionStatus.ERROR: State.FAILED,
 }
+
+ACU_CAP = acu_cap_for(ISSUE_CLASS)
+"""`max_acu_limit` for the class `a_remediation` creates."""
 
 
 def a_session(**overrides: Any) -> dict[str, Any]:
@@ -155,6 +163,19 @@ async def jobs(session: AsyncSession) -> list[Job]:
     return list(result.scalars())
 
 
+async def row_version(session: AsyncSession, remediation_id: int) -> str:
+    """Postgres's `xmin` for one remediation — the transaction that last wrote the row.
+
+    The only way to ask "was this row written at all", which is what an idempotent reconciliation
+    has to answer. A column-value assertion cannot: an `UPDATE` that sets every column to the value
+    it already held looks identical from the outside and is exactly the thing to avoid.
+    """
+    result = await session.execute(
+        text("SELECT xmin::text FROM remediation WHERE id = :id"), {"id": remediation_id}
+    )
+    return str(result.scalar_one())
+
+
 # --- Status mapping -------------------------------------------------------------------------------
 
 
@@ -218,12 +239,137 @@ async def test_an_errored_session_fails_and_escalates(
         (State.SESSION_CREATED.value, State.RUNNING.value),
         (State.RUNNING.value, State.FAILED.value),
     ]
-    assert [(job.kind, job.payload) for job in await jobs(session)] == [
+    # `remediation_id` is how the escalation handler knows which issue to comment on.
+    assert [(job.kind, job.remediation_id, job.payload) for job in await jobs(session)] == [
         (
             JobKind.ESCALATE.value,
+            remediation.id,
             {"reason": poller.SESSION_ERROR, "state": State.FAILED.value},
         )
     ]
+
+
+async def test_a_blocked_report_outranks_an_errored_session(
+    seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
+) -> None:
+    """`BLOCKED` is applied before `FAILED`, so a session that said *why* it stopped is recorded as
+    blocked with that reason rather than as a bare error. The second trigger is then absorbed by the
+    terminal state the first produced."""
+    remediation = await seed(state=State.RUNNING.value)
+    devin_api.responds(
+        "GET",
+        session_path,
+        200,
+        a_session(
+            status="error",
+            structured_output={**REPORT, "outcome": "blocked", "blocked_reason": "no upstream fix"},
+        ),
+    )
+
+    await poll()
+
+    await session.refresh(remediation)
+    assert remediation.state == State.BLOCKED.value
+    assert remediation.blocked_reason == "no upstream fix"
+    assert [event.to_state for event in await events(session)] == [State.BLOCKED.value]
+
+
+# --- A session with nothing to show ---------------------------------------------------------------
+
+
+async def test_a_finished_session_without_a_pull_request_fails(
+    seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
+) -> None:
+    """The failure this component exists to catch. Devin is finished, no pull request came of it,
+    and no GitHub event will ever arrive — so without this the remediation sits in `RUNNING`, is
+    re-read once per tick for ever, and counts as in flight on the funnel."""
+    remediation = await seed(state=State.RUNNING.value)
+    devin_api.responds("GET", session_path, 200, a_session(status="exit", structured_output=REPORT))
+
+    await poll()
+
+    await session.refresh(remediation)
+    assert remediation.state == State.FAILED.value
+    assert remediation.blocked_reason == poller.SESSION_ENDED_WITHOUT_PULL_REQUEST
+    assert remediation.closed_at is not None
+    assert [(job.kind, job.remediation_id) for job in await jobs(session)] == [
+        (JobKind.ESCALATE.value, remediation.id)
+    ]
+
+    # And it stops costing a request per tick, because `FAILED` is not polled.
+    assert (await poll()).polled == 0
+    devin_api.only("GET", session_path)
+
+
+async def test_a_session_that_spent_its_acu_cap_fails(
+    seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
+) -> None:
+    """`docs/04-state-machine.md` tabulates "ACU cap hit" as a cause of `FAILED` and nothing else
+    applies it: the budget guard in `docs/06-event-pipeline.md` is the *daily* one, checked before a
+    session exists. Devin enforces `max_acu_limit` itself, so the status it stops at does not
+    matter — `acus_consumed` against the class cap is the whole test."""
+    remediation = await seed(state=State.RUNNING.value)
+    devin_api.responds(
+        "GET", session_path, 200, a_session(status="suspended", acus_consumed=float(ACU_CAP))
+    )
+
+    await poll()
+
+    await session.refresh(remediation)
+    assert remediation.state == State.FAILED.value
+    assert remediation.blocked_reason == poller.ACU_CAP_EXHAUSTED
+    assert [(job.kind, job.payload["reason"]) for job in await jobs(session)] == [
+        (JobKind.ESCALATE.value, poller.ACU_CAP_EXHAUSTED)
+    ]
+
+
+async def test_a_session_below_its_acu_cap_is_left_alone(
+    seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
+) -> None:
+    remediation = await seed(state=State.RUNNING.value)
+    devin_api.responds(
+        "GET", session_path, 200, a_session(status="running", acus_consumed=float(ACU_CAP) - 0.5)
+    )
+
+    assert (await poll()).moved == 0
+
+    await session.refresh(remediation)
+    assert remediation.state == State.RUNNING.value
+
+
+async def test_a_remediation_holding_a_pull_request_survives_its_session(
+    seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
+) -> None:
+    """The pull request is the deliverable. A session that finished, or spent its whole cap, after
+    opening one has done its job — check suites and a reviewer carry the remediation the rest of the
+    way, and failing it here would discard finished work."""
+    remediation = await seed(state=State.PR_OPENED.value, pr_url=PR_URL, pr_number=PR_NUMBER)
+    devin_api.responds(
+        "GET",
+        session_path,
+        200,
+        a_session(status="exit", acus_consumed=float(ACU_CAP) + 5, structured_output=REPORT),
+    )
+
+    assert (await poll()).moved == 0
+
+    await session.refresh(remediation)
+    assert remediation.state == State.PR_OPENED.value
+    assert remediation.blocked_reason is None
+
+
+async def test_a_pull_request_the_session_stops_reporting_does_not_fail_the_remediation(
+    seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
+) -> None:
+    """`pull_requests[]` is read from an API whose shape is unverified (B8). A linked remediation is
+    judged on its own link, not on whether this observation happens to repeat it."""
+    remediation = await seed(state=State.IN_REVIEW.value, pr_url=PR_URL, pr_number=PR_NUMBER)
+    devin_api.responds("GET", session_path, 200, a_session(status="exit", pull_requests=[]))
+
+    assert (await poll()).moved == 0
+
+    await session.refresh(remediation)
+    assert remediation.state == State.IN_REVIEW.value
 
 
 # --- The pull request -----------------------------------------------------------------------------
@@ -247,6 +393,23 @@ async def test_pull_request_is_discovered_from_the_session(
     assert remediation.pr_number == PR_NUMBER
     assert remediation.pr_opened_at is not None
     assert [event.to_state for event in await events(session)] == [State.PR_OPENED.value]
+
+
+async def test_a_transition_carries_the_cycle_forward(
+    seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
+) -> None:
+    """No trigger the poller applies increments `cycle`, and none may reset it: it counts the fix
+    laps the worker paid for, and `docs/07-observability.md` reads the autonomy rate off it."""
+    remediation = await seed(state=State.RUNNING.value, cycle=2)
+    devin_api.responds(
+        "GET", session_path, 200, a_session(status="exit", pull_requests=a_pull_request())
+    )
+
+    await poll()
+
+    await session.refresh(remediation)
+    assert remediation.state == State.PR_OPENED.value
+    assert remediation.cycle == 2
 
 
 async def test_a_session_first_seen_at_exit_still_passes_through_running(
@@ -275,7 +438,12 @@ async def test_the_pull_request_link_is_write_once(
     seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
 ) -> None:
     """`Trigger.PR_OPENED` carries `PullRequestCondition.UNLINKED`, so re-reading
-    `pull_requests[]` on a later tick is absorbed rather than re-stamping anything."""
+    `pull_requests[]` on a later tick is absorbed rather than re-stamping anything.
+
+    The second tick has to be *absorbed*, not merely harmless: a `PR_OPENED` applied without telling
+    the machine about the link raises `IllegalTransitionError` from `PR_OPENED`, which leaves every
+    column exactly as correct as absorption does. `Tick.failed` is what tells the two apart.
+    """
     remediation = await seed(state=State.RUNNING.value)
     route = devin_api.route("GET", session_path)
     route.mock(
@@ -291,7 +459,7 @@ async def test_the_pull_request_link_is_write_once(
     await session.refresh(remediation)
     linked_at = remediation.pr_opened_at
 
-    await poll()
+    assert (await poll()) == poller.Tick(polled=1, moved=0, unreachable=0, failed=0)
 
     await session.refresh(remediation)
     assert remediation.state == State.PR_OPENED.value
@@ -312,7 +480,7 @@ async def test_a_running_session_does_not_walk_the_fix_loop_backwards(
     )
     devin_api.responds("GET", session_path, 200, a_session(pull_requests=a_pull_request()))
 
-    assert (await poll()).moved == 0
+    assert (await poll()) == poller.Tick(polled=1, moved=0, unreachable=0, failed=0)
 
     await session.refresh(remediation)
     assert remediation.state == State.CI_FAILED.value
@@ -358,17 +526,59 @@ async def test_reconciliation_is_idempotent(
     assert len(devin_api.sent("GET", session_path)) == 3
 
 
+async def test_a_tick_that_sees_nothing_new_does_not_write_the_row(
+    seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
+) -> None:
+    """Idempotence at the storage layer, which no assertion on a column value can reach: a column
+    whose value is unchanged must not be re-assigned, or every remediation would be rewritten once
+    per `POLL_INTERVAL_SECONDS` for as long as it is in flight.
+
+    `0.1` is the value that catches this. It has no exact binary form, so an `acus_consumed` built
+    from the float rather than from its text differs from the `numeric(10,3)` read back — the two
+    round to the same stored value, and the row is rewritten every tick for ever.
+    """
+    remediation = await seed(state=State.RUNNING.value)
+    devin_api.responds("GET", session_path, 200, a_session(acus_consumed=0.1))
+
+    await poll()
+    written = await row_version(session, remediation.id)
+
+    await poll()
+
+    assert await row_version(session, remediation.id) == written
+    await session.refresh(remediation)
+    assert remediation.acus_consumed == Decimal("0.100")
+
+
 async def test_a_terminal_remediation_is_not_polled_at_all(
     seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
 ) -> None:
     """Nothing a session says can move a terminal state, so asking costs a request per tick for
-    ever and answers nothing. `QUEUED` has no session to ask about yet."""
+    ever and answers nothing. `QUEUED` is excluded by its state alone — a session id written to a
+    row before its state moves must not make it pollable."""
     await seed(state=State.MERGED.value, issue_number=1)
-    await seed(state=State.QUEUED.value, issue_number=2, devin_session_id=None)
+    await seed(state=State.QUEUED.value, issue_number=2)
     remediation = await seed(issue_number=3)
     devin_api.responds("GET", session_path, 200, a_session())
 
     assert (await poll()).polled == 1
+
+    devin_api.only("GET", session_path)
+    await session.refresh(remediation)
+    assert remediation.state == State.RUNNING.value
+
+
+async def test_a_remediation_with_no_session_is_not_polled(
+    seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
+) -> None:
+    """There is nothing to ask about. The worker writes the session id and the state together, so
+    this is a row that should not exist — but a request to `/sessions/None` is a poor way to find
+    that out, and `in_flight` decides it in one place."""
+    await seed(issue_number=1, devin_session_id=None)
+    remediation = await seed(issue_number=2)
+    devin_api.responds("GET", session_path, 200, a_session())
+
+    assert (await poll()) == poller.Tick(polled=1, moved=1, unreachable=0)
 
     devin_api.only("GET", session_path)
     await session.refresh(remediation)
@@ -386,14 +596,18 @@ async def test_acus_and_structured_output_are_reconciled(
         "GET",
         session_path,
         200,
-        a_session(status="exit", acus_consumed=4.25, structured_output=REPORT),
+        a_session(
+            status="exit",
+            acus_consumed=0.1,
+            structured_output=REPORT,
+            pull_requests=a_pull_request(),
+        ),
     )
 
     await poll()
 
     await session.refresh(remediation)
-    # `numeric(10,3)`, so the value is exact rather than the binary expansion of a float.
-    assert remediation.acus_consumed == Decimal("4.250")
+    assert remediation.acus_consumed == Decimal("0.100")
     assert remediation.structured_output == {
         **REPORT,
         "blocked_reason": None,
@@ -489,7 +703,8 @@ async def test_a_finished_session_waiting_for_input_is_not_a_stall(
     seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
 ) -> None:
     """A session that has finished its lap and is waiting to be resumed is the normal state of
-    every remediation sitting in review. Only a *working* session is stalled by the detail."""
+    every remediation sitting in review. Only a session Devin is *running* is stalled by the
+    detail."""
     remediation = await seed(state=State.IN_REVIEW.value, pr_url=PR_URL)
     devin_api.responds(
         "GET", session_path, 200, a_session(status="exit", status_detail="waiting_for_user")
@@ -499,6 +714,35 @@ async def test_a_finished_session_waiting_for_input_is_not_a_stall(
 
     await session.refresh(remediation)
     assert remediation.state == State.IN_REVIEW.value
+    assert remediation.blocked_reason is None
+
+
+@pytest.mark.parametrize("status", [SessionStatus.RESUMING, SessionStatus.CLAIMED])
+async def test_a_session_being_started_is_not_stalled(
+    status: SessionStatus,
+    seed: Seed,
+    session: AsyncSession,
+    devin_api: FakeAPI,
+    session_path: str,
+    poll: Poll,
+) -> None:
+    """The false positive that would cost the most. `resuming` is by definition a session the worker
+    has just sent a message to, so a `waiting_for_user` observed on it may be left over from before
+    that message landed — and `status_detail` timing is unverified (B8). Blocking here would end a
+    remediation in the middle of its fix loop, and `BLOCKED` is terminal.
+
+    `claimed` is the same argument from the other end: work has not begun, so nothing has been
+    asked yet.
+    """
+    remediation = await seed(state=State.CI_FAILED.value, cycle=1, pr_url=PR_URL)
+    devin_api.responds(
+        "GET", session_path, 200, a_session(status=status.value, status_detail="waiting_for_user")
+    )
+
+    assert (await poll()).moved == 0
+
+    await session.refresh(remediation)
+    assert remediation.state == State.CI_FAILED.value
     assert remediation.blocked_reason is None
 
 
@@ -557,6 +801,39 @@ async def test_one_unreachable_session_does_not_hold_up_the_tick(
     assert (await poll()) == poller.Tick(polled=2, moved=1, unreachable=1)
 
     await session.refresh(remediation)
+    assert remediation.state == State.RUNNING.value
+
+
+async def test_one_remediation_that_raises_does_not_end_the_tick(
+    seed: Seed,
+    session: AsyncSession,
+    settings: Settings,
+    devin_api: FakeAPI,
+    session_path: str,
+    poll: Poll,
+) -> None:
+    """`in_flight` is ordered by id, so anything escaping the reconciliation of one row would
+    strand every remediation after it — and `restart: unless-stopped` would re-poison the process on
+    the same row after every restart.
+
+    A session reported as `new` while carrying a pull request is one way to get there: it moves
+    nothing, so `PR_OPENED` is applied from `SESSION_CREATED`, which the state machine refuses.
+    """
+    poisoned_id = "devin-0000dead"
+    poisoned_path = SESSION.format(org_id=settings.devin_org_id, session_id=poisoned_id)
+    poisoned = await seed(issue_number=1, devin_session_id=poisoned_id)
+    remediation = await seed(issue_number=2)
+    devin_api.responds(
+        "GET", poisoned_path, 200, a_session(status="new", pull_requests=a_pull_request())
+    )
+    devin_api.responds("GET", session_path, 200, a_session())
+
+    assert (await poll()) == poller.Tick(polled=2, moved=1, unreachable=0, failed=1)
+
+    # The poisoned row keeps the state it had, and the one behind it was still reconciled.
+    await session.refresh(poisoned)
+    await session.refresh(remediation)
+    assert poisoned.state == State.SESSION_CREATED.value
     assert remediation.state == State.RUNNING.value
 
 

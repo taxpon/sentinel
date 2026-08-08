@@ -14,14 +14,21 @@ each, and reconciles what came back:
 |---|---|
 | `new` | none — the session exists, nothing has claimed it |
 | `claimed`, `running`, `resuming` | `SESSION_RUNNING` |
-| `suspended`, `exit` | `SESSION_RUNNING` — reaching either means it was claimed |
+| `suspended` | `SESSION_RUNNING` — reaching it means it was claimed |
+| `exit` | `SESSION_RUNNING`, then `FAILED` unless a pull request came of it |
 | `error` | `SESSION_RUNNING`, then `FAILED` |
 
-plus `PR_OPENED` whenever `pull_requests[]` is non-empty, and `BLOCKED` whenever the session says it
-cannot proceed. A status other than `new` yields `SESSION_RUNNING` even when the session has since
-finished, because `docs/04-state-machine.md` puts `PR_OPENED` on every path into the CI states
-(invariant 5) and `RUNNING` is the only state it is reachable from: a poller that first sees a
-session at `exit` must still walk it through `RUNNING`, or the pull request could never be linked.
+plus `PR_OPENED` whenever `pull_requests[]` is non-empty, `BLOCKED` whenever the session says it
+cannot proceed, and `FAILED` whenever it has spent its ACU cap. A status other than `new` yields
+`SESSION_RUNNING` even when the session has since finished, because `docs/04-state-machine.md` puts
+`PR_OPENED` on every path into the CI states (invariant 5) and `RUNNING` is the only state it is
+reachable from: a poller that first sees a session at `exit` must still walk it through `RUNNING`,
+or the pull request could never be linked.
+
+**A session that ends with nothing to show fails the remediation**, rather than leaving it in
+`RUNNING` for a poller to re-read for ever. Both causes are ones only this module can see — Devin
+reports them and GitHub never hears about them
+(`docs/adr/2026-08-08-a-session-with-nothing-to-show-fails.md`).
 
 **Reconciliation is idempotent**, because it runs every tick and almost every tick sees exactly what
 the last one saw. Two rules make it so, and between them they cover every trigger:
@@ -34,7 +41,9 @@ the last one saw. Two rules make it so, and between them they cover every trigge
   link is write-once *there*, so checking it here would only duplicate a rule and risk disagreeing
   with it.
 
-An absorbed observation writes nothing at all: no column, no `remediation_event`. See
+An absorbed trigger writes no `remediation_event` and no job. The observed columns —
+`devin_status`, `acus_consumed`, the report — are reconciled on every tick whether anything moved or
+not, because they are the observation itself rather than a record of a change. See
 `docs/adr/2026-08-08-the-poller-records-only-what-moves.md`.
 
 This module registers no metric of its own. Devin latency and error rate are observed by
@@ -57,6 +66,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sentinel.config import Settings, get_settings
 from sentinel.db import dispose_engine, get_session_factory
 from sentinel.devin.client import DevinClient, DevinError, DevinResponseError, Sleep
+from sentinel.devin.playbooks import acu_cap_for
 from sentinel.devin.schemas import Outcome, PullRequest, Session, SessionStatus
 from sentinel.models import Remediation, RemediationEvent
 from sentinel.observability.logging import configure_logging, correlate, get_logger
@@ -91,8 +101,28 @@ SOURCE: Final = "poller"
 """Recorded on every event this module writes. A poller transition carries no
 `webhook_delivery_id`, and neither does a worker one, so the audit trail says which."""
 
+STALLED_STATUSES: Final[frozenset[SessionStatus]] = frozenset({SessionStatus.RUNNING})
+"""The statuses on which `status_detail: waiting_for_user` means the session is stalled.
+
+Narrower than `SessionStatus.is_working`, deliberately. `docs/05-devin-integration.md` describes the
+stall as a session *running* and waiting; `claimed` has not begun work, so it cannot have asked
+anything yet, and `resuming` is by definition a session the worker has just sent a message to — the
+one moment a `waiting_for_user` left over from before that message would be read as a fresh
+question. See `docs/adr/2026-08-08-a-stalled-session-is-blocked.md`."""
+
 SESSION_ERROR: Final = "session_error"
 """`blocked_reason` for a session Devin reports as `error`."""
+
+ACU_CAP_EXHAUSTED: Final = "acu_cap_exhausted"
+"""`blocked_reason` for a session that spent `ACU_CAPS[issue_class]` without producing a pull
+request. `docs/04-state-machine.md` tabulates "ACU cap hit" as a cause of `FAILED`, and Devin
+enforces the ceiling itself through `max_acu_limit` — so nothing further will happen on that
+session, whatever status it reports."""
+
+SESSION_ENDED_WITHOUT_PULL_REQUEST: Final = "session_ended_without_pull_request"
+"""`blocked_reason` for a session Devin is finished with that produced no pull request and gave no
+reason. The remediation has nowhere left to go: the CI triggers need a linked pull request, and
+nothing resumes a session that is not in the fix loop."""
 
 SESSION_UNREADABLE: Final = "session_unreadable"
 """`blocked_reason` for a session whose body the v3 schemas reject — an undocumented status, or a
@@ -126,26 +156,28 @@ class Tick:
     """What one pass over the in-flight remediations did.
 
     `unreachable` counts the sessions Devin gave no usable answer for — a request that failed, or a
-    body the v3 schemas reject. A failed request is not an error the tick reports upwards: the next
-    tick asks again, which is the self-healing property the poller exists for.
+    body the v3 schemas reject. `failed` counts the remediations that raised while being reconciled.
+    Neither is an error the tick reports upwards: the next tick asks again, which is the
+    self-healing property the poller exists for.
     """
 
     polled: int
     moved: int
     unreachable: int
+    failed: int = 0
 
 
 def blocked_reason(session: Session) -> str | None:
     """Why this observation says the remediation cannot proceed, or `None` if it does not.
 
     Two causes, both of which `docs/04-state-machine.md` escalates. Devin reporting
-    `outcome: blocked` is the one the spec tabulates. The other is a session that is *working* and
-    `waiting_for_user`: it has asked a question, nothing in an unattended pipeline will answer it,
-    and without this it would look busy for ever. The `is_working` half matters — a `suspended` or
-    `exit` session idling between fix cycles also waits for input, and that is the normal state of
-    every remediation sitting in review.
+    `outcome: blocked` is the one the spec tabulates. The other is a session in one of
+    `STALLED_STATUSES` reporting `waiting_for_user`: it has asked a question, nothing in an
+    unattended pipeline will answer it, and without this it would look busy for ever. Which statuses
+    those are matters as much as the detail — a `suspended` or `exit` session idling between fix
+    cycles also waits for input, and that is the normal state of every remediation in review.
     """
-    if session.status.is_working and session.waiting_for_user:
+    if session.status in STALLED_STATUSES and session.waiting_for_user:
         return SESSION_WAITING_FOR_USER
     report = session.structured_output
     if report is not None and report.outcome is Outcome.BLOCKED:
@@ -153,23 +185,53 @@ def blocked_reason(session: Session) -> str | None:
     return None
 
 
-def observed_triggers(session: Session) -> tuple[tuple[Trigger, str | None], ...]:
+def failure_reason(session: Session, *, issue_class: str, has_pull_request: bool) -> str | None:
+    """Why this observation says the session will never produce anything more, or `None`.
+
+    All three causes are invisible to GitHub, which is what makes them the poller's to find. Two are
+    conditional on there being no pull request, because the pull request is the deliverable: a
+    remediation holding one is carried the rest of the way by check suites and a reviewer, and
+    killing it because the session that opened it has stopped would discard finished work. A session
+    Devin reports as `error` fails the remediation either way, which is what the spec tabulates.
+
+    The ACU cap is judged from `acus_consumed` against `ACU_CAPS[issue_class]` rather than from any
+    status, because Devin enforces `max_acu_limit` itself and the status it stops at is not
+    documented (B8).
+    """
+    if not has_pull_request and session.acus_consumed >= acu_cap_for(issue_class):
+        return ACU_CAP_EXHAUSTED
+    if session.status is SessionStatus.ERROR:
+        return SESSION_ERROR
+    if session.status.is_terminal and not has_pull_request:
+        return SESSION_ENDED_WITHOUT_PULL_REQUEST
+    return None
+
+
+def observed_triggers(
+    session: Session, *, issue_class: str, pr_linked: bool
+) -> tuple[tuple[Trigger, str | None], ...]:
     """The triggers one observation carries, in the order they must be applied, each with the
     `blocked_reason` it stores.
 
     Order is the point: a session first seen at `exit` with a pull request on it has to pass through
     `RUNNING` before `PR_OPENED` is reachable, and `BLOCKED` is applied before `FAILED` so that a
-    session which reported *why* it stopped is recorded as blocked rather than as a bare error.
+    session which reported *why* it stopped is recorded as blocked rather than as a bare failure.
+
+    `pr_linked` is the remediation's own link. A pull request counts as existing if either side
+    knows of one: the session may report it for the first time in this very observation, and an
+    already-linked remediation must not be failed by a `pull_requests[]` that has since gone quiet.
     """
+    has_pull_request = pr_linked or session.pull_request_url is not None
     triggers: list[tuple[Trigger, str | None]] = []
     if session.status is not SessionStatus.NEW:
         triggers.append((Trigger.SESSION_RUNNING, None))
     if session.pull_request_url is not None:
         triggers.append((Trigger.PR_OPENED, None))
-    if (reason := blocked_reason(session)) is not None:
-        triggers.append((Trigger.BLOCKED, reason))
-    if session.status is SessionStatus.ERROR:
-        triggers.append((Trigger.FAILED, SESSION_ERROR))
+    if (blocked := blocked_reason(session)) is not None:
+        triggers.append((Trigger.BLOCKED, blocked))
+    failed = failure_reason(session, issue_class=issue_class, has_pull_request=has_pull_request)
+    if failed is not None:
+        triggers.append((Trigger.FAILED, failed))
     return tuple(triggers)
 
 
@@ -177,15 +239,14 @@ async def in_flight(db: AsyncSession) -> tuple[InFlight, ...]:
     """Every remediation with a session that could still change, oldest first."""
     result = await db.execute(
         select(Remediation.id, Remediation.devin_session_id)
-        .where(
-            Remediation.state.in_(sorted(POLLED_STATES)),
-            Remediation.devin_session_id.is_not(None),
-        )
+        .where(Remediation.state.in_(sorted(POLLED_STATES)))
         .order_by(Remediation.id)
     )
-    # The `is not None` repeats the predicate above so that the session id is typed `str` here; a
-    # remediation past `QUEUED` always has one, because the worker writes it as it enters
-    # `SESSION_CREATED`.
+    # There is nothing to ask Devin about a remediation with no session id, and this is the only
+    # place that is decided — a second `devin_session_id IS NOT NULL` in the statement above would
+    # be a rule in two places that could only ever agree by luck. It costs nothing: a remediation
+    # past `QUEUED` has a session id, because the worker writes both as it enters
+    # `SESSION_CREATED`. It also types the id `str` for the call below.
     return tuple(
         InFlight(remediation_id=remediation_id, session_id=session_id)
         for remediation_id, session_id in result.all()
@@ -261,8 +322,13 @@ async def reconcile(
     """
     _reconcile_columns(remediation, session)
     pull_request = session.pull_requests[0] if session.pull_requests else None
+    observed = observed_triggers(
+        session,
+        issue_class=remediation.issue_class,
+        pr_linked=remediation.pr_url is not None,
+    )
     moved: list[Transition] = []
-    for trigger, reason in observed_triggers(session):
+    for trigger, reason in observed:
         result = await apply(
             db, remediation, trigger, settings=settings, reason=reason, pull_request=pull_request
         )
@@ -287,10 +353,11 @@ async def poll_once(
 
     moved = 0
     unreachable = 0
+    failed = 0
     for entry in pending:
         with correlate(remediation_id=entry.remediation_id, session_id=entry.session_id):
             try:
-                session = await devin.get_session(entry.session_id)
+                session: Session | None = await devin.get_session(entry.session_id)
             except DevinResponseError as exc:
                 # Devin answered with something v3 does not document, and will answer the same way
                 # next tick, so this cannot resolve itself by waiting. Escalate it, with the reason
@@ -298,18 +365,36 @@ async def poll_once(
                 # `DevinResponseError` is separate from `DevinAPIError` in order to allow.
                 log.warning("poller.session.unreadable", error=str(exc))
                 unreachable += 1
-                moved += len(
-                    await _fail(session_factory, entry, SESSION_UNREADABLE, settings=settings)
-                )
-                continue
+                session = None
             except DevinError as exc:
                 log.warning("poller.session.unreachable", error=str(exc))
                 unreachable += 1
                 continue
-            moved += len(await _reconcile_one(session_factory, entry, session, settings=settings))
 
-    log.info("poller.tick", polled=len(pending), moved=moved, unreachable=unreachable)
-    return Tick(polled=len(pending), moved=moved, unreachable=unreachable)
+            try:
+                if session is None:
+                    transitions = await _fail(
+                        session_factory, entry, SESSION_UNREADABLE, settings=settings
+                    )
+                else:
+                    transitions = await _reconcile_one(
+                        session_factory, entry, session, settings=settings
+                    )
+            except Exception:
+                # One row must not end the tick. `in_flight` is ordered by id, so anything escaping
+                # here would strand every remediation after it — and `restart: unless-stopped` would
+                # then re-poison the process on the same row after every restart, which is harder to
+                # diagnose than a stuck remediation. The row keeps the state it had; the next tick
+                # tries again.
+                log.exception("poller.remediation.failed")
+                failed += 1
+                continue
+            moved += len(transitions)
+
+    log.info(
+        "poller.tick", polled=len(pending), moved=moved, unreachable=unreachable, failed=failed
+    )
+    return Tick(polled=len(pending), moved=moved, unreachable=unreachable, failed=failed)
 
 
 async def run(
