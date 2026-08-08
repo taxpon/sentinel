@@ -30,13 +30,21 @@ Tests build the schema with `alembic upgrade head` against an empty database, ne
 test runs the migration on the connection and event loop it already has.
 
 One test then asserts that autogenerate finds no difference between the migrated database and
-`Base.metadata`. Three things make that comparison mean what it appears to mean. `Base.metadata`
-carries a naming convention, because otherwise Postgres names the constraints itself and Alembic
-cannot reproduce those names. And both comparisons Alembic leaves off are turned on: without
-`compare_type` a changed column type reads as no change at all, and without `compare_server_default`
-so does a changed default — `job.run_after DEFAULT now()` is the difference between a job that is
-immediately claimable and one that is never claimed. Both options are set in `alembic/env.py` and
-again in the test, which configures its own migration context and does not go through `env.py`.
+`Base.metadata`. Three things make that comparison mean what it appears to mean.
+
+`Base.metadata` carries a naming convention, because otherwise Postgres names the constraints itself
+and Alembic cannot reproduce those names. `compare_server_default` is turned on — in
+`alembic/env.py`, and again in the test, which configures its own migration context and does not go
+through `env.py` — because it is off by Alembic's default, and with it off a column whose server
+default has drifted from its migration is not reported as a difference at all. `job.run_after
+DEFAULT now()` is the difference between a job that is immediately claimable and one that is never
+claimed. (`compare_type` has been on by default since Alembic 1.12; both places name it anyway, to
+pin the comparison rather than inherit it.)
+
+Third, two further tests assert that the comparison *can* fail, by comparing the migrated database
+against a copy of the metadata with one column deliberately drifted. Whether the options are right
+is then a test result rather than something a reader verifies by eye — which is how the missing
+`compare_server_default` survived its first review.
 
 ## Alternatives considered
 

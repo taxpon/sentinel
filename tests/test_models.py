@@ -206,10 +206,12 @@ async def test_downgrade_leaves_the_database_empty(
 async def differences(engine: AsyncEngine, metadata: MetaData) -> list[Any]:
     """What autogenerate would write to turn the database into `metadata`.
 
-    The two comparisons Alembic leaves off are the two this schema most needs — a changed column
-    type, and a changed server default — and they have to be set here as well as in
-    `alembic/env.py`, which this context does not go through. That they are set is not something to
-    take on trust: `test_the_comparison_sees_*` below assert the comparison can actually fail.
+    `compare_server_default` is off in Alembic by default and has to be asked for: with it off, a
+    column whose default has drifted from its migration is not reported as a difference at all.
+    `compare_type` has been on by default since Alembic 1.12 and is named anyway, so the comparison
+    is pinned rather than inherited. Both have to be set here as well as in `alembic/env.py`, which
+    this context does not go through — and that they are set is not left to be read off the code:
+    `test_the_comparison_sees_*` below assert the comparison can actually fail.
 
     `compare_metadata` groups per table, so its result is a list of operations and lists of
     operations. Flattening it makes both the assertion and the failure message read plainly.
@@ -230,6 +232,11 @@ async def differences(engine: AsyncEngine, metadata: MetaData) -> list[Any]:
     ]
 
 
+async def operations(engine: AsyncEngine, metadata: MetaData) -> set[str]:
+    """Just the names of those operations — `modify_default`, `add_column`, and so on."""
+    return {operation[0] for operation in await differences(engine, metadata)}
+
+
 def a_copy_of_the_models() -> MetaData:
     """`Base.metadata` copied, so that a test can drift one column without touching the real one."""
     copy = MetaData(naming_convention=NAMING_CONVENTION)
@@ -248,26 +255,34 @@ async def test_the_migrated_schema_matches_the_models(migrated: AsyncEngine) -> 
 
 
 async def test_the_comparison_sees_a_changed_server_default(migrated: AsyncEngine) -> None:
-    """Proof that the test above can fail — `compare_server_default` is off in Alembic by default.
+    """Proof that the test above can fail — and the one option that has to be asked for.
 
-    With it off the comparison returns *no differences at all* for a changed default, so the drift
-    test passes on a model whose `server_default` no longer matches its migration. That is not a
-    hypothetical: `job.run_after DEFAULT now()` is what makes an un-backed-off job claimable.
+    `compare_server_default` is off in Alembic by default, and with it off the comparison reports
+    *no difference at all* for a changed default: the drift test then passes on a model whose
+    `server_default` no longer matches its migration. That is not hypothetical — it is how this
+    test module shipped in its first version — and the stake is real, since
+    `job.run_after DEFAULT now()` is what makes an un-backed-off job claimable.
     """
     drifted = a_copy_of_the_models()
     drifted.tables["remediation"].c.cycle.server_default = DefaultClause(text("7"))
 
-    assert [operation[0] for operation in await differences(migrated, drifted)] == [
-        "modify_default"
-    ]
+    # Membership rather than equality: if a model really has drifted from its migration, the test
+    # above is the one that should say so, and these two should not pile on with the same news.
+    assert "modify_default" in await operations(migrated, drifted)
 
 
 async def test_the_comparison_sees_a_changed_column_type(migrated: AsyncEngine) -> None:
-    """The same for `compare_type`, the other comparison Alembic leaves off."""
+    """The same for a changed column type, which is the weaker of the two guarantees.
+
+    `compare_type` defaults to on, so *removing* it from the options changes nothing and this test
+    stays green; only setting it to `False` breaks it. It is here because the property is worth
+    holding either way, and because this default has already moved once — it was off before
+    Alembic 1.12.
+    """
     drifted = a_copy_of_the_models()
     drifted.tables["remediation"].c.issue_number.type = Text()
 
-    assert [operation[0] for operation in await differences(migrated, drifted)] == ["modify_type"]
+    assert "modify_type" in await operations(migrated, drifted)
 
 
 async def test_a_redelivered_webhook_is_refused_by_the_database(session: AsyncSession) -> None:
