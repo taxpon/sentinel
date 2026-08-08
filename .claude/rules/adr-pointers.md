@@ -5,6 +5,10 @@ paths:
   - ".github/workflows/ci.yml"
   - "Dockerfile"
   - "alembic/env.py"
+  - "dashboard/package-lock.json"
+  - "dashboard/package.json"
+  - "dashboard/src/App.tsx"
+  - "dashboard/src/api.ts"
   - "docs/adr/template.md"
   - "docs/tasks.yaml"
   - "pyproject.toml"
@@ -41,6 +45,10 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `.github/workflows/ci.yml` — [Enforce the tests-with-source rule as a CI job that diffs the pull request](../../docs/adr/2026-08-08-enforce-tests-with-source-by-diffing-the-pull-request.md)
 - `Dockerfile` — [Manage dependencies with uv and a committed lock file](../../docs/adr/2026-08-07-uv-for-dependencies-and-the-image.md)
 - `alembic/env.py` — [Build the test schema by running the migrations, and test for drift](../../docs/adr/2026-08-08-migrations-are-the-schema-tests-run-against.md)
+- `dashboard/package-lock.json` — [Pin the dashboard toolchain to versions that run on Node 20](../../docs/adr/2026-08-08-dashboard-toolchain-runs-on-node-20.md)
+- `dashboard/package.json` — [Pin the dashboard toolchain to versions that run on Node 20](../../docs/adr/2026-08-08-dashboard-toolchain-runs-on-node-20.md), [Draw every dashboard chart with Recharts](../../docs/adr/2026-08-08-recharts-for-the-dashboard-charts.md)
+- `dashboard/src/App.tsx` — [Panels self-register from src/panels and receive the whole request state](../../docs/adr/2026-08-08-panels-self-register-from-the-panels-directory.md)
+- `dashboard/src/api.ts` — [Panels self-register from src/panels and receive the whole request state](../../docs/adr/2026-08-08-panels-self-register-from-the-panels-directory.md), [Draw every dashboard chart with Recharts](../../docs/adr/2026-08-08-recharts-for-the-dashboard-charts.md)
 - `docs/adr/template.md` — [Validate ADR front matter at generation time and refuse to write a partial index](../../docs/adr/2026-08-08-validate-adr-front-matter-at-generation.md)
 - `docs/tasks.yaml` — [Keep the task graph in one machine-readable file](../../docs/adr/2026-08-07-tasks-yaml-single-source.md)
 - `pyproject.toml` — [Manage dependencies with uv and a committed lock file](../../docs/adr/2026-08-07-uv-for-dependencies-and-the-image.md)
