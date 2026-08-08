@@ -9,6 +9,11 @@ The prompts follow `docs/adr/2026-08-07-delegate-task-not-steps.md`: they state 
 objective, the definition of done and the constraints, and say nothing about how to investigate or
 implement. Class-level standing instructions live in the playbooks, repository facts in the
 knowledge notes.
+
+`NAMESPACE_TAG` and `TAG_PREFIXES` are the **single source of the tag vocabulary**. The bootstrap
+script registers exactly those with `PUT /v3/organizations/{org_id}/tags`, and `validate_tag` below
+accepts exactly those; a vocabulary transcribed by hand at either end would drift and the drift
+would surface as a 422 at session creation (B7), long after the mistake was made.
 """
 
 from __future__ import annotations
@@ -22,6 +27,16 @@ from typing import Any, Final
 
 class UnknownIssueClass(ValueError):
     """An issue class that has no playbook. Callers move the remediation to `BLOCKED`."""
+
+
+class MissingPlaybookId(LookupError):
+    """A known issue class with no `DEVIN_PLAYBOOK_IDS` entry.
+
+    A deployment fault, not a property of the issue: the class is recognised and has a playbook, but
+    nobody configured the id it was created under. Distinct from `UnknownIssueClass` so that the
+    worker fails the job — and the bootstrap script fails at bootstrap — instead of telling a human
+    on every issue of that class that the class is unrecognised.
+    """
 
 
 class UnregisteredTag(ValueError):
@@ -74,7 +89,7 @@ PLAYBOOK_BY_CLASS: Final[Mapping[IssueClass, Playbook]] = {
 }
 
 
-def issue_class(value: str) -> IssueClass:
+def parse_issue_class(value: str) -> IssueClass:
     """Coerce a `remediation.issue_class` text column into the enum, or fail loudly."""
     try:
         return IssueClass(value)
@@ -85,7 +100,7 @@ def issue_class(value: str) -> IssueClass:
 
 def playbook_for(value: str | IssueClass) -> Playbook:
     """The playbook for an issue class. Raises `UnknownIssueClass` rather than defaulting."""
-    return PLAYBOOK_BY_CLASS[issue_class(str(value))]
+    return PLAYBOOK_BY_CLASS[parse_issue_class(str(value))]
 
 
 def acu_cap_for(value: str | IssueClass) -> int:
@@ -105,11 +120,14 @@ def playbook_id_for(value: str | IssueClass, playbook_ids: Mapping[str, str]) ->
     classes, so a map keyed by playbook name is also accepted and needs half the entries. An exact
     issue-class key wins where both are present, which is what lets one class be pointed at a
     different playbook without disturbing the rest.
+
+    Raises `MissingPlaybookId` when neither key is configured — a deployment fault — and
+    `UnknownIssueClass` when the class itself is not one we handle.
     """
     playbook = playbook_for(value)
     resolved = playbook_ids.get(str(value)) or playbook_ids.get(playbook.name)
     if not resolved:
-        raise UnknownIssueClass(
+        raise MissingPlaybookId(
             f"no playbook id configured for issue class {str(value)!r}; expected a "
             f"DEVIN_PLAYBOOK_IDS entry keyed {str(value)!r} or {playbook.name!r}"
         )
@@ -172,6 +190,12 @@ TAG_VALUE_PATTERNS: Final[Mapping[str, re.Pattern[str]]] = {
     "outcome": re.compile("|".join(sorted(OUTCOMES))),
 }
 
+# What `make bootstrap-devin` registers, derived from the mapping `validate_tag` enforces so the two
+# cannot disagree. The prefixed tags take unbounded values — an issue number, a delivery id — so the
+# vocabulary is the namespace tag plus the prefixes, not an enumeration of every tag Sentinel will
+# ever send.
+TAG_PREFIXES: Final[tuple[str, ...]] = tuple(TAG_VALUE_PATTERNS)
+
 
 def validate_tag(tag: str) -> str:
     """Return `tag` if the registered vocabulary accepts it, otherwise raise `UnregisteredTag`."""
@@ -190,14 +214,19 @@ def validate_tag(tag: str) -> str:
 def session_tags(
     *, repo: str, issue_number: int, issue_class: str | IssueClass, delivery_id: str
 ) -> list[str]:
-    """The tag set every session is created with, in the order the spec tabulates it."""
+    """The tag set every session is created with, in the order the spec tabulates it.
+
+    An unhandled class raises `UnknownIssueClass` here too, rather than surfacing as a rejected
+    `class:` tag: it is the same condition the worker already routes to `BLOCKED`, and one edge of
+    the state machine should not need two exceptions caught to implement it.
+    """
     return [
         validate_tag(tag)
         for tag in (
             NAMESPACE_TAG,
             f"repo:{repo}",
             f"issue:{issue_number}",
-            f"class:{issue_class}",
+            f"class:{parse_issue_class(str(issue_class))}",
             f"run:{delivery_id}",
         )
     ]
@@ -268,6 +297,11 @@ CI failed on {sha}. Failing job: {job_name}.
 
 Diagnose the failure and push a fix to the same branch."""
 
+# Stands in for an empty excerpt, the same way `NO_ISSUE_BODY` does in the prompt. A job that fails
+# during setup, or a log fetch that comes back empty, would otherwise leave a blank gap where the
+# evidence should be — and "there is no log" is itself a fact worth stating.
+NO_LOG_OUTPUT: Final = "(No log output was captured for the failing job.)"
+
 # The spec templates only the CI-failure message; this is the second loop edge in
 # `docs/04-state-machine.md`, written to the same rule — state the new fact, restate the goal.
 CHANGES_REQUESTED_TEMPLATE: Final = """\
@@ -276,6 +310,10 @@ A reviewer requested changes on {pr_url}.
 {review}
 
 Address the review and push a fix to the same branch."""
+
+# A review can request changes with nothing written anywhere — approving in a call, say, and
+# recording the request afterwards. Naming that is more use than an empty line.
+NO_REVIEW_FEEDBACK: Final = "(The reviewer left no written feedback.)"
 
 # Appended to every resume message. The cycle is the one piece of state Devin cannot observe for
 # itself, and knowing the budget is what makes "report blocked" a real alternative to churning
@@ -298,7 +336,9 @@ def _cycle_notice(cycle: int, max_cycles: int) -> str:
 def ci_failure_message(*, sha: str, job_name: str, log: str, cycle: int, max_cycles: int) -> str:
     """Resume message for the `CI_FAILED -> RUNNING` edge."""
     excerpt = "\n".join(log.strip().splitlines()[-LOG_EXCERPT_LINES:])
-    body = CI_FAILURE_TEMPLATE.format(sha=sha, job_name=job_name, log_excerpt=excerpt)
+    body = CI_FAILURE_TEMPLATE.format(
+        sha=sha, job_name=job_name, log_excerpt=excerpt or NO_LOG_OUTPUT
+    )
     return body + "\n" + _cycle_notice(cycle, max_cycles)
 
 
@@ -315,8 +355,7 @@ def changes_requested_message(
     `inline_comments` are the reviewer's file comments, already rendered by the caller — a review
     can request changes with an empty body and say everything inline, so both are forwarded.
     """
-    review = "\n\n".join(part for part in (review_body.strip(), *inline_comments) if part.strip())
-    body = CHANGES_REQUESTED_TEMPLATE.format(
-        pr_url=pr_url, review=review or "(The reviewer left no written feedback.)"
-    )
+    parts = (part.strip() for part in (review_body, *inline_comments))
+    review = "\n\n".join(part for part in parts if part)
+    body = CHANGES_REQUESTED_TEMPLATE.format(pr_url=pr_url, review=review or NO_REVIEW_FEEDBACK)
     return body + "\n" + _cycle_notice(cycle, max_cycles)

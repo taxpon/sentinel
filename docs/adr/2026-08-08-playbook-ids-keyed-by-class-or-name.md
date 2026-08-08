@@ -29,7 +29,14 @@ to playbook id, which means eight entries, six of them duplicates of another ent
 `playbook_id_for(issue_class, playbook_ids)` looks up the issue class first and falls back to the
 name of the playbook that serves it. An operator may therefore configure four entries keyed by
 playbook name, eight keyed by issue class, or a mix; an issue-class key always wins over the
-playbook-name key. A class with neither key raises rather than picking any id.
+playbook-name key.
+
+A class with neither key raises `MissingPlaybookId`, which is deliberately **not** an
+`UnknownIssueClass`. An unrecognised class is a property of the issue and escalates to a human as
+`QUEUED → BLOCKED` with the reason "issue class unrecognised" ([04](../04-state-machine.md)); a
+missing configuration key is a property of the deployment. Conflating them would tell a human that
+the class is unrecognised — on every issue of that class — when one environment variable is short an
+entry.
 
 ## Alternatives considered
 
@@ -43,9 +50,10 @@ playbook-name key. A class with neither key raises rather than picking any id.
 
 The bootstrap script and the worker read one function instead of interpreting the environment
 variable themselves, and the shorter four-entry form stays valid if a later playbook is split across
-classes. The cost is a resolution rule that is not visible in `.env.example` — it lives in the
-function's docstring and in the error message raised when neither key is present, which names both
-keys that would have worked.
+classes. T40 can surface a missing id at bootstrap, where it is cheap to fix, rather than letting it
+appear as an escalated issue at run time. The cost is a resolution rule that is not visible in
+`.env.example` — it lives in the function's docstring and in the error message raised when neither
+key is present, which names both keys that would have worked.
 
 **What would tell us this was wrong:** an operator configuring both key forms and being surprised by
 which one won — that is, the precedence mattering in practice rather than only on paper.

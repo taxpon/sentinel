@@ -13,8 +13,10 @@ import pytest
 
 from sentinel.devin import playbooks as pb
 
-SPEC = Path(__file__).resolve().parents[1] / "docs" / "05-devin-integration.md"
-SPEC_TEXT = SPEC.read_text()
+DOCS = Path(__file__).resolve().parents[1] / "docs"
+SPEC_TEXT = (DOCS / "05-devin-integration.md").read_text()
+OVERVIEW = (DOCS / "01-overview.md").read_text()
+STATE_MACHINE = (DOCS / "04-state-machine.md").read_text()
 
 JSON_SCHEMA_KEYWORDS = {"object", "array", "string", "number", "integer", "boolean", "null"}
 
@@ -22,11 +24,11 @@ JSON_SCHEMA_KEYWORDS = {"object", "array", "string", "number", "integer", "boole
 # --- Spec parsing --------------------------------------------------------------------------------
 
 
-def section(heading: str) -> str:
-    """The body of one `## ` section of the spec."""
+def section(heading: str, spec: str = SPEC_TEXT) -> str:
+    """The body of one `## ` section of a spec document."""
     body: list[str] = []
     found = False
-    for line in SPEC_TEXT.splitlines():
+    for line in spec.splitlines():
         if line.startswith("## "):
             if found:
                 break
@@ -91,6 +93,13 @@ def test_the_classes_covered_are_exactly_the_classes_the_spec_lists() -> None:
     assert spec_classes == {c.value for c in pb.IssueClass}
 
 
+def test_the_issue_classes_are_the_ones_the_overview_defines() -> None:
+    """`docs/01-overview.md` is where the classes are defined and where the `class:` labels on the
+    target repository come from; the playbook table in `docs/05` only has to cover them."""
+    rows = table_rows(section("Issue classes", spec=OVERVIEW))
+    assert {backticked(row[0])[0] for row in rows} == {c.value for c in pb.IssueClass}
+
+
 def test_playbooks_are_the_four_the_spec_names() -> None:
     assert {p.name for p in pb.PLAYBOOKS} == {backticked(row[0])[0] for row in SPEC_PLAYBOOK_ROWS}
     assert set(pb.PLAYBOOK_BY_CLASS.values()) == set(pb.PLAYBOOKS)
@@ -100,7 +109,7 @@ def test_playbooks_are_the_four_the_spec_names() -> None:
     "unknown", ["", "Security", "security ", "docs", "class:security", "flaky_test"]
 )
 def test_an_unknown_class_fails_loudly_rather_than_defaulting(unknown: str) -> None:
-    for call in (pb.playbook_for, pb.acu_cap_for, pb.baseline_hours_for, pb.issue_class):
+    for call in (pb.playbook_for, pb.acu_cap_for, pb.baseline_hours_for, pb.parse_issue_class):
         with pytest.raises(pb.UnknownIssueClass, match="unknown issue class"):
             call(unknown)
 
@@ -132,10 +141,20 @@ def test_an_issue_class_key_wins_over_the_playbook_name_key() -> None:
 
 
 def test_a_missing_playbook_id_names_both_keys_that_would_have_worked() -> None:
-    with pytest.raises(pb.UnknownIssueClass) as excinfo:
+    with pytest.raises(pb.MissingPlaybookId) as excinfo:
         pb.playbook_id_for("perf", {"security": "playbook-aaa"})
     assert "'perf'" in str(excinfo.value)
     assert "'deprecation'" in str(excinfo.value)
+
+
+def test_a_missing_playbook_id_is_not_an_unrecognised_issue_class() -> None:
+    """An unrecognised class escalates to a human (`QUEUED -> BLOCKED`, `docs/04-state-machine.md`).
+    A missing config key is a deployment fault: the class is known, the id was never supplied. The
+    two must not be caught by the same `except`, or one typo escalates every issue of that class."""
+    assert not issubclass(pb.MissingPlaybookId, pb.UnknownIssueClass)
+    with pytest.raises(pb.MissingPlaybookId):
+        pb.playbook_id_for("perf", {})
+    assert pb.playbook_for("perf").name == "deprecation", "the class itself is recognised"
 
 
 def test_an_unknown_class_is_rejected_before_the_configured_ids_are_consulted() -> None:
@@ -225,6 +244,35 @@ def test_session_tags_are_the_creation_time_tags_in_spec_order() -> None:
     ]
 
 
+def test_the_exported_vocabulary_is_what_validation_enforces() -> None:
+    """`make bootstrap-devin` registers `NAMESPACE_TAG` and `TAG_PREFIXES` with
+    `PUT /v3/organizations/{org_id}/tags`. If the bootstrap script could register a list that
+    validation does not enforce — or the reverse — the mismatch would surface as a 422 at session
+    creation (B7), so both come off the same mapping."""
+    assert tuple(pb.TAG_VALUE_PATTERNS) == pb.TAG_PREFIXES
+    for prefix in pb.TAG_PREFIXES:
+        with pytest.raises(pb.UnregisteredTag, match="value"):
+            # Reaching the *value* complaint proves the prefix itself was accepted.
+            pb.validate_tag(f"{prefix}:")
+
+
+def test_a_prefix_outside_the_exported_vocabulary_is_refused() -> None:
+    assert "priority" not in pb.TAG_PREFIXES
+    with pytest.raises(pb.UnregisteredTag, match="outside the vocabulary"):
+        pb.validate_tag("priority:high")
+
+
+def test_every_tag_sentinel_sends_comes_from_the_exported_vocabulary() -> None:
+    sent = [
+        *pb.session_tags(**VALID_TAG_INPUTS),
+        pb.cycle_tag(2),
+        pb.outcome_tag("merged"),
+    ]
+    for tag in sent:
+        prefix = tag.partition(":")[0]
+        assert tag == pb.NAMESPACE_TAG or prefix in pb.TAG_PREFIXES
+
+
 def test_the_vocabulary_covers_every_tag_the_spec_tabulates() -> None:
     for row in SPEC_TAG_ROWS:
         # The `run:` example is elided in the spec (`run:8f1c…`); the ellipsis stands for the rest
@@ -269,12 +317,19 @@ def test_a_tag_outside_the_registered_vocabulary_is_rejected(tag: str) -> None:
         pb.validate_tag(tag)
 
 
+VALID_TAG_INPUTS = {
+    "repo": "taxpon/superset",
+    "issue_number": 42,
+    "issue_class": "security",
+    "delivery_id": "8f1c2d3e",
+}
+
+
 @pytest.mark.parametrize(
     ("kwargs", "field"),
     [
         ({"repo": "superset"}, "repo"),
         ({"issue_number": 0}, "issue"),
-        ({"issue_class": "chore"}, "class"),
         ({"delivery_id": ""}, "run"),
         ({"delivery_id": "has spaces"}, "run"),
     ],
@@ -282,14 +337,15 @@ def test_a_tag_outside_the_registered_vocabulary_is_rejected(tag: str) -> None:
 def test_session_tags_reject_values_the_vocabulary_would_not_accept(
     kwargs: dict[str, object], field: str
 ) -> None:
-    valid = {
-        "repo": "taxpon/superset",
-        "issue_number": 42,
-        "issue_class": "security",
-        "delivery_id": "8f1c2d3e",
-    }
     with pytest.raises(pb.UnregisteredTag, match=field):
-        pb.session_tags(**{**valid, **kwargs})
+        pb.session_tags(**{**VALID_TAG_INPUTS, **kwargs})
+
+
+def test_an_unknown_class_reaches_session_tags_as_an_unknown_class() -> None:
+    """`QUEUED -> BLOCKED` on an unrecognised class is one state-machine edge, so the worker should
+    not have to catch a second exception type to implement it."""
+    with pytest.raises(pb.UnknownIssueClass, match="unknown issue class"):
+        pb.session_tags(**{**VALID_TAG_INPUTS, "issue_class": "chore"})
 
 
 @pytest.mark.parametrize("cycle", [0, -1])
@@ -298,8 +354,13 @@ def test_a_cycle_tag_starts_at_one(cycle: int) -> None:
         pb.cycle_tag(cycle)
 
 
-def test_outcome_tags_are_the_terminal_states() -> None:
-    assert {"merged", "blocked", "failed"} == pb.OUTCOMES
+def test_outcome_tags_are_the_terminal_states_of_the_state_machine() -> None:
+    """`outcome:<state>` is appended on reaching a terminal state, so the accepted values are
+    whatever `docs/04-state-machine.md` marks terminal — read from there, not restated here."""
+    states = table_rows(section("States", spec=STATE_MACHINE))
+    terminal = {backticked(row[0])[0].lower() for row in states if "**Terminal" in row[1]}
+    assert terminal, "the state table was not parsed"
+    assert terminal == pb.OUTCOMES
     for outcome in pb.OUTCOMES:
         assert pb.outcome_tag(outcome) == f"outcome:{outcome}"
 
@@ -396,6 +457,28 @@ def test_ci_failure_message_carries_the_cycle_and_the_failure_context() -> None:
     assert 'report outcome "blocked"' in message
 
 
+@pytest.mark.parametrize("log", ["", "   ", "\n\n", "\t\n  \n"])
+def test_a_failing_job_with_no_log_output_says_so_rather_than_leaving_a_hole(log: str) -> None:
+    """A job that fails during setup, or a log fetch that returns nothing, would otherwise leave a
+    blank gap where the evidence belongs — the same defect `NO_ISSUE_BODY` guards in the prompt."""
+    message = pb.ci_failure_message(
+        sha="abc1234", job_name="python-tests", log=log, cycle=1, max_cycles=3
+    )
+    assert pb.NO_LOG_OUTPUT in message
+    assert "\n\n\n" not in message
+
+
+def test_a_log_excerpt_never_leaves_a_blank_run_in_the_message() -> None:
+    message = pb.ci_failure_message(
+        sha="abc1234",
+        job_name="python-tests",
+        log="\n\nFAILED tests/test_cache.py::test_key\n\n",
+        cycle=1,
+        max_cycles=3,
+    )
+    assert "\n\n\n" not in message
+
+
 def test_a_long_log_is_cut_to_the_last_hundred_lines() -> None:
     log = "\n".join(f"line {n}" for n in range(500))
     message = pb.ci_failure_message(
@@ -430,7 +513,19 @@ def test_a_review_that_says_everything_inline_still_forwards_the_comments() -> N
         max_cycles=3,
     )
     assert "tests/test_cache.py:12" in message
-    assert pb.NO_ISSUE_BODY not in message
+    assert pb.NO_REVIEW_FEEDBACK not in message
+
+
+def test_review_parts_that_arrive_with_stray_whitespace_do_not_open_a_blank_run() -> None:
+    message = pb.changes_requested_message(
+        pr_url="https://github.com/taxpon/superset/pull/7",
+        review_body="This widens the cache key more than necessary.\n\n",
+        inline_comments=["\nsuperset/common/query_context.py:120 — use the schema\n"],
+        cycle=1,
+        max_cycles=3,
+    )
+    assert "\n\n\n" not in message
+    assert "superset/common/query_context.py:120 — use the schema" in message
 
 
 def test_a_review_with_no_written_feedback_says_so_rather_than_leaving_a_hole() -> None:
@@ -440,7 +535,7 @@ def test_a_review_with_no_written_feedback_says_so_rather_than_leaving_a_hole() 
         cycle=1,
         max_cycles=3,
     )
-    assert "(The reviewer left no written feedback.)" in message
+    assert pb.NO_REVIEW_FEEDBACK in message
     assert "\n\n\n" not in message
 
 
