@@ -4,6 +4,7 @@ paths:
   - ".claude/settings.json"
   - ".github/workflows/ci.yml"
   - "Dockerfile"
+  - "alembic/env.py"
   - "docs/adr/template.md"
   - "docs/tasks.yaml"
   - "pyproject.toml"
@@ -22,6 +23,8 @@ paths:
   - "src/sentinel/policy/dedup.py"
   - "src/sentinel/queue.py"
   - "src/sentinel/security/hmac.py"
+  - "tests/conftest.py"
+  - "tests/test_models.py"
   - "uv.lock"
 ---
 
@@ -37,6 +40,7 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `.claude/settings.json` — [Enforce the pre-PR review step with a hook, not with CLAUDE.md alone](../../docs/adr/2026-08-07-enforce-workflow-with-hooks.md)
 - `.github/workflows/ci.yml` — [Enforce the tests-with-source rule as a CI job that diffs the pull request](../../docs/adr/2026-08-08-enforce-tests-with-source-by-diffing-the-pull-request.md)
 - `Dockerfile` — [Manage dependencies with uv and a committed lock file](../../docs/adr/2026-08-07-uv-for-dependencies-and-the-image.md)
+- `alembic/env.py` — [Build the test schema by running the migrations, and test for drift](../../docs/adr/2026-08-08-migrations-are-the-schema-tests-run-against.md)
 - `docs/adr/template.md` — [Validate ADR front matter at generation time and refuse to write a partial index](../../docs/adr/2026-08-08-validate-adr-front-matter-at-generation.md)
 - `docs/tasks.yaml` — [Keep the task graph in one machine-readable file](../../docs/adr/2026-08-07-tasks-yaml-single-source.md)
 - `pyproject.toml` — [Manage dependencies with uv and a committed lock file](../../docs/adr/2026-08-07-uv-for-dependencies-and-the-image.md)
@@ -46,7 +50,7 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `src/sentinel/config.py` — [Hold credentials as SecretStr and rewrite configuration errors before raising them](../../docs/adr/2026-08-08-credentials-are-secretstr-and-config-errors-are-rewritten.md)
 - `src/sentinel/devin/client.py` — [Use the Devin v3 API exclusively](../../docs/adr/2026-08-07-devin-v3-only.md)
 - `src/sentinel/devin/playbooks.py` — [Give Devin the objective and constraints, not the steps](../../docs/adr/2026-08-07-delegate-task-not-steps.md), [Accept DEVIN_PLAYBOOK_IDS keyed by issue class or by playbook name](../../docs/adr/2026-08-08-playbook-ids-keyed-by-class-or-name.md), [Tell the session which fix cycle it is on and how many remain](../../docs/adr/2026-08-08-resume-messages-state-the-cycle-budget.md)
-- `src/sentinel/models.py` — [Record every state transition as an append-only event](../../docs/adr/2026-08-07-transitions-are-append-only-events.md)
+- `src/sentinel/models.py` — [Record every state transition as an append-only event](../../docs/adr/2026-08-07-transitions-are-append-only-events.md), [Build the test schema by running the migrations, and test for drift](../../docs/adr/2026-08-08-migrations-are-the-schema-tests-run-against.md)
 - `src/sentinel/observability/logging.py` — [Scrub credentials out of log values, not only out of fields named like credentials](../../docs/adr/2026-08-08-log-redaction-scrubs-values-not-only-keys.md)
 - `src/sentinel/observability/prom.py` — [Keep Prometheus metrics process-local and publish cross-process figures as snapshots](../../docs/adr/2026-08-08-metrics-are-process-local.md)
 - `src/sentinel/pipeline/handlers.py` — [Resume the existing Devin session on CI failure rather than starting a new one](../../docs/adr/2026-08-07-reuse-resumable-sessions.md)
@@ -55,4 +59,6 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `src/sentinel/policy/dedup.py` — [Deduplicate at both the delivery and the remediation layer](../../docs/adr/2026-08-07-two-layer-deduplication.md)
 - `src/sentinel/queue.py` — [Use Postgres as the job queue instead of adding Redis](../../docs/adr/2026-08-07-postgres-as-job-queue.md)
 - `src/sentinel/security/hmac.py` — [Return a reason from signature verification instead of a boolean or an exception](../../docs/adr/2026-08-08-signature-verification-returns-a-reason.md)
+- `tests/conftest.py` — [Build the test schema by running the migrations, and test for drift](../../docs/adr/2026-08-08-migrations-are-the-schema-tests-run-against.md)
+- `tests/test_models.py` — [Build the test schema by running the migrations, and test for drift](../../docs/adr/2026-08-08-migrations-are-the-schema-tests-run-against.md)
 - `uv.lock` — [Manage dependencies with uv and a committed lock file](../../docs/adr/2026-08-07-uv-for-dependencies-and-the-image.md)

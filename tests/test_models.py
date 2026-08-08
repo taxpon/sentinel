@@ -1,0 +1,479 @@
+"""The schema, against a real Postgres.
+
+What is asserted here is what the rest of the system is entitled to assume: that the two
+deduplication constraints are refused by the database rather than by a caller remembering to check,
+that the append-only event log cannot be tidied away, that the documented server defaults and metric
+timestamps behave as `docs/03-data-model.md` and `docs/07-observability.md` describe, and that the
+migration and the models agree.
+
+Every test starts from an empty schema and runs the migration, so what is exercised is the schema
+`alembic upgrade head` produces — not one `Base.metadata.create_all` would have produced. A model
+changed without a migration therefore fails here rather than in production.
+
+The fixtures below are deliberately local: `tests/conftest.py` belongs to T04, which lifts them out.
+"""
+
+from __future__ import annotations
+
+import datetime
+import os
+from collections.abc import AsyncIterator, Callable, Iterator
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+import pytest
+from alembic import command
+from alembic.autogenerate import compare_metadata
+from alembic.config import Config
+from alembic.runtime.migration import MigrationContext
+from sqlalchemy import Connection, delete, inspect, select, text
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+
+from sentinel import db
+from sentinel.config import Settings
+from sentinel.models import (
+    AcuLedger,
+    Base,
+    Job,
+    Remediation,
+    RemediationEvent,
+    WebhookDelivery,
+)
+
+# The host-side URL documented in `.env.example`, for a run that has not exported its own. CI sets
+# DATABASE_URL; a worktree sharing the machine with another one has to.
+DEFAULT_DATABASE_URL = "postgresql+asyncpg://sentinel:sentinel@localhost:5432/sentinel"
+
+DOCUMENTED_TABLES = {"webhook_delivery", "remediation", "remediation_event", "job", "acu_ledger"}
+
+# `docs/06-event-pipeline.md`, verbatim. A worker claims exactly one job with it, and it is repeated
+# here so that a column renamed out from under it fails a test rather than a deployment.
+CLAIM_ONE_JOB = text("""
+    UPDATE job SET status = 'running', locked_by = :worker_id, locked_at = now()
+    WHERE id = (
+        SELECT id FROM job
+        WHERE status = 'pending' AND run_after <= now()
+        ORDER BY run_after
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+    )
+    RETURNING *
+""")
+
+LABELED_AT = datetime.datetime(2026, 8, 8, 9, 0, tzinfo=datetime.UTC)
+
+
+def a_remediation(**overrides: Any) -> Remediation:
+    """A remediation with only the columns the schema requires."""
+    return Remediation(
+        **{
+            "repo": "taxpon/superset",
+            "issue_number": 42,
+            "issue_class": "security",
+            "state": "QUEUED",
+            "labeled_at": LABELED_AT,
+            **overrides,
+        }
+    )
+
+
+@pytest.fixture(scope="session")
+def database_url() -> str:
+    return os.environ.get("DATABASE_URL") or DEFAULT_DATABASE_URL
+
+
+@pytest.fixture(scope="session")
+def settings(database_url: str) -> Settings:
+    """Configuration whose only real value is the database URL.
+
+    The credentials are placeholders: nothing in this module talks to Devin or GitHub, but
+    `Settings` requires them, and going through it rather than around it is what proves `db.py`
+    builds an engine from configuration.
+    """
+    return Settings(
+        devin_api_token="devin-token",
+        devin_org_id="org-test",
+        devin_playbook_ids={},
+        github_token="github-token",
+        github_webhook_secret="webhook-secret",
+        database_url=database_url,
+    )
+
+
+@pytest.fixture(scope="session")
+def alembic_config() -> Config:
+    # Located from this file rather than the working directory: `script_location` in the ini is
+    # relative to the ini, so this is the only path that has to be found.
+    return Config(Path(__file__).resolve().parents[1] / "alembic.ini")
+
+
+@pytest.fixture
+async def engine(settings: Settings) -> AsyncIterator[AsyncEngine]:
+    engine = db.create_engine(settings)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture
+async def empty_database(engine: AsyncEngine) -> None:
+    """An empty schema — no tables, no `alembic_version`, whatever the last run left behind."""
+    async with engine.begin() as connection:
+        await connection.execute(text("DROP SCHEMA public CASCADE"))
+        await connection.execute(text("CREATE SCHEMA public"))
+
+
+@pytest.fixture
+async def migrated(
+    engine: AsyncEngine, alembic_config: Config, empty_database: None
+) -> AsyncEngine:
+    await upgrade(engine, alembic_config, "head")
+    return engine
+
+
+@pytest.fixture
+async def session(migrated: AsyncEngine) -> AsyncIterator[AsyncSession]:
+    async with db.create_session_factory(migrated)() as session:
+        yield session
+
+
+@pytest.fixture
+def process_engine(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Point `db.get_engine()` — the process-wide engine — at the test database."""
+    monkeypatch.setattr(db, "get_settings", lambda: settings)
+    db.get_engine.cache_clear()
+    db.get_session_factory.cache_clear()
+    yield
+    db.get_engine.cache_clear()
+    db.get_session_factory.cache_clear()
+
+
+async def upgrade(engine: AsyncEngine, config: Config, revision: str) -> None:
+    await run_alembic(engine, config, command.upgrade, revision)
+
+
+async def downgrade(engine: AsyncEngine, config: Config, revision: str) -> None:
+    await run_alembic(engine, config, command.downgrade, revision)
+
+
+async def run_alembic(
+    engine: AsyncEngine,
+    config: Config,
+    action: Callable[[Config, str], None],
+    revision: str,
+) -> None:
+    """Run an Alembic command on a connection of ours, as `alembic/env.py` allows."""
+
+    def run(connection: Connection) -> None:
+        config.attributes["connection"] = connection
+        action(config, revision)
+
+    async with engine.begin() as connection:
+        await connection.run_sync(run)
+
+
+async def table_names(engine: AsyncEngine) -> set[str]:
+    async with engine.connect() as connection:
+        return set(await connection.run_sync(lambda c: inspect(c).get_table_names()))
+
+
+async def test_upgrade_creates_the_documented_tables(migrated: AsyncEngine) -> None:
+    assert await table_names(migrated) == DOCUMENTED_TABLES | {"alembic_version"}
+
+
+async def test_downgrade_leaves_the_database_empty(
+    migrated: AsyncEngine, alembic_config: Config
+) -> None:
+    await downgrade(migrated, alembic_config, "base")
+
+    # `alembic_version` is Alembic's own bookkeeping and outlives the schema it tracks.
+    assert await table_names(migrated) - {"alembic_version"} == set()
+
+
+async def test_the_migrated_schema_matches_the_models(migrated: AsyncEngine) -> None:
+    """The test that catches a model changed without a migration.
+
+    Autogenerate compares the live schema against `Base.metadata`; anything it would write into a
+    new revision is a difference between the two.
+    """
+
+    def diff(connection: Connection) -> list[Any]:
+        context = MigrationContext.configure(connection, opts={"compare_type": True})
+        return compare_metadata(context, Base.metadata)
+
+    async with migrated.connect() as connection:
+        assert await connection.run_sync(diff) == []
+
+
+async def test_a_redelivered_webhook_is_refused_by_the_database(session: AsyncSession) -> None:
+    """The delivery deduplication layer: GitHub retries, and a retry must not be stored twice."""
+    received_at = datetime.datetime.now(datetime.UTC)
+    for _ in range(2):
+        session.add(
+            WebhookDelivery(
+                delivery_id="8f1c-repeated",
+                event="issues",
+                payload={"action": "labeled"},
+                received_at=received_at,
+            )
+        )
+
+    with pytest.raises(IntegrityError) as raised:
+        await session.flush()
+
+    assert "uq_webhook_delivery_delivery_id" in str(raised.value)
+
+
+async def test_a_second_remediation_for_one_issue_is_refused_by_the_database(
+    session: AsyncSession,
+) -> None:
+    """The domain layer: several different events about one issue are still one remediation."""
+    session.add(a_remediation())
+    session.add(a_remediation(issue_class="flaky-test", state="RUNNING"))
+
+    with pytest.raises(IntegrityError) as raised:
+        await session.flush()
+
+    assert "uq_remediation_repo_issue_number" in str(raised.value)
+
+
+async def test_create_if_absent_is_one_statement(session: AsyncSession) -> None:
+    """`INSERT … ON CONFLICT DO NOTHING RETURNING id`, the statement the worker uses.
+
+    The second caller gets no id back, which is how it learns the remediation already existed
+    without a read of its own — and without a window between the read and the write.
+    """
+    values = {
+        "repo": "taxpon/superset",
+        "issue_number": 42,
+        "issue_class": "security",
+        "state": "QUEUED",
+        "labeled_at": LABELED_AT,
+    }
+    statement = (
+        insert(Remediation)
+        .values(values)
+        .on_conflict_do_nothing(index_elements=["repo", "issue_number"])
+        .returning(Remediation.id)
+    )
+
+    created = (await session.execute(statement)).scalar_one_or_none()
+    already_there = (await session.execute(statement)).scalar_one_or_none()
+
+    assert created is not None
+    assert already_there is None
+    assert (await session.execute(select(Remediation.id))).scalars().all() == [created]
+
+
+async def test_a_minimal_remediation_takes_the_documented_defaults(session: AsyncSession) -> None:
+    remediation = a_remediation()
+    session.add(remediation)
+    await session.flush()
+    await session.refresh(remediation)
+
+    assert remediation.cycle == 0
+    assert remediation.acus_consumed == Decimal(0)
+    assert remediation.human_message_count == 0
+    # Every metric timestamp is absent until the remediation reaches that point, and the metrics in
+    # `docs/07-observability.md` that read them are undefined for it until then.
+    assert remediation.session_created_at is None
+    assert remediation.pr_opened_at is None
+    assert remediation.ci_green_at is None
+    assert remediation.merged_at is None
+    assert remediation.closed_at is None
+
+
+async def test_the_metric_timestamps_subtract_to_the_documented_durations(
+    session: AsyncSession,
+) -> None:
+    """The durations in `docs/07-observability.md` are a subtraction over one row."""
+    hour = datetime.timedelta(hours=1)
+    remediation = a_remediation(
+        state="MERGED",
+        session_created_at=LABELED_AT + hour,
+        pr_opened_at=LABELED_AT + 2 * hour,
+        ci_green_at=LABELED_AT + 3 * hour,
+        merged_at=LABELED_AT + 5 * hour,
+    )
+    session.add(remediation)
+    await session.flush()
+
+    durations = (
+        await session.execute(
+            select(
+                Remediation.session_created_at - Remediation.labeled_at,
+                Remediation.pr_opened_at - Remediation.labeled_at,
+                Remediation.ci_green_at - Remediation.labeled_at,
+                Remediation.merged_at - Remediation.labeled_at,
+                Remediation.merged_at - Remediation.ci_green_at,
+                Remediation.closed_at - Remediation.labeled_at,
+            )
+        )
+    ).one()
+
+    assert durations == (hour, 2 * hour, 3 * hour, 5 * hour, 2 * hour, None)
+
+
+async def test_the_event_log_stamps_its_own_created_at(session: AsyncSession) -> None:
+    """Ordering within the log is Postgres's clock, not that of whichever process wrote the row."""
+    remediation = a_remediation()
+    session.add(remediation)
+    await session.flush()
+
+    events = [
+        RemediationEvent(
+            remediation_id=remediation.id, from_state=None, to_state="QUEUED", kind="transition"
+        ),
+        RemediationEvent(
+            remediation_id=remediation.id,
+            from_state="QUEUED",
+            to_state="SESSION_CREATED",
+            kind="transition",
+            detail={"session_id": "devin-1"},
+        ),
+    ]
+    session.add_all(events)
+    await session.flush()
+    for event in events:
+        await session.refresh(event)
+
+    assert all(event.created_at.tzinfo is not None for event in events)
+    assert events[0].created_at <= events[1].created_at
+
+
+async def test_the_event_log_cannot_be_tidied_away(session: AsyncSession) -> None:
+    """`remediation_event` is the audit trail: deleting the remediation it belongs to is refused."""
+    remediation = a_remediation()
+    session.add(remediation)
+    await session.flush()
+    session.add(
+        RemediationEvent(remediation_id=remediation.id, to_state="QUEUED", kind="transition")
+    )
+    await session.flush()
+
+    with pytest.raises(IntegrityError) as raised:
+        await session.execute(delete(Remediation).where(Remediation.id == remediation.id))
+        await session.flush()
+
+    assert "fk_remediation_event_remediation_id_remediation" in str(raised.value)
+
+
+async def test_an_event_needs_a_remediation_that_exists(session: AsyncSession) -> None:
+    session.add(RemediationEvent(remediation_id=99999, to_state="QUEUED", kind="transition"))
+
+    with pytest.raises(IntegrityError) as raised:
+        await session.flush()
+
+    assert "fk_remediation_event_remediation_id_remediation" in str(raised.value)
+
+
+async def test_a_repo_wide_job_needs_no_remediation(session: AsyncSession) -> None:
+    """The ACU sweep belongs to no single issue, which is why `job.remediation_id` is nullable."""
+    job = Job(kind="sync_acu", payload={}, status="pending")
+    session.add(job)
+    await session.flush()
+    await session.refresh(job)
+
+    assert job.remediation_id is None
+    assert job.attempts == 0
+    # `run_after` defaulting to now() is what makes a job with no backoff immediately claimable.
+    assert job.run_after <= datetime.datetime.now(datetime.UTC)
+
+
+async def test_the_documented_claim_statement_claims_one_pending_job(
+    session: AsyncSession,
+) -> None:
+    """The queue's claiming SQL against the real schema and a real `FOR UPDATE SKIP LOCKED`."""
+    session.add_all(
+        [
+            Job(kind="create_session", payload={"issue": 42}, status="pending"),
+            Job(
+                kind="create_session",
+                payload={"issue": 43},
+                status="pending",
+                run_after=datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=1),
+            ),
+        ]
+    )
+    await session.flush()
+
+    claimed = (await session.execute(CLAIM_ONE_JOB, {"worker_id": "worker-1"})).mappings().one()
+
+    assert claimed["payload"] == {"issue": 42}
+    assert claimed["status"] == "running"
+    assert claimed["locked_by"] == "worker-1"
+    assert claimed["locked_at"] is not None
+    # The second job is deferred by `run_after`, so nothing is left to claim.
+    assert (await session.execute(CLAIM_ONE_JOB, {"worker_id": "worker-2"})).mappings().all() == []
+
+
+async def test_the_ledger_holds_one_row_per_day(session: AsyncSession) -> None:
+    day = datetime.date(2026, 8, 8)
+    session.add(
+        AcuLedger(day=day, acus=Decimal("61.375"), synced_at=datetime.datetime.now(datetime.UTC))
+    )
+    await session.flush()
+
+    session.add(
+        AcuLedger(day=day, acus=Decimal("62.5"), synced_at=datetime.datetime.now(datetime.UTC))
+    )
+    with pytest.raises(IntegrityError) as raised:
+        await session.flush()
+
+    assert "pk_acu_ledger" in str(raised.value)
+
+
+async def test_acus_keep_three_decimal_places(session: AsyncSession) -> None:
+    """ACUs are `numeric`, not a float: the budget guard adds them up and compares to a ceiling."""
+    session.add(a_remediation(acus_consumed=Decimal("12.345")))
+    await session.flush()
+    session.expunge_all()
+
+    assert (await session.execute(select(Remediation.acus_consumed))).scalar_one() == Decimal(
+        "12.345"
+    )
+
+
+async def test_session_scope_commits_and_leaves_the_row_readable(
+    migrated: AsyncEngine, process_engine: None
+) -> None:
+    """`session_scope` is one unit of work, and `expire_on_commit=False` keeps the object usable."""
+    async with db.session_scope() as session:
+        remediation = a_remediation()
+        session.add(remediation)
+
+    # Reading an attribute after the commit must not emit a lazy SELECT: there is no session and no
+    # greenlet left to run one in, and under asyncio that is a `MissingGreenlet`, not a slow query.
+    assert remediation.state == "QUEUED"
+
+    async with db.create_session_factory(migrated)() as verify:
+        assert (await verify.execute(select(Remediation.issue_number))).scalar_one() == 42
+
+    await db.dispose_engine()
+
+
+async def test_session_scope_rolls_back_when_the_unit_of_work_fails(
+    migrated: AsyncEngine, process_engine: None
+) -> None:
+    with pytest.raises(RuntimeError):
+        async with db.session_scope() as session:
+            session.add(a_remediation())
+            await session.flush()
+            raise RuntimeError("the handler failed after writing")
+
+    async with db.create_session_factory(migrated)() as verify:
+        assert (await verify.execute(select(Remediation.id))).scalars().all() == []
+
+    await db.dispose_engine()
+
+
+async def test_dispose_engine_lets_the_next_call_build_a_fresh_one(process_engine: None) -> None:
+    first = db.get_engine()
+    assert db.get_engine() is first
+
+    await db.dispose_engine()
+
+    assert db.get_engine() is not first
+    await db.dispose_engine()
