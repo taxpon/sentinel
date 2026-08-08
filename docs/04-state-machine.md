@@ -49,7 +49,7 @@ stateDiagram-v2
 | `CHANGES_REQUESTED` | A reviewer requested changes — the second loop trigger |
 | `MERGED` | **Terminal, success.** |
 | `BLOCKED` | **Terminal.** Devin reported it cannot proceed, or a policy limit stopped us. Escalated to a human. |
-| `FAILED` | **Terminal.** Session errored, or the cycle limit was exhausted. |
+| `FAILED` | **Terminal.** The session errored, spent its ACU cap, or finished without a pull request; or the cycle limit was exhausted. |
 
 ## Transitions
 
@@ -58,8 +58,8 @@ stateDiagram-v2
 | — | `QUEUED` | `issues.labeled` with `devin:autofix` | Create `remediation`, enqueue `create_session` |
 | `QUEUED` | `SESSION_CREATED` | Worker created the session | `POST /v3/…/sessions`; store `devin_session_id`, `session_created_at` |
 | `QUEUED` | `BLOCKED` | Daily ACU budget exhausted, or issue class unrecognised | Comment on issue, add `needs-human` |
-| `SESSION_CREATED` | `RUNNING` | Poller sees status `running` | — |
-| `RUNNING` | `PR_OPENED` | `pull_request.opened` from Devin's bot, or `pull_requests[]` on the session — **only while no pull request is linked** | Link PR to remediation, set `pr_opened_at`. Both are write-once: a later observation is recorded and otherwise ignored |
+| `SESSION_CREATED` | `RUNNING` | Poller sees any status but `new` — the session has been claimed. A session first observed at `exit` still passes through here, because invariant 5 puts `PR_OPENED` on every path to CI and `RUNNING` is the only state it is reachable from | — |
+| `RUNNING` | `PR_OPENED` | `pull_request.opened` from Devin's bot, or `pull_requests[]` on the session — **only while no pull request is linked** | Link PR to remediation, set `pr_opened_at`. Both are write-once: a later observation changes nothing. A repeat webhook delivery is recorded in `remediation_event`; a repeat poller observation is not ([ADR](./adr/2026-08-08-the-poller-records-only-what-moves.md)) |
 | `PR_OPENED`, `RUNNING` | `CI_RUNNING` | `check_suite.requested` on the head SHA — **requires a linked pull request** | — |
 | `PR_OPENED`, `RUNNING`, `CI_RUNNING`, `CI_FAILED` | `CI_PASSED` | `check_suite.completed`, conclusion `success` — **requires a linked pull request** | Set `ci_green_at` |
 | `PR_OPENED`, `RUNNING`, `CI_RUNNING`, `CI_PASSED`, `IN_REVIEW` | `CI_FAILED` | `check_suite.completed`, conclusion `failure`/`timed_out` — **requires a linked pull request** | Enqueue `resume_session` |
@@ -68,8 +68,8 @@ stateDiagram-v2
 | `IN_REVIEW` | `CHANGES_REQUESTED` | `pull_request_review.submitted`, state `changes_requested` | Enqueue `resume_session` |
 | **`CHANGES_REQUESTED`** | **`RUNNING`** | Worker resumed the session | Forward review body and inline comments via `POST /v3/…/messages`, increment `cycle` |
 | `IN_REVIEW` | `MERGED` | `pull_request.closed` with `merged: true` | Set `merged_at`, append tag `outcome:merged`, close the issue |
-| any | `BLOCKED` | `structured_output.outcome == "blocked"` | Store `blocked_reason`, comment on issue, add `needs-human` |
-| any | `FAILED` | Session status `error`, ACU cap hit, or `cycle > MAX_FIX_CYCLES` | Store reason, comment on issue, add `needs-human` |
+| any | `BLOCKED` | `structured_output.outcome == "blocked"`, or a session Devin reports as `running` and stalled on `status_detail: waiting_for_user` ([ADR](./adr/2026-08-08-a-stalled-session-is-blocked.md)) | Store `blocked_reason`, comment on issue, add `needs-human` |
+| any | `FAILED` | Session status `error`; `cycle > MAX_FIX_CYCLES`; or, **while no pull request is linked**, `acus_consumed` reaching `ACU_CAPS[issue_class]` or Devin finishing the session with nothing to show ([ADR](./adr/2026-08-08-a-session-with-nothing-to-show-fails.md)) | Store reason, comment on issue, add `needs-human` |
 
 ## Check suite events
 
@@ -143,8 +143,11 @@ CI triggers require one — which keeps `PR_OPENED` on every path into the CI st
 letting `RUNNING → CI_PASSED` bypass it. And `RUNNING → PR_OPENED` is only legal while none is
 linked, so the poller, which re-reads `pull_requests[]` on every poll
 ([ADR](./adr/2026-08-07-poller-drives-state-machine.md)), cannot walk the state backwards out of the
-loop or re-stamp `pr_opened_at` on lap two. A repeat observation is recorded as an event and
-otherwise ignored, exactly as for a terminal state.
+loop or re-stamp `pr_opened_at` on lap two. A repeat observation is absorbed rather than rejected,
+exactly as for a terminal state — but the poller does not record it: a webhook arrives once per real
+event, while the poller re-reads the same session every `POLL_INTERVAL_SECONDS`, so only the
+observations that move a remediation are written to `remediation_event`
+([ADR](./adr/2026-08-08-the-poller-records-only-what-moves.md)).
 
 The message states the failure and the goal; it does not prescribe the fix. Steering Devin
 line-by-line would defeat the purpose and is explicitly avoided ([05](./05-devin-integration.md)).
