@@ -20,8 +20,14 @@ Then a **capability probe**, which is the part that earns the run. `docs/blocker
 existed to verify them with, and the whole `Degradable` design in `devin/schemas.py` exists in case
 they are refused. The probe prints, in one table, which optional endpoints this deployment can
 actually reach and what each unreachable one falls back to — so the degradation path is known
-before the demo rather than during it. A degraded capability is reported; it never fails the run
-(`docs/adr/2026-08-08-the-capability-probe-reports-rather-than-fails.md`).
+before the demo rather than during it.
+
+A **refusal** is reported and never fails the run: it is an answer, and the fallback is the right
+response to it. A **fault** — a `401`, a `500`, a dead connection — is not an answer, claims no
+fallback, and leaves the run non-zero once the table has been printed. That line is `client.py`'s,
+not this script's: it converts `403` and `404` into `Unavailable` and raises everything else, so
+anything that reaches the probe's `except` is by construction something a fallback would paper over
+(`docs/adr/2026-08-08-a-refusal-is-reported-a-fault-is-not.md`).
 
 **Every step is idempotent.** This is run more than once — after a token is rotated, after a note
 is edited, after a failure part-way through — and a second run must not leave a second schedule or
@@ -63,7 +69,7 @@ from sentinel.devin.client import (
     DevinTransportError,
 )
 from sentinel.devin.playbooks import NAMESPACE_TAG, TAG_PREFIXES, IssueClass
-from sentinel.devin.schemas import Capability
+from sentinel.devin.schemas import Capability, Unavailability
 from sentinel.observability.logging import configure_logging
 
 # --- What is registered ---------------------------------------------------------------------------
@@ -262,6 +268,16 @@ class EnvFile:
                 return value.strip()
         return None
 
+    def bootstrapped_before(self) -> bool:
+        """Whether this organisation has been through this script already.
+
+        The schedule is created *after* the notes and recorded immediately, so a recorded schedule
+        id cannot predate them: it means four notes were created and their record has since been
+        lost. That is the difference between a first run and a `.env` that was replaced from
+        `.env.example` — which is exactly what the missing-file remedy tells an operator to do.
+        """
+        return self.recorded(SCHEDULE_ID) is not None
+
     def recorded_ids(self, name: str) -> list[str]:
         """`name` decoded as the JSON array of ids it is documented to be."""
         raw = self.recorded(name)
@@ -288,26 +304,44 @@ class EnvFile:
         """
         if not self.exists:
             raise _no_env_file(name, value)
-        # `newline=""` turns off universal newlines, so a file written on Windows comes back with
-        # its CRLF endings attached and goes back out with them. Reading it the default way would
-        # rewrite every line ending in the file as a side effect of recording one id.
-        text = self.path.read_text(encoding="utf-8", newline="")
-        updated = _assign(text, name, value)
-        if updated == text:
-            return False
-        _write_atomically(self.path, updated)
+        try:
+            # `newline=""` turns off universal newlines, so a file written on Windows comes back
+            # with its CRLF endings attached and goes back out with them. Reading it the default
+            # way would rewrite every line ending in the file as a side effect of recording one id.
+            text = self.path.read_text(encoding="utf-8", newline="")
+            updated = _assign(text, name, value)
+            if updated == text:
+                return False
+            _write_atomically(self.path, updated)
+        except (OSError, UnicodeDecodeError) as exc:
+            # A read-only directory, a full disk, a `.env` that is not UTF-8. The id is already
+            # created at Devin by the time this runs, so the failure has to hand it back: an id
+            # that reaches nobody belongs to a note nobody can find again.
+            raise _unwritable(self.path, name, value, exc) from None
         return True
 
     def _from_file(self, name: str) -> str | None:
         if not self.exists:
             return None
-        # The last assignment is the effective one, which is also the one `_assign` replaces.
+        # The last assignment is the effective one, which is also the one `_assign` replaces. The
+        # two must agree: reading the first while replacing the last would report a stale schedule
+        # id as current and create a second sweep.
         found: str | None = None
-        for line in self.path.read_text(encoding="utf-8").splitlines():
+        for line in self._text().splitlines():
             match = _ASSIGNMENT.match(line)
             if match and match.group(1) == name:
-                found = line[match.end() :]
+                found = _unquote(line[match.end() :])
         return found
+
+    def _text(self) -> str:
+        try:
+            return self.path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise BootstrapError(
+                "the .env record",
+                f"{self.path} could not be read: {_why(exc)}",
+                "fix or replace the file, then re-run — nothing has been created yet",
+            ) from None
 
 
 def _assign(text: str, name: str, value: str) -> str:
@@ -344,9 +378,14 @@ def _write_atomically(path: Path, text: str) -> None:
     crash cannot leave a file of credentials lying around untracked. The mode of the original is
     carried over rather than assumed — a `.env` an operator chmodded to 0600 stays 0600, and one
     that was not is not silently tightened either.
+
+    A symlinked `.env` is followed rather than replaced. `os.replace` onto the link path would swap
+    the link itself for a regular file: the real file would stop receiving updates while a second
+    complete copy of every credential was left at the link.
     """
-    mode = stat.S_IMODE(path.stat().st_mode)
-    handle, name = tempfile.mkstemp(dir=path.parent, prefix=".env.", suffix=".tmp")
+    target = path.resolve()
+    mode = stat.S_IMODE(target.stat().st_mode)
+    handle, name = tempfile.mkstemp(dir=target.parent, prefix=".env.", suffix=".tmp")
     temporary = Path(name)
     try:
         # newline="" so the line endings written are exactly the ones `_assign` preserved.
@@ -355,10 +394,44 @@ def _write_atomically(path: Path, text: str) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temporary, mode)
-        os.replace(temporary, path)
+        os.replace(temporary, target)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+
+
+_QUOTED = re.compile(r"""^\s*(['"])(.*?)\1""")
+_INLINE_COMMENT = re.compile(r"\s+#.*$")
+
+
+def _unquote(value: str) -> str:
+    """One `.env` value, read the way `dotenv` reads it.
+
+    `dotenv` is what actually configures the process, so a value this script reads differently from
+    `dotenv` is a value it would report to the operator as something the worker never sees.
+    """
+    quoted = _QUOTED.match(value)
+    return quoted.group(2) if quoted else _INLINE_COMMENT.sub("", value).strip()
+
+
+def _why(exc: OSError | UnicodeDecodeError) -> str:
+    """Why a file operation failed, without quoting any of the file.
+
+    `strerror` describes the operation, never the content. A `UnicodeDecodeError` renders the bytes
+    it choked on, and those bytes came out of a file full of credentials, so it is not repeated.
+    """
+    return (exc.strerror or type(exc).__name__) if isinstance(exc, OSError) else "not valid UTF-8"
+
+
+def _unwritable(
+    path: Path, name: str, value: str, exc: OSError | UnicodeDecodeError
+) -> BootstrapError:
+    return BootstrapError(
+        "the .env record",
+        f"{name} could not be recorded in {path}: {_why(exc)}",
+        f"add `{name}={value}` by hand once the file can be written, then re-run — what that line "
+        "names has already been created, and without it the next run creates it a second time",
+    )
 
 
 def _checked_id(step: str, kind: str, value: str) -> str:
@@ -388,19 +461,37 @@ def _no_env_file(name: str, value: str) -> BootstrapError:
 # --- The report -----------------------------------------------------------------------------------
 
 REACHABLE = "reachable"
+"""Asked, and answered."""
+
 DEGRADED = "degraded"
+"""Asked, and **refused** — a `403` or a `404`, which `client.DEGRADES` calls a capability this
+deployment does not have. Only this status claims a fallback, because only a refusal is an answer
+the fallback is the right response to."""
+
+FAULT = "fault"
+"""Asked, and something went wrong that is not an answer: a `401`, a `500`, a dead connection, a
+body that will not parse. The capability is left **unanswered** and no fallback is claimed —
+recording "use the derived figures" would answer a question nobody asked."""
+
 NOT_PROBED = "not probed"
+"""Not asked, and why."""
+
 REGISTERED = "registered"
 
 
 @dataclass(frozen=True, slots=True)
 class Capable:
-    """One row of the capability table: what was probed, what came back, and what it means."""
+    """One row of the capability table: what was probed, what came back, and what it means.
+
+    `remedy` is set only on a `FAULT` row: a fault is the one outcome the probe cannot report and
+    move on from, so it also carries what to do about it.
+    """
 
     blocker: str
     name: str
     status: str
     detail: str
+    remedy: str = ""
 
 
 @dataclass
@@ -458,17 +549,21 @@ UNREADABLE_REMEDY = (
 )
 
 
+def _diagnosis(exc: DevinError) -> tuple[str, str]:
+    """What the client raised, as (what happened, what to do)."""
+    if isinstance(exc, DevinAPIError):
+        return (
+            f"Devin answered {exc.status_code} to {exc.method} {exc.endpoint}: {exc.body}",
+            REMEDIES.get(exc.status_code, GENERIC_REMEDY),
+        )
+    if isinstance(exc, DevinTransportError):
+        return f"Devin could not be reached: {exc}", UNREACHABLE_REMEDY
+    return str(exc), UNREADABLE_REMEDY
+
+
 def _failed(step: str, exc: DevinError) -> BootstrapError:
     """Turn what the client raised into something an operator can act on."""
-    if isinstance(exc, DevinAPIError):
-        problem = f"Devin answered {exc.status_code} to {exc.method} {exc.endpoint}: {exc.body}"
-        remedy = REMEDIES.get(exc.status_code, GENERIC_REMEDY)
-    elif isinstance(exc, DevinTransportError):
-        problem = f"Devin could not be reached: {exc}"
-        remedy = UNREACHABLE_REMEDY
-    else:
-        problem = str(exc)
-        remedy = UNREADABLE_REMEDY
+    problem, remedy = _diagnosis(exc)
     return BootstrapError(_label(step), problem, remedy)
 
 
@@ -512,6 +607,21 @@ async def _seed_knowledge(devin: DevinClient, env: EnvFile) -> str:
     part-way through costs nothing on the next run.
     """
     recorded = env.recorded_ids(KNOWLEDGE_IDS)
+    if not recorded and env.bootstrapped_before():
+        # A blank `DEVIN_KNOWLEDGE_IDS` beside a recorded schedule is not a first run: the schedule
+        # is created after the notes, so it cannot exist without them. The likely cause is exactly
+        # what `_no_env_file` tells an operator to do — `cp .env.example .env`, which ships this
+        # variable blank — and creating four more notes on top of four that already exist would be
+        # a silent duplication nothing later can detect.
+        raise BootstrapError(
+            _label("knowledge"),
+            f"{KNOWLEDGE_IDS} is empty but {SCHEDULE_ID} is recorded, so this organisation has "
+            "been bootstrapped before and its four notes still exist; creating them again would "
+            "leave two sets that nothing can tell apart",
+            f"restore {KNOWLEDGE_IDS} from the run that wrote it (the ids are on that run's "
+            f"output), or — if the notes really are gone — clear {SCHEDULE_ID} as well and re-run "
+            "to start from nothing",
+        )
     outstanding = NOTES[len(recorded) :]
     if not outstanding:
         return f"{len(recorded)} note(s) already recorded — nothing created"
@@ -569,10 +679,13 @@ async def _create_schedule(devin: DevinClient, settings: Settings, env: EnvFile)
 async def _probe(devin: DevinClient, settings: Settings) -> list[Capable]:
     """Ask each optional capability whether this deployment can have it.
 
-    Nothing here raises. A capability that is refused, unreachable or unreadable is exactly what
-    the degradation table in `docs/05-devin-integration.md` is for, and reporting it is the whole
-    purpose of the probe — failing the bootstrap over it would throw the answer away along with
-    the three steps that already succeeded.
+    Nothing here raises, but not everything here is an answer. A **refusal** — the `403` and `404`
+    that `client.DEGRADES` recognises — is what the degradation table in
+    `docs/05-devin-integration.md` is for, and reporting it with its fallback is the whole purpose
+    of the probe. A **fault** is not a refusal: `client.py` re-raises `401` precisely so that a
+    rejected token is not silently turned into "use the derived figures", and turning that re-raise
+    back into a fallback here would undo the distinction one layer down. Those become `FAULT` rows,
+    which claim no fallback and which `bootstrap` refuses to exit 0 on.
     """
     return [
         await _probe_session_metrics(devin),
@@ -586,9 +699,21 @@ async def _probe_session_metrics(devin: DevinClient) -> Capable:
     try:
         metrics = await devin.session_metrics()
     except DevinError as exc:
-        return _unavailable("B5", capability, f"probe failed: {exc}")
+        return _fault("B5", capability, exc)
     if not metrics.available:
-        return _unavailable("B5", capability, _reason(metrics.reason.value, metrics.status_code))
+        if metrics.reason is Unavailability.NOT_CONFIGURED:
+            # Not asked, so B5 is not answered. The question B5 puts is whether the *token* carries
+            # `ViewAccountMetrics`; an unset DEVIN_ENTERPRISE_ID only says the panel is switched
+            # off. Reporting that as `degraded` would let an operator close B5 on a run that made
+            # no request at all.
+            return Capable(
+                "B5",
+                capability.value,
+                NOT_PROBED,
+                "DEVIN_ENTERPRISE_ID is unset, so nothing was asked and B5 stays open — set it and "
+                f"re-run to find out. Until then: {capability.fallback}",
+            )
+        return _refused("B5", capability, metrics.reason.value, metrics.status_code)
     figures = metrics.value
     return Capable(
         "B5",
@@ -604,9 +729,9 @@ async def _probe_acu_spend(devin: DevinClient) -> Capable:
     try:
         spend = await devin.daily_consumption()
     except DevinError as exc:
-        return _unavailable("—", capability, f"probe failed: {exc}")
+        return _fault("—", capability, exc)
     if not spend.available:
-        return _unavailable("—", capability, _reason(spend.reason.value, spend.status_code))
+        return _refused("—", capability, spend.reason.value, spend.status_code)
     consumption = spend.value
     return Capable(
         "—",
@@ -628,9 +753,10 @@ def _probe_playbook_creation(settings: Settings) -> Capable:
     the ids in `DEVIN_PLAYBOOK_IDS`.
     """
     scope = (
-        "no enterprise scope claimed (DEVIN_ENTERPRISE_ID unset)"
+        "DEVIN_ENTERPRISE_ID is unset, so nothing asked Devin about enterprise scope and B6 stays "
+        "open with B5"
         if settings.devin_enterprise_id is None
-        else "enterprise scope claimed — session_metrics above is whether it answers"
+        else "enterprise scope claimed — session_metrics above is whether the token carries it"
     )
     return Capable(
         "B6",
@@ -641,14 +767,34 @@ def _probe_playbook_creation(settings: Settings) -> Capable:
     )
 
 
-def _reason(reason: str, status_code: int | None) -> str:
-    return f"{reason} ({status_code})" if status_code is not None else reason
+def _refused(blocker: str, capability: Capability, reason: str, status_code: int | None) -> Capable:
+    """Devin was asked and said no. Reported with the fallback that replaces it — the sentence the
+    dashboard labels the derived figure with, taken from the same enum so the two cannot drift."""
+    status = f" ({status_code})" if status_code is not None else ""
+    return Capable(
+        blocker, capability.value, DEGRADED, f"{reason}{status} -> {capability.fallback}"
+    )
 
 
-def _unavailable(blocker: str, capability: Capability, reason: str) -> Capable:
-    """A capability this deployment cannot have, reported with the fallback that replaces it —
-    which is the sentence the dashboard labels the derived figure with."""
-    return Capable(blocker, capability.value, DEGRADED, f"{reason} -> {capability.fallback}")
+def _fault(blocker: str, capability: Capability, exc: DevinError) -> Capable:
+    """Devin was asked and something went wrong that is not an answer.
+
+    Everything the client hands back here is a fault by construction: it converts a `403` and a
+    `404` into `Unavailable` itself and raises everything else, `401` most pointedly, because "a
+    rejected token is a misconfiguration that must be fixed, and silently falling back to derived
+    figures would hide it".
+
+    So the row says the capability is unanswered and names no fallback. It carries the remedy for
+    whatever went wrong, which `bootstrap` raises with once the whole table has been printed.
+    """
+    problem, remedy = _diagnosis(exc)
+    return Capable(
+        blocker,
+        capability.value,
+        FAULT,
+        f"unanswered — {problem}",
+        remedy=remedy,
+    )
 
 
 def _table(rows: Sequence[Capable]) -> list[str]:
@@ -703,6 +849,19 @@ async def bootstrap(
     )
     print(CAPABILITY_HEADING, file=out)
     print("\n".join(_table(report.capabilities)), file=out)
+
+    # After the table, not instead of it. The four steps are done and the rest of the answer is
+    # worth having, but a capability the probe could not put a question to is a run that did not do
+    # what `docs/09-operations.md` asked of it, and exiting 0 would have it recorded as an answer.
+    faults = [row for row in report.capabilities if row.status == FAULT]
+    if faults:
+        raise BootstrapError(
+            "the capability probe",
+            "; ".join(f"{row.name}: {row.detail}" for row in faults),
+            f"{faults[0].remedy} This is a fault rather than a refusal, so no fallback is claimed "
+            "and the capability is still an open question. The four setup steps above are done and "
+            "idempotent: re-running repeats none of them.",
+        )
     return report
 
 

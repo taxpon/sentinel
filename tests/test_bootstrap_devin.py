@@ -16,9 +16,12 @@ rewrite may touch (one assignment line), what it may not (every other byte, the 
 mode) and what it must refuse outright (an id that would corrupt the file, a file that is not
 there).
 
-**The probe reports rather than fails.** B5 and B6 are open because nothing has ever asked Devin
-whether these credentials carry enterprise scope. Both the reachable and the refused answer are
-covered, because the refused one is the answer the design expects and the demo depends on.
+**A refusal is reported; a fault is not.** B5 and B6 are open because nothing has ever asked Devin
+whether these credentials carry enterprise scope. The reachable answer, the refused one and the
+unasked one are each covered — the refused one most of all, because it is what the design expects
+and what the demo depends on. So is the case that must not be folded in with it: a `401` or a `500`
+is not an answer, and reporting it with a fallback would record B5 as settled by a run that never
+got one.
 """
 
 from __future__ import annotations
@@ -198,6 +201,15 @@ def read_bytes(path: Path) -> bytes:
     return path.read_bytes()
 
 
+def _raise(exc: BaseException) -> Any:
+    """A call that fails: `monkeypatch.setattr(module.os, "replace", _raise(OSError(...)))`."""
+
+    def fail(*_: Any, **__: Any) -> Any:
+        raise exc
+
+    return fail
+
+
 def env_value(path: Path, name: str) -> str | None:
     """The effective assignment for `name`, read back the way `.env` would be read."""
     found = None
@@ -365,7 +377,13 @@ async def test_an_exported_variable_counts_as_recorded(
     The file says something else on purpose: when the two disagree, the exported value is the one
     in force, and reporting the file's would name a schedule nothing is actually running.
     """
-    write(env_path, f"{ENV_TEXT}DEVIN_SCHEDULE_ID=sched-in-the-file\n")
+    write(
+        env_path,
+        ENV_TEXT.replace(
+            "DEVIN_KNOWLEDGE_IDS=", f"DEVIN_KNOWLEDGE_IDS={json.dumps(list(NOTE_IDS))}"
+        )
+        + "DEVIN_SCHEDULE_ID=sched-in-the-file\n",
+    )
     env = bootstrap_devin.EnvFile(env_path, {bootstrap_devin.SCHEDULE_ID: "sched-from-the-shell"})
 
     report = await run(devin, settings, env)
@@ -606,29 +624,126 @@ def test_recording_the_same_value_does_not_rewrite_the_file(tmp_path: Path) -> N
 
 def test_no_temporary_file_is_left_behind(tmp_path: Path) -> None:
     path = tmp_path / ".env"
-    path.write_text("A=1\n", encoding="utf-8")
+    write(path, "A=1\n")
 
     bootstrap_devin.EnvFile(path, {}).record(bootstrap_devin.SCHEDULE_ID, "new")
 
     assert [child.name for child in tmp_path.iterdir()] == [".env"]
 
 
-async def test_an_id_that_would_corrupt_env_is_refused_and_reported(
-    devin: DevinClient, settings: Settings, env: Any, env_path: Path, devin_api: FakeAPI
+def test_a_write_that_fails_leaves_the_previous_file_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An unquoted `.env` value cannot carry whitespace, `#`, a quote or a backslash. Writing one
-    anyway would corrupt a file holding every credential, so the id is handed to the operator
-    instead — losing it silently would leave a note nobody can find."""
+    """The point of writing through `os.replace`: the rename either happened or it did not, so an
+    interrupted write cannot leave half a `.env` behind. Writing the new text over the file in
+    place would pass every other test here and fail this one."""
+    path = tmp_path / ".env"
+    write(path, "DEVIN_SCHEDULE_ID=old\nDEVIN_API_TOKEN=cog_live_secret\n")
+    monkeypatch.setattr(
+        bootstrap_devin.os, "replace", _raise(OSError(28, "No space left on device"))
+    )
+
+    with pytest.raises(bootstrap_devin.BootstrapError) as failure:
+        bootstrap_devin.EnvFile(path, {}).record(bootstrap_devin.SCHEDULE_ID, "new")
+
+    assert read_lines(path) == ["DEVIN_SCHEDULE_ID=old", "DEVIN_API_TOKEN=cog_live_secret"]
+    assert [child.name for child in tmp_path.iterdir()] == [".env"]
+    assert "DEVIN_SCHEDULE_ID=new" in failure.value.remedy
+
+
+def test_the_temporary_file_is_written_beside_the_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It holds a complete copy of every credential in `.env`. Somewhere else — the system
+    temporary directory, which is world-listable — is a copy in a place the operator did not choose
+    and would never think to clear."""
+    path = tmp_path / ".env"
+    write(path, "A=1\n")
+    directories: list[Any] = []
+    original = bootstrap_devin.tempfile.mkstemp
+
+    def spy(**options: Any) -> Any:
+        directories.append(options.get("dir"))
+        return original(**options)
+
+    monkeypatch.setattr(bootstrap_devin.tempfile, "mkstemp", spy)
+
+    bootstrap_devin.EnvFile(path, {}).record(bootstrap_devin.SCHEDULE_ID, "new")
+
+    assert directories == [tmp_path]
+
+
+def test_a_symlinked_env_is_followed_rather_than_replaced(tmp_path: Path) -> None:
+    """`os.replace` onto the link path would swap the link for a regular file: the real `.env`
+    would stop receiving updates, and a second complete copy of every credential would be left
+    behind at the link."""
+    target = tmp_path / "real.env"
+    write(target, "DEVIN_API_TOKEN=cog_live_secret\n")
+    link = tmp_path / ".env"
+    link.symlink_to(target)
+
+    bootstrap_devin.EnvFile(link, {}).record(bootstrap_devin.SCHEDULE_ID, "new")
+
+    assert link.is_symlink()
+    assert read_lines(target) == ["DEVIN_API_TOKEN=cog_live_secret", "DEVIN_SCHEDULE_ID=new"]
+    assert sorted(child.name for child in tmp_path.iterdir()) == [".env", "real.env"]
+
+
+def test_an_unwritable_env_hands_the_id_back_instead_of_a_traceback(tmp_path: Path) -> None:
+    """The id is already created at Devin by the time the record is written. An `OSError` escaping
+    as a traceback would take it with it, leaving a note nobody can find again — which is the same
+    harm `_no_env_file` already refuses to do."""
+    path = tmp_path / ".env"
+    write(path, "A=1\n")
+    tmp_path.chmod(0o500)
+
+    try:
+        with pytest.raises(bootstrap_devin.BootstrapError) as failure:
+            bootstrap_devin.EnvFile(path, {}).record(bootstrap_devin.KNOWLEDGE_IDS, '["note-1"]')
+    finally:
+        tmp_path.chmod(0o700)
+
+    assert 'DEVIN_KNOWLEDGE_IDS=["note-1"]' in failure.value.remedy
+    assert "re-run" in failure.value.remedy
+
+
+def test_an_env_that_is_not_utf8_is_reported_without_quoting_it(tmp_path: Path) -> None:
+    """The bytes a `UnicodeDecodeError` renders came out of a file full of credentials."""
+    path = tmp_path / ".env"
+    path.write_bytes(b"DEVIN_API_TOKEN=cog_\xff\xfe_secret\n")
+
+    with pytest.raises(bootstrap_devin.BootstrapError) as failure:
+        bootstrap_devin.EnvFile(path, {}).recorded(bootstrap_devin.SCHEDULE_ID)
+
+    assert "not valid UTF-8" in failure.value.problem
+    assert "cog_" not in failure.value.problem + failure.value.remedy
+
+
+@pytest.mark.parametrize(
+    "note_id", ["note one", "note#one", 'note"one', "note'one", "note\\one", ""]
+)
+async def test_an_id_that_would_corrupt_env_is_refused_and_reported(
+    devin: DevinClient,
+    settings: Settings,
+    env: Any,
+    env_path: Path,
+    devin_api: FakeAPI,
+    note_id: str,
+) -> None:
+    """An unquoted `.env` value cannot carry whitespace, `#`, a quote or a backslash, and an empty
+    id names nothing — `KnowledgeNote` accepts `""`, so the guard is reachable. Writing any of them
+    would corrupt a file holding every credential, so the id is handed to the operator instead;
+    dropping it silently would leave a note nobody can find."""
     devin_api.responds("GET", SESSIONS, 200, {"sessions": []})
     devin_api.responds("PUT", TAGS, 200, {})
-    respond_with_notes(devin_api, ["note one # two"])
+    respond_with_notes(devin_api, [note_id])
     before = read_bytes(env_path)
 
     with pytest.raises(bootstrap_devin.BootstrapError) as failure:
         await run(devin, settings, env)
 
     assert read_bytes(env_path) == before
-    assert "note one # two" in failure.value.problem
+    assert repr(note_id) in failure.value.problem
     assert failure.value.step == "step 3 of 4 (knowledge)"
 
 
@@ -648,18 +763,70 @@ async def test_a_missing_env_file_is_not_created(
     assert "cp .env.example .env" in failure.value.remedy
 
 
-async def test_a_record_that_is_not_a_json_array_stops_the_run(
-    devin: DevinClient, settings: Settings, env_path: Path, wired: FakeAPI
+@pytest.mark.parametrize("recorded", ['{"a": 1}', "not json at all", '["note-1", 3]'])
+async def test_a_record_that_is_not_a_json_array_of_ids_stops_the_run(
+    devin: DevinClient, settings: Settings, env_path: Path, wired: FakeAPI, recorded: str
 ) -> None:
     """Reading it as "nothing recorded" would create four more notes on top of whatever the value
-    was hiding."""
-    env = bootstrap_devin.EnvFile(env_path, {bootstrap_devin.KNOWLEDGE_IDS: '{"a": 1}'})
+    was hiding. A list with a non-string in it is the same hazard: `["note-1", 3]` has a length,
+    and length is what decides how many notes are outstanding."""
+    env = bootstrap_devin.EnvFile(env_path, {bootstrap_devin.KNOWLEDGE_IDS: recorded})
 
     with pytest.raises(bootstrap_devin.BootstrapError) as failure:
         await run(devin, settings, env)
 
     assert wired.sent("POST", NOTES) == []
     assert bootstrap_devin.KNOWLEDGE_IDS in failure.value.problem
+
+
+async def test_a_blanked_record_beside_a_recorded_schedule_refuses_to_create_a_second_set(
+    devin: DevinClient, settings: Settings, env_path: Path, wired: FakeAPI
+) -> None:
+    """`cp .env.example .env` — which is what the missing-file remedy tells an operator to run —
+    ships DEVIN_KNOWLEDGE_IDS blank. Read as a first run, that silently makes a second set of four
+    notes with nothing able to tell them apart afterwards.
+
+    The schedule is created *after* the notes, so a recorded schedule id cannot predate them: it is
+    the evidence that this organisation has been here before.
+    """
+    write(env_path, f"{ENV_TEXT}DEVIN_SCHEDULE_ID={SCHEDULE}\n")
+
+    with pytest.raises(bootstrap_devin.BootstrapError) as failure:
+        await run(devin, settings, bootstrap_devin.EnvFile(env_path, {}))
+
+    assert wired.sent("POST", NOTES) == []
+    assert failure.value.step == "step 3 of 4 (knowledge)"
+    assert bootstrap_devin.KNOWLEDGE_IDS in failure.value.remedy
+    assert bootstrap_devin.SCHEDULE_ID in failure.value.remedy
+
+
+def test_the_effective_assignment_is_the_one_read(tmp_path: Path) -> None:
+    """The read and the write must agree on which duplicate counts. Reading the first while
+    replacing the last would report a stale schedule id as current — and a schedule id read stale
+    is a second nightly sweep."""
+    path = tmp_path / ".env"
+    write(path, "DEVIN_SCHEDULE_ID=first\nOTHER=x\nDEVIN_SCHEDULE_ID=second\n")
+
+    assert bootstrap_devin.EnvFile(path, {}).recorded(bootstrap_devin.SCHEDULE_ID) == "second"
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("DEVIN_SCHEDULE_ID=sched-9", "sched-9"),
+        ('DEVIN_SCHEDULE_ID="sched-9"', "sched-9"),
+        ("DEVIN_SCHEDULE_ID='sched-9'", "sched-9"),
+        ("DEVIN_SCHEDULE_ID=sched-9  # the nightly sweep", "sched-9"),
+        ('DEVIN_SCHEDULE_ID="sched-9"  # the nightly sweep', "sched-9"),
+    ],
+)
+def test_a_value_is_read_the_way_dotenv_reads_it(tmp_path: Path, line: str, expected: str) -> None:
+    """`dotenv` is what configures the worker, so a value read differently here is one reported to
+    the operator as something the worker never sees."""
+    path = tmp_path / ".env"
+    write(path, f"{line}\n")
+
+    assert bootstrap_devin.EnvFile(path, {}).recorded(bootstrap_devin.SCHEDULE_ID) == expected
 
 
 # --- The capability probe ------------------------------------------------------------------------
@@ -714,38 +881,104 @@ async def test_reports_a_refused_capability_with_the_fallback_that_replaces_it(
 
     for capability in (Capability.SESSION_METRICS, Capability.ACU_SPEND):
         row = report.capability(capability.value)
+        # Returning at all is the assertion that a refusal does not fail the run.
         assert row.status == bootstrap_devin.DEGRADED
         assert f"{reason} ({status_code})" in row.detail
         assert capability.fallback in row.detail
 
 
-async def test_the_enterprise_endpoint_is_not_called_without_an_enterprise_id(
+async def test_an_unset_enterprise_id_leaves_b5_open_rather_than_degraded(
     devin: DevinClient, settings: Settings, env: Any, wired: FakeAPI
 ) -> None:
-    """`wired` registers no route for it, so a request would raise. The row still has to report
-    the answer: this deployment does not claim enterprise scope."""
+    """`.env.example` ships DEVIN_ENTERPRISE_ID blank, so this is the default run. Nothing is asked
+    — `wired` registers no route for the endpoint, and a request would raise — and B5 asks whether
+    the *token* carries `ViewAccountMetrics`, which an unset id says nothing about. Reporting it as
+    `degraded` would let an operator close B5 on a run that made no request."""
     report = await run(devin, settings, env)
 
     row = report.capability(Capability.SESSION_METRICS.value)
-    assert row.status == bootstrap_devin.DEGRADED
-    assert "not_configured" in row.detail
+    assert row.status == bootstrap_devin.NOT_PROBED
+    assert "DEVIN_ENTERPRISE_ID is unset" in row.detail
+    assert "B5 stays open" in row.detail
     assert Capability.SESSION_METRICS.fallback in row.detail
 
+    playbooks = report.capability(Capability.PLAYBOOK_CREATION.value)
+    assert "B6 stays open with B5" in playbooks.detail
 
-async def test_a_probe_that_fails_outright_does_not_fail_the_bootstrap(
-    devin: DevinClient, settings: Settings, env: Any, env_path: Path, wired: FakeAPI
+
+async def test_a_configured_enterprise_id_points_b6_at_the_probed_row(
+    settings: Settings, env: Any, wired: FakeAPI
 ) -> None:
-    """Three steps have already succeeded by then. Losing that — and losing the rest of the
-    report — over an optional panel would be the wrong trade."""
-    wired.responds("GET", CONSUMPTION, 500, {"detail": "boom"})
+    """With the id set the run does ask, so B6 may lean on what B5's row found."""
+    enterprise = make_settings(
+        devin_org_id=ORG, devin_enterprise_id="ent-1", devin_playbook_ids={"security-fix": "pb-1"}
+    )
+    wired.responds("GET", ENTERPRISE_METRICS, 403, {"detail": "no"})
 
-    report = await run(devin, settings, env)
+    async with DevinClient(enterprise) as client:
+        report = await run(client, enterprise, env)
 
-    row = report.capability(Capability.ACU_SPEND.value)
-    assert row.status == bootstrap_devin.DEGRADED
-    assert "probe failed" in row.detail
-    assert Capability.ACU_SPEND.fallback in row.detail
+    assert "session_metrics above" in report.capability(Capability.PLAYBOOK_CREATION.value).detail
+
+
+@pytest.mark.parametrize(
+    ("status_code", "advice"),
+    [(401, "DEVIN_API_TOKEN"), (500, "docs/05-devin-integration.md")],
+)
+async def test_a_fault_on_the_probe_claims_no_fallback_and_does_not_exit_zero(
+    devin: DevinClient,
+    settings: Settings,
+    env: Any,
+    env_path: Path,
+    wired: FakeAPI,
+    status_code: int,
+    advice: str,
+) -> None:
+    """`client.py` converts `403` and `404` into `Unavailable` and raises everything else — `401`
+    deliberately, because "silently falling back to derived figures would hide it". Anything that
+    reaches this handler is therefore a fault, and answering it with the fallback here would undo
+    that decision one layer up: an operator would record B5 as answered ("use the derived figures")
+    when the answer is "fix your token and ask again"."""
+    out = Out()
+    wired.responds("GET", CONSUMPTION, status_code, {"detail": "boom"})
+
+    with pytest.raises(bootstrap_devin.BootstrapError) as failure:
+        await bootstrap_devin.bootstrap(devin, settings, env=env, out=out)
+
+    row = next(line for line in out.text.splitlines() if Capability.ACU_SPEND.value in line)
+    assert bootstrap_devin.FAULT in row
+    assert "unanswered" in row and str(status_code) in row
+    assert Capability.ACU_SPEND.fallback not in row
+    assert "fault rather than a refusal" in failure.value.remedy
+    # The remedy is the one diagnosed from what came back, not a sentence about faults in general.
+    assert advice in failure.value.remedy
+
+    # Raised *after* the whole table, not instead of it: the four steps did succeed, and the rows
+    # that were answered are the answer the run was for. Only the exit status changes.
+    assert bootstrap_devin.CAPABILITY_HEADING.strip() in out.text
+    for name in ("session_metrics", "acu_spend", "playbook_creation", "tag_vocabulary"):
+        assert name in out.text
+    assert "[4/4] schedule" in out.text
     assert env_value(env_path, bootstrap_devin.SCHEDULE_ID) == SCHEDULE
+
+
+async def test_a_rejected_token_on_the_enterprise_probe_names_the_token(
+    settings: Settings, env: Any, wired: FakeAPI, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The case B5 exists for. Step 1 verifies the token against the *organisation* endpoints, so a
+    401 here is the difference between "wrong token" and "no enterprise scope" — and only one of
+    those is answered by writing down the fallback."""
+    enterprise = make_settings(
+        devin_org_id=ORG, devin_enterprise_id="ent-1", devin_playbook_ids={"security-fix": "pb-1"}
+    )
+    wired.responds("GET", ENTERPRISE_METRICS, 401, {"detail": "invalid token"})
+
+    async with DevinClient(enterprise) as client:
+        with pytest.raises(bootstrap_devin.BootstrapError) as failure:
+            await run(client, enterprise, env)
+
+    assert "DEVIN_API_TOKEN" in failure.value.remedy
+    assert Capability.SESSION_METRICS.fallback not in failure.value.problem
 
 
 async def test_playbook_creation_is_reported_without_being_probed(
@@ -798,6 +1031,49 @@ def test_main_reports_success_without_touching_stdout_with_diagnostics(
     assert Capability.SESSION_METRICS.value in captured.out
     assert DEVIN_TOKEN not in captured.out + captured.err
     assert env_value(env_path, bootstrap_devin.SCHEDULE_ID) == SCHEDULE
+
+
+def test_main_records_into_dot_env_when_no_path_is_given(
+    settings: Settings,
+    wired: FakeAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    no_recorded_ids: None,
+) -> None:
+    """`make bootstrap-devin` passes no `--env`, so the default is the path every real run uses and
+    the one no other test here exercises."""
+    monkeypatch.setattr(bootstrap_devin, "get_settings", lambda: settings)
+    monkeypatch.chdir(tmp_path)
+    write(tmp_path / ".env", ENV_TEXT)
+
+    assert bootstrap_devin.main([]) == 0
+
+    assert env_value(tmp_path / ".env", bootstrap_devin.SCHEDULE_ID) == SCHEDULE
+
+
+def test_main_reports_an_unwritable_record_without_a_traceback(
+    settings: Settings,
+    tmp_path: Path,
+    wired: FakeAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    no_recorded_ids: None,
+) -> None:
+    """An `OSError` from the write is the one failure that reaches `main` from outside the client.
+    Escaping as a traceback would defeat the contract twice over: no step named, and the id of the
+    note that was created nowhere in the output."""
+    path = tmp_path / ".env"
+    write(path, "A=1\n")
+    monkeypatch.setattr(bootstrap_devin, "get_settings", lambda: settings)
+    monkeypatch.setattr(bootstrap_devin.os, "replace", _raise(OSError(13, "Permission denied")))
+
+    assert bootstrap_devin.main(["--env", str(path)]) == 1
+
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert "Permission denied" in captured.err
+    assert NOTE_IDS[0] in captured.err
+    assert DEVIN_TOKEN not in captured.out + captured.err
 
 
 def test_main_exits_nonzero_with_a_legible_failure_and_no_traceback(

@@ -44,7 +44,15 @@ variable.
   table in `docs/09-operations.md`: those two lists are the process's configuration, they are
   checked against each other by `tests/test_env_example.py`, and `.env.example` belongs to T01.
 - The record is written **after each creation**, not once at the end. An id that was not recorded
-  belongs to a note nobody can find again.
+  belongs to a note nobody can find again — which is also why every way the write can fail is
+  turned into a `BootstrapError` whose remedy contains the exact `NAME=value` line to add by hand.
+  An `OSError` escaping as a traceback would take the id with it.
+- A **blank** `DEVIN_KNOWLEDGE_IDS` beside a recorded `DEVIN_SCHEDULE_ID` is refused rather than
+  read as a first run. The schedule is created after the notes, so it cannot exist without them:
+  the pair means the notes exist and their record was lost. This is not a hypothetical — the
+  missing-file remedy tells the operator to run `cp .env.example .env`, and `.env.example` ships
+  the variable blank, so the likelier way to lose the record is to blank it rather than to delete
+  the file.
 
 `.env` holds real credentials, so how it is written is part of this decision:
 
@@ -53,7 +61,15 @@ variable.
   variables all survive byte for byte;
 - the new text lands through a temporary file in the same directory and `os.replace`, so an
   interruption leaves the previous file complete rather than a truncated new one. The temporary is
-  named `.env.*`, which `.gitignore` already covers;
+  named `.env.*`, which `.gitignore` already covers, and it is created beside the original rather
+  than in the system temporary directory — it holds a complete copy of every credential in the
+  file;
+- a symlinked `.env` is followed, not replaced. `os.replace` onto the link path would swap the link
+  for a regular file: the real file would stop receiving updates while a second full copy of the
+  credentials was left at the link;
+- a value is read back the way `dotenv` reads it — surrounding quotes and an inline comment
+  stripped — because `dotenv` is what actually configures the worker, and a value this script reads
+  differently is one it would report as something the worker never sees;
 - the file's mode is carried over, so a `.env` chmodded to 0600 stays 0600;
 - an id that cannot be written into an unquoted value — whitespace, `#`, a quote, a backslash — is
   **refused**, and handed to the operator in the error instead. A corrupted `.env` is worse than a
@@ -75,10 +91,15 @@ variable.
 
 ## Consequences
 
-The record is only as good as `.env`. An operator who deletes it, or points `--env` somewhere else,
-gets a second set of notes — the script says so in the error it raises when the file is absent.
-Moving to a different Devin organisation means clearing both variables first; nothing checks that
-the recorded ids belong to `DEVIN_ORG_ID`.
+The record is only as good as `.env`. The two ways to lose it are covered — an absent file is
+refused, and a blanked knowledge record beside a recorded schedule is refused — but an operator who
+points `--env` at a different file, or who clears *both* variables, still gets a second set of
+notes and a second sweep. Moving to a different Devin organisation means clearing both variables
+first; nothing checks that the recorded ids belong to `DEVIN_ORG_ID`.
+
+The blanked-record guard costs one real case: an operator who genuinely deleted the four notes in
+the Devin UI must clear `DEVIN_SCHEDULE_ID` too before the script will make them again. The remedy
+says so.
 
 Because the knowledge ids are positional, reordering `NOTES` would silently attach existing ids to
 different notes. The list is documented as append-only for that reason, and the test that counts
