@@ -35,12 +35,24 @@ is rule 1 in `CLAUDE.md`; the detail below is what "correctly implemented" means
 
 ## Running
 
+The suite talks to a real Postgres and has no in-memory fallback: in a worktree where `make db` has
+never been run, the database tests **error during setup**. That is the first thing to check when a
+fresh tree reports twenty failures at once.
+
 ```bash
+export COMPOSE_PROJECT_NAME=sentinel-t14   # anything unique to this worktree
+export POSTGRES_PORT=54314                 # a free port per worktree
+export API_PORT=8014                       # only needed for `make up`
+make db
+export DATABASE_URL=postgresql+asyncpg://sentinel:sentinel@localhost:54314/sentinel
+
 make test                       # full suite
 uv run pytest tests/test_x.py   # one file
 ```
 
-Two worktrees running tests at once need distinct `COMPOSE_PROJECT_NAME` and `POSTGRES_PORT`.
+All three exports are per-worktree: `COMPOSE_PROJECT_NAME` separates the containers and volumes,
+`POSTGRES_PORT` and `API_PORT` separate the published host ports. `DATABASE_URL` is what the tests
+read — left unset they use port 5432, which is another worktree's database or nothing at all.
 
 ## Do not
 

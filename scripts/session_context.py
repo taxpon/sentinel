@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.14"
 # dependencies = ["pyyaml>=6"]
 # ///
 """Produce the session-start briefing: what this worktree is for, or what is free to pick up.
@@ -26,7 +26,7 @@ BRANCH_RE = re.compile(r"^task/(T\d+)-")
 def sh(*args: str, timeout: int = 20) -> str | None:
     try:
         out = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError, subprocess.TimeoutExpired:
         return None
     return out.stdout if out.returncode == 0 else None
 
@@ -38,13 +38,30 @@ def load_tasks() -> dict[str, dict]:
 
 def load_issues() -> dict[str, dict] | None:
     raw = sh(
-        "gh", "issue", "list", "-R", REPO, "--label", "task", "--state", "all",
-        "--limit", "200", "--json", "number,title,state,assignees",
+        "gh",
+        "issue",
+        "list",
+        "-R",
+        REPO,
+        "--label",
+        "task",
+        "--state",
+        "all",
+        "--limit",
+        "200",
+        "--json",
+        "number,title,state,assignees",
     )
     if raw is None:
         return None
+    try:
+        issues = json.loads(raw)
+    except json.JSONDecodeError:
+        # `gh` exits 0 with an empty or truncated body often enough (an expired token renewing, a
+        # proxy interposing) that treating it as "state unavailable" beats a traceback.
+        return None
     by_task: dict[str, dict] = {}
-    for issue in json.loads(raw):
+    for issue in issues:
         m = re.match(r"^(T\d+)\b", issue["title"])
         if m:
             by_task[m.group(1)] = issue
@@ -156,8 +173,11 @@ def main() -> int:
     if blockers.exists():
         open_count = blockers.read_text().count("| Open ")
         if open_count:
-            out += ["", f"**{open_count} open blockers** — see `docs/blockers.md` before assuming "
-                        "an external dependency works."]
+            out += [
+                "",
+                f"**{open_count} open blockers** — see `docs/blockers.md` before assuming "
+                "an external dependency works.",
+            ]
 
     out += [
         "",

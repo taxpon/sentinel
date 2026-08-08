@@ -39,7 +39,8 @@ invalidates the marker, so review the final state, not an earlier one.
 If you chose between defensible options, or someone will later ask "why is it like this?", write a
 record in `docs/adr/` and run `make adr-index`. Criteria and the template are in
 [`docs/implementation-plan.md`](docs/implementation-plan.md#adrs). Do not write one for following a
-library idiom or for a choice the spec already justifies.
+library idiom or for a choice the spec already justifies. A record of `type: architecture` also gets
+a row in the **Design decisions** table of `docs/02-architecture.md` — a test enforces it.
 
 **5. Never modify files outside your task's "Owned files".**
 This is the entire collision-avoidance strategy for parallel sessions. Ownership is declared in
@@ -62,13 +63,26 @@ than making it.
 
 ```bash
 make test          # pytest against the Compose Postgres
-make lint          # ruff + mypy
+make lint          # ruff check + ruff format --check
+make typecheck     # mypy
 make adr-index     # regenerate the ADR index and pointer rules
 make up            # docker compose up -d
 ```
 
-Running tests in more than one worktree at once requires a distinct
-`COMPOSE_PROJECT_NAME` and `POSTGRES_PORT` per tree.
+**`make test` needs a database.** There is no in-memory fallback, so a worktree that has not started
+Postgres fails every database test at setup rather than skipping it. Each worktree runs its own
+Postgres on its own port:
+
+```bash
+export COMPOSE_PROJECT_NAME=sentinel-t06   # anything unique to this tree
+export POSTGRES_PORT=54306                 # a free port per tree
+export API_PORT=8006                       # only needed for `make up`
+make db                                    # starts Postgres; creates .env if it is missing
+export DATABASE_URL=postgresql+asyncpg://sentinel:sentinel@localhost:54306/sentinel
+```
+
+All three variables matter: without `API_PORT`, two worktrees running `make up` collide on host
+port 8000.
 
 ## Project facts worth knowing
 

@@ -1,5 +1,6 @@
 ---
 paths:
+  - ".claude/commands/finish-task.md"
   - ".claude/rules/ui-testing.md"
   - ".claude/settings.json"
   - ".github/workflows/ci.yml"
@@ -13,6 +14,8 @@ paths:
   - "docs/tasks.yaml"
   - "pyproject.toml"
   - "scripts/gen_adr_index.py"
+  - "scripts/seed_issues.py"
+  - "scripts/session_context.py"
   - "src/sentinel/analytics/metrics.py"
   - "src/sentinel/api/webhooks.py"
   - "src/sentinel/config.py"
@@ -40,6 +43,7 @@ You are editing a file covered by an existing decision record. Read the linked A
 changing the behaviour it describes. If you are deliberately overturning it, supersede the
 ADR in the same pull request rather than leaving it contradicted by the code.
 
+- `.claude/commands/finish-task.md` — [Absorb the two predictable rebase conflicts instead of engineering them away](../../docs/adr/2026-08-08-absorb-the-predictable-rebase-conflicts.md)
 - `.claude/rules/ui-testing.md` — [Test the dashboard with component tests only, never a real browser](../../docs/adr/2026-08-08-no-browser-level-tests.md)
 - `.claude/settings.json` — [Enforce the pre-PR review step with a hook, not with CLAUDE.md alone](../../docs/adr/2026-08-07-enforce-workflow-with-hooks.md)
 - `.github/workflows/ci.yml` — [Enforce the tests-with-source rule as a CI job that diffs the pull request](../../docs/adr/2026-08-08-enforce-tests-with-source-by-diffing-the-pull-request.md)
@@ -53,6 +57,8 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `docs/tasks.yaml` — [Keep the task graph in one machine-readable file](../../docs/adr/2026-08-07-tasks-yaml-single-source.md)
 - `pyproject.toml` — [Manage dependencies with uv and a committed lock file](../../docs/adr/2026-08-07-uv-for-dependencies-and-the-image.md)
 - `scripts/gen_adr_index.py` — [Validate ADR front matter at generation time and refuse to write a partial index](../../docs/adr/2026-08-08-validate-adr-front-matter-at-generation.md)
+- `scripts/seed_issues.py` — [Single-file scripts declare the same Python floor as the project](../../docs/adr/2026-08-08-scripts-declare-the-projects-python-floor.md)
+- `scripts/session_context.py` — [Single-file scripts declare the same Python floor as the project](../../docs/adr/2026-08-08-scripts-declare-the-projects-python-floor.md)
 - `src/sentinel/analytics/metrics.py` — [Record every state transition as an append-only event](../../docs/adr/2026-08-07-transitions-are-append-only-events.md)
 - `src/sentinel/api/webhooks.py` — [Acknowledge webhooks with 202 before making any external call](../../docs/adr/2026-08-07-respond-202-before-external-calls.md)
 - `src/sentinel/config.py` — [Hold credentials as SecretStr and rewrite configuration errors before raising them](../../docs/adr/2026-08-08-credentials-are-secretstr-and-config-errors-are-rewritten.md)
