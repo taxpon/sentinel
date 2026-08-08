@@ -197,3 +197,35 @@ export const remediationTimelineFixture: RemediationEvent[] = [
     created_at: '2026-08-08T03:41:30Z',
   },
 ]
+
+/**
+ * A window in which work started and cost real ACUs, but nothing merged. Every merge-relative
+ * figure — MTTR, review latency, autonomy rate, ACU and cost per fix — divides by `merged`, so the
+ * API sends a zero that a panel must not render as a measurement: "$0.00 per fix" next to 24 ACUs
+ * of spend, or "0% autonomous", are the two most expensive wrong numbers on this dashboard.
+ */
+export const unmergedSummaryFixture: AnalyticsSummary = {
+  window: { from: '2026-08-01T00:00:00Z', to: '2026-08-08T00:00:00Z' },
+  funnel: { labelled: 4, session_created: 4, pr_opened: 2, ci_green: 0, merged: 0 },
+  rates: { success: 0, merge: 0, autonomy: 0 },
+  durations_seconds: {
+    to_pr: { p50: 2400, p90: 3000 },
+    to_merge: { p50: 0, p90: 0 },
+    review_latency: { p50: 0, p90: 0 },
+  },
+  cost: {
+    acus_total: 24.5,
+    acus_per_merged_fix: 0,
+    usd_per_fix: 0,
+    unit_cost_usd: 2.25,
+    source: 'derived',
+  },
+  cycles: { mean: 1.5, distribution: { '1': 2, '2': 2 } },
+  throughput: [],
+  failures: [
+    { reason: 'requires_upstream_decision', count: 1, issues: [37] },
+    { reason: 'max_fix_cycles_exceeded', count: 1, issues: [41] },
+  ],
+  impact: { hours_saved: 0, assumption: 'baseline hours per issue class; see docs/05' },
+  generated_at: '2026-08-08T04:12:03Z',
+}
