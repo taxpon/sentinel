@@ -302,8 +302,8 @@ Diagnose the failure and push a fix to the same branch."""
 # evidence should be — and "there is no log" is itself a fact worth stating.
 NO_LOG_OUTPUT: Final = "(No log output was captured for the failing job.)"
 
-# The spec templates only the CI-failure message; this is the second loop edge in
-# `docs/04-state-machine.md`, written to the same rule — state the new fact, restate the goal.
+# The second loop edge in `docs/04-state-machine.md`, written to the same rule as the first — state
+# the new fact, restate the goal.
 CHANGES_REQUESTED_TEMPLATE: Final = """\
 A reviewer requested changes on {pr_url}.
 
@@ -319,7 +319,6 @@ NO_REVIEW_FEEDBACK: Final = "(The reviewer left no written feedback.)"
 # itself, and knowing the budget is what makes "report blocked" a real alternative to churning
 # through the remaining cycles.
 CYCLE_NOTICE_TEMPLATE: Final = """\
-
 This is fix cycle {cycle} of {max_cycles}. If the goal cannot be reached within the
 remaining cycles, report outcome "blocked" with a specific blocked_reason rather
 than continuing."""
@@ -339,7 +338,7 @@ def ci_failure_message(*, sha: str, job_name: str, log: str, cycle: int, max_cyc
     body = CI_FAILURE_TEMPLATE.format(
         sha=sha, job_name=job_name, log_excerpt=excerpt or NO_LOG_OUTPUT
     )
-    return body + "\n" + _cycle_notice(cycle, max_cycles)
+    return f"{body}\n\n{_cycle_notice(cycle, max_cycles)}"
 
 
 def changes_requested_message(
@@ -358,4 +357,4 @@ def changes_requested_message(
     parts = (part.strip() for part in (review_body, *inline_comments))
     review = "\n\n".join(part for part in parts if part)
     body = CHANGES_REQUESTED_TEMPLATE.format(pr_url=pr_url, review=review or NO_REVIEW_FEEDBACK)
-    return body + "\n" + _cycle_notice(cycle, max_cycles)
+    return f"{body}\n\n{_cycle_notice(cycle, max_cycles)}"

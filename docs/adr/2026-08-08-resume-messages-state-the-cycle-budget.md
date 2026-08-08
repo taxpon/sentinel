@@ -33,6 +33,9 @@ specific reason. The spec's CI-failure text is reproduced verbatim ahead of it, 
 changes-requested message is written to the same shape — the pull request, the reviewer's words,
 then the goal restated.
 
+`docs/05-devin-integration.md` carries all three blocks as of this record, so what is sent can still
+be diffed against the document; the tests read the blocks out of it and assert equality.
+
 Passing a cycle outside `1..max_cycles` raises. Reaching the cap is a state-machine transition to
 `FAILED`, not a message to send.
 

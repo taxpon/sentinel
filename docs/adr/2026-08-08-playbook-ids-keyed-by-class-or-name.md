@@ -21,8 +21,9 @@ configuration differently. `docs/05-devin-integration.md` maps the session field
 **eight** issue classes. `.env.example` documents `DEVIN_PLAYBOOK_IDS` as a JSON map of issue class
 to playbook id, which means eight entries, six of them duplicates of another entry's value.
 
-`.env.example` is owned by T01 and is checked against the configuration table in
-`docs/09-operations.md` by `tests/test_env_example.py`, so the wording there is not T15's to change.
+`.env.example` is owned by T01, so the comment above the variable is not T15's to change. The field
+mapping in `docs/05-devin-integration.md` and the configuration table in `docs/09-operations.md` have
+no declared owner and are updated alongside this record.
 
 ## Decision
 

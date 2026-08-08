@@ -60,7 +60,9 @@ def backticked(cell: str) -> list[str]:
 
 SPEC_PLAYBOOK_ROWS = table_rows(section("Playbooks and ACU caps"))
 SPEC_TAG_ROWS = table_rows(section("Tag vocabulary"))
-SPEC_PROMPT, SPEC_RESUME = fenced_blocks(section("Prompt construction"))
+SPEC_PROMPT, SPEC_CI_RESUME, SPEC_CHANGES_REQUESTED, SPEC_CYCLE_NOTICE = fenced_blocks(
+    section("Prompt construction")
+)
 
 
 # --- Playbooks, caps and baselines ---------------------------------------------------------------
@@ -428,10 +430,19 @@ def test_an_issue_with_no_body_still_renders_a_complete_prompt() -> None:
 # --- Resume messages -----------------------------------------------------------------------------
 
 
+def cycle_notice(cycle: int, max_cycles: int) -> str:
+    """The spec's cycle-notice block, rendered — both resume messages end with it."""
+    return (
+        SPEC_CYCLE_NOTICE.strip()
+        .replace("{cycle}", str(cycle))
+        .replace("{max_cycles}", str(max_cycles))
+    )
+
+
 def test_ci_failure_message_renders_the_spec_template() -> None:
     log = "E   assert 1 == 2\nFAILED tests/test_cache.py::test_key"
     expected = (
-        SPEC_RESUME.strip()
+        SPEC_CI_RESUME.strip()
         .replace("{sha}", "abc1234")
         .replace("{job_name}", "python-tests")
         .replace("{log excerpt, last 100 lines}", log)
@@ -439,7 +450,31 @@ def test_ci_failure_message_renders_the_spec_template() -> None:
     message = pb.ci_failure_message(
         sha="abc1234", job_name="python-tests", log=log, cycle=1, max_cycles=3
     )
-    assert message.startswith(expected)
+    assert message == f"{expected}\n\n{cycle_notice(1, 3)}"
+
+
+def test_changes_requested_message_renders_the_spec_template() -> None:
+    review = "This widens the cache key.\n\nsuperset/common/query_context.py:120 — use the schema"
+    expected = (
+        SPEC_CHANGES_REQUESTED.strip()
+        .replace("{pr_url}", "https://github.com/taxpon/superset/pull/7")
+        .replace("{review body, then inline comments}", review)
+    )
+    message = pb.changes_requested_message(
+        pr_url="https://github.com/taxpon/superset/pull/7",
+        review_body="This widens the cache key.",
+        inline_comments=["superset/common/query_context.py:120 — use the schema"],
+        cycle=2,
+        max_cycles=3,
+    )
+    assert message == f"{expected}\n\n{cycle_notice(2, 3)}"
+
+
+def test_the_empty_substitution_fallbacks_are_the_ones_the_spec_names() -> None:
+    """A reviewer diffing the spec against a real session should find the same parentheticals."""
+    prose = section("Prompt construction")
+    for fallback in (pb.NO_LOG_OUTPUT, pb.NO_REVIEW_FEEDBACK, pb.NO_ISSUE_BODY):
+        assert f"`{fallback}`" in prose
 
 
 def test_ci_failure_message_carries_the_cycle_and_the_failure_context() -> None:
