@@ -90,6 +90,9 @@ class FakeRepo:
     """How many matching calls succeed before `broken` starts failing them."""
     error_status: int = 500
     error_body: dict[str, Any] = field(default_factory=lambda: {"message": "Server Error"})
+    error_text: str | None = None
+    """A non-JSON body, for the proxy-in-front-of-GitHub case. Wins over `error_body`."""
+    error_headers: dict[str, str] = field(default_factory=dict)
 
     _matched: int = 0
     _next_hook_id: int = 1
@@ -121,7 +124,13 @@ class FakeRepo:
             ):
                 self._matched += 1
                 if self._matched > self.broken_after:
-                    return httpx.Response(self.error_status, json=self.error_body)
+                    if self.error_text is not None:
+                        return httpx.Response(
+                            self.error_status, text=self.error_text, headers=self.error_headers
+                        )
+                    return httpx.Response(
+                        self.error_status, json=self.error_body, headers=self.error_headers
+                    )
             return handler(request)
 
         return respond
@@ -612,12 +621,43 @@ def test_ignores_a_hook_that_is_not_ours(repo: FakeRepo, run: Run, github_api: F
     assert len(repo.hooks) == 2
 
 
-def test_a_second_sentinel_hook_is_reported_not_removed(
+def test_does_not_promote_a_dead_hook_beside_a_live_one(
+    repo: FakeRepo, run: Run, github_api: FakeAPI, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The precondition is the *expected* first-run state: `docs/09-operations.md#3-webhook` tells
+    the operator to `POST` a hook, which creates unconditionally, and the tunnel URL rotates. Two
+    or three hooks are waiting for anyone who followed it across a restart.
+
+    Repointing the stale one at the tunnel the working one already uses does not consolidate them.
+    It makes both live, and a doubled `check_suite.completed` resumes the same Devin session twice
+    — nothing downstream deduplicates a resume, so the ACUs and the fix cycle are spent twice.
+    """
+    repo.hooks += [
+        a_hook(id=4, url="https://dead-tunnel.trycloudflare.com/webhooks/github"),
+        a_hook(id=9),
+    ]
+
+    assert run("--webhook-url", TUNNEL) == 0
+
+    assert github_api.only("PATCH", f"/repos/{REPO}/hooks/9").json["config"]["url"] == DELIVERY_URL
+    assert github_api.sent("PATCH", f"/repos/{REPO}/hooks/4") == []
+    assert [hook["config"]["url"] for hook in repo.hooks] == [
+        "https://dead-tunnel.trycloudflare.com/webhooks/github",
+        DELIVERY_URL,
+    ]
+    # The one identified for removal is the one that is *not* at the target URL.
+    assert "webhook 4 also delivers to this pipeline" in capsys.readouterr().err
+
+
+def test_keeps_the_oldest_when_none_is_at_the_target_url(
     repo: FakeRepo, run: Run, github_api: FakeAPI, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Two hooks on the same path is somebody's mistake, and guessing which to remove is how a
-    re-run becomes unrecoverable."""
-    repo.hooks += [a_hook(id=4, url="https://old.example/webhooks/github"), a_hook(id=9)]
+    re-run becomes unrecoverable. One is moved; the other is named, never deleted."""
+    repo.hooks += [
+        a_hook(id=4, url="https://old.example/webhooks/github"),
+        a_hook(id=9, url="https://older.example/webhooks/github"),
+    ]
 
     assert run("--webhook-url", TUNNEL) == 0
 
@@ -625,21 +665,58 @@ def test_a_second_sentinel_hook_is_reported_not_removed(
     assert github_api.sent("PATCH", f"/repos/{REPO}/hooks/9") == []
     assert github_api.sent("DELETE") == []
     assert len(repo.hooks) == 2
-    assert "a second webhook delivers to this pipeline (id 9" in capsys.readouterr().err
+    assert "webhook 9 also delivers to this pipeline" in capsys.readouterr().err
 
 
-def test_leaves_the_hook_alone_when_no_url_is_given(
+def test_warns_when_two_hooks_are_both_on_the_target_url(
+    repo: FakeRepo, run: Run, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A condition this script will not create but may find. Saying "left in place" understates
+    it: until one is removed every event arrives twice."""
+    repo.hooks += [a_hook(id=4), a_hook(id=9)]
+
+    assert run("--webhook-url", TUNNEL) == 0
+
+    assert "every event is delivered twice" in capsys.readouterr().err
+
+
+def test_reconciles_the_hook_where_it_is_when_no_url_is_given(
     repo: FakeRepo, run: Run, github_api: FakeAPI, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """`make bootstrap` runs with no URL — the tunnel is started afterwards. Labels are still
-    reconciled; the hook is reported, not rewritten."""
-    repo.hooks.append(a_hook(id=7))
+    """`Makefile` runs the script with no arguments and `docs/09-operations.md` never exports
+    `$TUNNEL_URL`, so this is the default path — the one a rotated `GITHUB_WEBHOOK_SECRET` has to
+    take effect on. Repairing the hook where it stands moves nothing and loses nothing, because a
+    `PATCH` replaces `config` wholesale anyway.
+    """
+    stale = "https://still-running.trycloudflare.com/webhooks/github"
+    repo.hooks.append(
+        a_hook(id=7, url=stale, events=("issues",), content_type="form", active=False)
+    )
 
     assert run() == 0
 
+    body = github_api.only("PATCH", f"/repos/{REPO}/hooks/7").json
+    assert body["config"]["url"] == stale
+    assert body["config"]["secret"] == WEBHOOK_SECRET
+    assert body["config"]["content_type"] == "json"
+    assert body["events"] == list(bootstrap.WEBHOOK_EVENTS)
+    assert body["active"] is True
     assert github_api.sent("POST", f"/repos/{REPO}/hooks") == []
-    assert github_api.sent("PATCH", f"/repos/{REPO}/hooks/7") == []
-    assert f"webhook: left at {DELIVERY_URL}" in capsys.readouterr().out
+    assert repo.hooks[0]["config"]["url"] == stale
+    assert f"webhook: reconciling 7 where it is ({stale})" in capsys.readouterr().out
+
+
+def test_moves_no_hook_when_no_url_is_given(repo: FakeRepo, run: Run, github_api: FakeAPI) -> None:
+    """Reconciling without a URL must never repoint anything — that is the whole difference
+    between it and a run that was told where the tunnel is."""
+    urls = ["https://a.example/webhooks/github", "https://b.example/webhooks/github"]
+    repo.hooks += [a_hook(id=4, url=urls[0]), a_hook(id=9, url=urls[1])]
+
+    assert run() == 0
+
+    assert github_api.only("PATCH", f"/repos/{REPO}/hooks/4").json["config"]["url"] == urls[0]
+    assert github_api.sent("PATCH", f"/repos/{REPO}/hooks/9") == []
+    assert [hook["config"]["url"] for hook in repo.hooks] == urls
 
 
 def test_says_so_when_no_webhook_is_registered_at_all(
@@ -724,6 +801,61 @@ def test_a_failure_partway_through_leaves_the_repository_usable(
     assert [label["name"] for label in repo.labels] == list(EXPECTED_LABELS)
     assert len(repo.hooks) == 1
     assert len(github_api.sent("POST", f"/repos/{REPO}/labels")) == len(EXPECTED_LABELS) + 1
+
+
+# ------------------------------------------------------------------- diagnosing a failure
+
+
+def test_a_403_names_the_permissions_to_check(
+    repo: FakeRepo, run: Run, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`docs/09-operations.md` scopes the PAT to issues, pull requests and contents — none of which
+    covers `PATCH /repos/{repo}` or the hooks endpoints. GitHub's own message for a fine-grained
+    token missing a permission does not say which permission, so the script says it.
+    """
+    repo.broken = ("PATCH", REPO)
+    repo.error_status = 403
+    repo.error_body = {"message": "Resource not accessible by personal access token"}
+
+    assert run("--webhook-url", TUNNEL) == 1
+
+    error = capsys.readouterr().err
+    assert "Administration: write" in error
+    assert "Webhooks: read and write" in error
+
+
+def test_a_rate_limited_403_is_not_confused_with_a_permission(
+    repo: FakeRepo, run: Run, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """GitHub uses `403` for both. Told apart by the headers, or the operator goes looking for a
+    permission that is already granted."""
+    repo.broken = ("PATCH", REPO)
+    repo.error_status = 403
+    repo.error_body = {"message": "You have exceeded a secondary rate limit"}
+    repo.error_headers = {"retry-after": "60", "x-ratelimit-remaining": "0"}
+
+    assert run("--webhook-url", TUNNEL) == 1
+
+    error = capsys.readouterr().err
+    assert "rate limited; wait and re-run" in error
+    assert "Administration" not in error
+
+
+def test_a_non_json_response_is_reported_rather_than_raised(
+    repo: FakeRepo, run: Run, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A tunnel or proxy in front of GitHub answers `200 text/html`. Left to `response.json()` that
+    is a `JSONDecodeError` past `main`'s handler — a traceback instead of the one line telling the
+    operator the run is resumable."""
+    repo.broken = ("GET", REPO)
+    repo.error_status = 200
+    repo.error_text = "<html><body>502 Bad Gateway</body></html>"
+
+    assert run("--webhook-url", TUNNEL) == 1
+
+    error = capsys.readouterr().err
+    assert "did not answer with JSON" in error
+    assert "re-run to complete the remaining steps" in error
 
 
 # ------------------------------------------------------------------------------ the secret

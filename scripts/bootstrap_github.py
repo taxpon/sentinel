@@ -11,7 +11,14 @@ new is the ordinary case rather than the exceptional one.
 
 Every step reconciles rather than recreates. Issues are enabled only when they are off, a label is
 patched only in the fields that differ, and the webhook Sentinel already owns — recognised by the
-receiver path it points at, not by the host, which is what changes — is updated in place.
+receiver path it points at, not by the host, which is what changes — is updated in place. Run
+without `--webhook-url`, as `make bootstrap` does, the hook is still reconciled: everything but its
+URL is brought into line, including the secret.
+
+Where several hooks deliver to the receiver path, the one already at the target URL is the one
+kept, never simply the oldest. See
+`docs/adr/2026-08-09-the-webhook-already-at-the-target-url-is-the-one-kept.md`: repointing a dead
+hook at the tunnel a working hook already uses does not consolidate them, it doubles delivery.
 
 **Nothing here deletes.** A second run has to be survivable against a repository somebody else has
 also configured, and delete-then-recreate is the one shape that is not: it turns a re-run into data
@@ -124,6 +131,31 @@ def _text(value: object) -> str:
     return "" if value is None else str(value)
 
 
+def _hint(response: httpx.Response) -> str:
+    """What to do about a `403`, which GitHub uses for two unrelated things.
+
+    A fine-grained PAT missing a permission is answered with "Resource not accessible by personal
+    access token" and no indication of *which* permission — and the token `docs/09-operations.md`
+    specifies is scoped to issues, pull requests and contents, none of which covers enabling the
+    issue tracker or managing a webhook. Being rate limited looks the same from the status line, so
+    the two are told apart by the headers rather than left ambiguous.
+    """
+    if response.status_code == 429 or (
+        response.status_code == 403
+        and (
+            response.headers.get("x-ratelimit-remaining") == "0"
+            or "retry-after" in response.headers
+        )
+    ):
+        return " — rate limited; wait and re-run."
+    if response.status_code == 403:
+        return (
+            " — check the token's permissions: enabling issues needs Administration: write, "
+            "and the webhook needs Webhooks: read and write."
+        )
+    return ""
+
+
 def desired_labels(settings: Settings) -> tuple[Label, ...]:
     """The label set from `docs/09-operations.md#bootstrap`.
 
@@ -166,8 +198,7 @@ class GitHub:
         self.dry_run = dry_run
 
     def __repr__(self) -> str:
-        # The client this holds is configured with the token; a default repr is one attribute away
-        # from it, and a repr reaches tracebacks.
+        # Names the repository the run is about, where the default names an address.
         return f"GitHub(repo={self.repo!r})"
 
     @property
@@ -175,7 +206,8 @@ class GitHub:
         return f"/repos/{self.repo}"
 
     def get(self, path: str) -> dict[str, Any]:
-        body = self._request("GET", path).json()
+        response = self._request("GET", path)
+        body = self._decoded(response, "GET", path)
         if not isinstance(body, dict):
             raise BootstrapError(f"GET {path} did not answer with an object")
         return body
@@ -192,7 +224,7 @@ class GitHub:
         params: dict[str, Any] | None = {"per_page": PAGE_SIZE}
         while url is not None:
             response = self._request("GET", url, params=params)
-            page = response.json()
+            page = self._decoded(response, "GET", url)
             if not isinstance(page, list):
                 raise BootstrapError(f"GET {url} did not answer with an array")
             items += page
@@ -210,7 +242,7 @@ class GitHub:
         if self.dry_run:
             return {}
         response = self._request(method, path, json=body)
-        decoded = response.json() if response.content else {}
+        decoded = self._decoded(response, method, path) if response.content else {}
         return decoded if isinstance(decoded, dict) else {}
 
     def change(self, message: str) -> None:
@@ -231,13 +263,27 @@ class GitHub:
         if response.is_success:
             return response
         raise BootstrapError(
-            self._redact(
-                f"{method} {path} failed with {response.status_code}: {self._excerpt(response)}"
-            )
+            f"{method} {path} failed with {response.status_code}: "
+            f"{self._excerpt(response)}{_hint(response)}"
         )
 
+    def _decoded(self, response: httpx.Response, method: str, path: str) -> Any:
+        """The JSON body, or a `BootstrapError` naming the request that produced something else.
+
+        A tunnel or a proxy in front of GitHub answers `200 text/html`. Left to `response.json()`
+        that is a `JSONDecodeError` raised past `main`'s handler, so the operator gets a traceback
+        instead of the one line saying the run is resumable.
+        """
+        try:
+            return response.json()
+        except ValueError:
+            raise BootstrapError(
+                f"{method} {path} did not answer with JSON: {self._excerpt(response)}"
+            ) from None
+
     def _excerpt(self, response: httpx.Response) -> str:
-        text = " ".join(response.text.split())
+        """A redacted, single-line excerpt of a response body, for an error message."""
+        text = self._redact(" ".join(response.text.split()))
         return text[:BODY_EXCERPT_CHARS] if text else "no response body"
 
     def _redact(self, text: str) -> str:
@@ -287,53 +333,82 @@ def sync_labels(api: GitHub, labels: Sequence[Label]) -> None:
 
 
 def sync_webhook(api: GitHub, *, url: str | None, secret: SecretStr) -> None:
-    """Register the delivery webhook, or move the existing one to a new tunnel."""
+    """Register the delivery webhook, move the existing one to a new tunnel, or repair it."""
     hooks = [hook for hook in api.collection(f"{api.repo_path}/hooks") if _is_sentinel_hook(hook)]
 
-    if url is None:
-        if hooks:
-            print(f"webhook: left at {_hook_url(hooks[0])} (no --webhook-url given)")
-        else:
+    if not hooks:
+        if url is None:
             print("webhook: not registered")
             api.note(
                 "no webhook delivers to this pipeline. Start a tunnel and re-run with "
                 "--webhook-url <https://…>."
             )
-        return
-
-    config = {
-        "url": url,
-        "content_type": "json",
-        # A delivery signed with the shared secret still travels over the wire, and GitHub will
-        # happily post to a certificate it cannot verify if asked to.
-        "insecure_ssl": "0",
-        "secret": secret.get_secret_value(),
-    }
-    desired: dict[str, Any] = {"active": True, "events": list(WEBHOOK_EVENTS), "config": config}
-
-    if not hooks:
-        api.write("POST", f"{api.repo_path}/hooks", {"name": "web", **desired})
+            return
+        api.write("POST", f"{api.repo_path}/hooks", {"name": "web", **_body(url, secret)})
         api.change(f"webhook: registered {url}")
         return
 
-    hook, *duplicates = hooks
+    hook = _canonical(hooks, url)
     hook_id = hook.get("id")
+    # With no URL to move it to, the hook is reconciled against the one it already has. That is
+    # the path `make bootstrap` takes, and everything but the URL still has to be brought into
+    # line — above all the secret, which is the field a run cannot see and cannot skip.
+    target = url if url is not None else _hook_url(hook)
+    if url is None:
+        print(f"webhook: reconciling {hook_id} where it is ({target}); no --webhook-url given")
+
+    differences = _hook_differences(hook, target)
     # Written every run, even when nothing observably differs. `config.secret` comes back from
-    # GitHub as `********`, so "the hook already has the right secret" is not a knowable state: the
-    # only way to make a rotated GITHUB_WEBHOOK_SECRET take effect is to send it. Re-sending the
-    # same values changes nothing and creates nothing.
-    api.write("PATCH", f"{api.repo_path}/hooks/{hook_id}", desired)
-    differences = _hook_differences(hook, url)
+    # GitHub as `********`, so "the hook already has the right secret" is not a knowable state, and
+    # a PATCH replaces `config` wholesale — omitting the secret would delete it from a working
+    # hook. Re-sending the same values changes nothing and creates nothing.
+    api.write("PATCH", f"{api.repo_path}/hooks/{hook_id}", _body(target, secret))
     api.change(
         f"webhook {hook_id}: updated {', '.join(differences)}"
         if differences
-        else f"webhook {hook_id}: already current at {url}; secret re-applied"
+        else f"webhook {hook_id}: already current at {target}; secret re-applied"
     )
-    for duplicate in duplicates:
+    for other in hooks:
+        if other is hook:
+            continue
+        doubled = " — every event is delivered twice" if _hook_url(other) == target else ""
         api.note(
-            f"a second webhook delivers to this pipeline (id {duplicate.get('id')}, "
-            f"{_hook_url(duplicate)}). Left in place — delete it yourself if it is stale."
+            f"webhook {other.get('id')} also delivers to this pipeline, at "
+            f"{_hook_url(other)}{doubled}. Only {hook_id} is reconciled; delete the other "
+            "yourself once you are sure of it."
         )
+
+
+def _body(url: str, secret: SecretStr) -> dict[str, Any]:
+    """The whole of a hook's configuration. `PATCH` replaces `config`, so it is sent whole."""
+    return {
+        "active": True,
+        "events": list(WEBHOOK_EVENTS),
+        "config": {
+            "url": url,
+            "content_type": "json",
+            # A delivery signed with the shared secret still travels over the wire, and GitHub
+            # will happily post to a certificate it cannot verify if asked to.
+            "insecure_ssl": "0",
+            "secret": secret.get_secret_value(),
+        },
+    }
+
+
+def _canonical(hooks: Sequence[Mapping[str, Any]], url: str | None) -> Mapping[str, Any]:
+    """Which of several hooks on the receiver path is the one to keep.
+
+    The one already delivering to `url`, if there is one; otherwise the oldest, which is the order
+    GitHub lists them in. Picking the oldest unconditionally is what turns "one dead hook and one
+    live hook" into *two* live hooks: repointing the dead one at the tunnel the live one already
+    uses does not consolidate them, it doubles delivery — and a doubled `check_suite.completed`
+    resumes the same Devin session twice, spending the ACUs and the fix cycle twice
+    (`docs/06-event-pipeline.md`, `docs/04-state-machine.md`). Only the domain layer's
+    `(repo, issue_number)` uniqueness absorbs a doubled *start*; nothing absorbs a doubled resume.
+
+    With no URL given there is nothing to prefer by — no hook is being moved — so the oldest it is.
+    """
+    return next((hook for hook in hooks if _hook_url(hook) == url), hooks[0])
 
 
 def _is_sentinel_hook(hook: Mapping[str, Any]) -> bool:
