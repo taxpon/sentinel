@@ -7,8 +7,12 @@ which a test iterating the implementation's own table could never show. Every le
 from the transcription, and every pair *not* in the transcription is asserted to raise.
 
 The transcription is in turn pinned to the document it was transcribed from — see the tests at the
-end, which parse the tables out of `docs/04-state-machine.md` so that editing the spec without
-editing this file fails, in the same spirit as `make adr-check`.
+end, which parse `docs/04-state-machine.md` back out so that editing the spec without editing this
+file fails, in the same spirit as `make adr-check`. That covers the state list, the From and To
+columns, the two pull-request conditions, the state diagram, and the default cycle limit in
+`docs/09-operations.md`. It does **not** cover the transition table's Trigger column, which is free
+prose: which trigger fires which row is a human transcription, and rewriting that prose leaves this
+suite green.
 """
 
 from collections.abc import Iterator
@@ -380,9 +384,9 @@ def test_the_error_names_both_states_and_the_legal_sources() -> None:
 # ---------------------------------------------------------------- the transcription against the doc
 
 
-def spec_table(section: str) -> Iterator[list[str]]:
+def spec_table(section: str, doc: Path = SPEC_DOC) -> Iterator[list[str]]:
     """The rows of the one markdown table under `## <section>`, header and rule dropped."""
-    lines = SPEC_DOC.read_text().splitlines()
+    lines = doc.read_text().splitlines()
     body = lines[lines.index(f"## {section}") + 1 :]
     rows = []
     for line in body:
@@ -392,12 +396,34 @@ def spec_table(section: str) -> Iterator[list[str]]:
             cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
             if not all(set(cell) <= set("-: ") for cell in cells):
                 rows.append(cells)
-    assert len(rows) > 1, f"no table found under '## {section}' in {SPEC_DOC.name}"
+    assert len(rows) > 1, f"no table found under '## {section}' in {doc.name}"
     return iter(rows[1:])
 
 
 def names_in(cell: str) -> list[str]:
     return [part.strip().strip("*`") for part in cell.split(",")]
+
+
+def spec_diagram_edges() -> set[tuple[str | None, str]]:
+    """The `A --> B` edges of the state diagram, with the initial `[*]` read as `None`.
+
+    Terminal `X --> [*]` markers are dropped: they say a state is final, which the "States" table
+    already says and the transition table has no row for.
+    """
+    lines = SPEC_DOC.read_text().splitlines()
+    body = lines[lines.index("```mermaid") + 1 :]
+    edges = set()
+    for line in body:
+        if line.startswith("```"):
+            break
+        if "-->" not in line:
+            continue
+        source, _, rest = line.partition("-->")
+        target = rest.split(":")[0].strip()
+        if target == "[*]":
+            continue
+        edges.add((None if source.strip() == "[*]" else source.strip(), target))
+    return edges
 
 
 def test_the_transcribed_states_match_the_spec_document() -> None:
@@ -448,3 +474,37 @@ def test_the_transcribed_pull_request_conditions_match_the_spec_document() -> No
         for rule in RULES.values()
         if rule.pull_request is PullRequestCondition.UNLINKED
     }
+
+
+def test_the_state_diagram_agrees_with_the_transition_table() -> None:
+    """The picture is what most readers trust, and a picture nobody checks is how this went wrong.
+
+    Exact in both directions for the ordinary edges. The escalation edges are the one asymmetry:
+    the table states them as `any -> BLOCKED` and `any -> FAILED`, and the diagram draws the few
+    worth drawing, so those are only required to be a subset.
+    """
+    escalation = {Trigger.BLOCKED, Trigger.FAILED}
+    ordinary = {
+        (source.value if source else None, target.value)
+        for source, trigger, target in SPEC_TRANSITIONS
+        if trigger not in escalation
+    }
+    escalating = {
+        (source.value if source else None, target.value)
+        for source, trigger, target in SPEC_TRANSITIONS
+        if trigger in escalation
+    }
+    drawn = spec_diagram_edges()
+
+    assert drawn - escalating == ordinary
+    assert drawn <= ordinary | escalating
+
+
+def test_the_default_cycle_limit_matches_the_operations_table() -> None:
+    """The module's one configurable number, so it is read from the spec like everything else."""
+    operations = SPEC_DOC.parent / "09-operations.md"
+    defaults = {
+        names_in(row[0])[0]: row[2].strip("`") for row in spec_table("Configuration", operations)
+    }
+
+    assert defaults["MAX_FIX_CYCLES"] == str(DEFAULT_MAX_FIX_CYCLES)

@@ -14,6 +14,8 @@ stateDiagram-v2
     RUNNING --> CI_RUNNING : fix pushed
     CI_RUNNING --> CI_FAILED
     CI_RUNNING --> CI_PASSED
+    RUNNING --> CI_FAILED : requested missed
+    RUNNING --> CI_PASSED : requested missed
     CI_FAILED --> RUNNING : resume, cycle + 1
     CI_PASSED --> IN_REVIEW
     IN_REVIEW --> CHANGES_REQUESTED

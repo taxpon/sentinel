@@ -42,10 +42,15 @@ link, not by the lap count**:
 - `RUNNING → PR_OPENED` is legal only while none is linked. A later observation is absorbed —
   recorded as an event, state and `pr_opened_at` untouched — rather than raising or moving.
 
-`docs/04-state-machine.md` is corrected in the same branch: the state diagram gains
-`RUNNING --> CI_RUNNING`, the three CI rows gain their second source and their condition, the
-`PR_OPENED` row gains "only while no pull request is linked", and a fifth invariant states that a
-pull request is linked exactly once and that `PR_OPENED` is on every path to CI.
+`docs/04-state-machine.md` is corrected in the same branch: the state diagram gains all three
+widened edges — `RUNNING --> CI_RUNNING`, `RUNNING --> CI_PASSED` and `RUNNING --> CI_FAILED` — the
+three CI rows gain their second source and their condition, the `PR_OPENED` row gains "only while no
+pull request is linked", and a fifth invariant states that a pull request is linked exactly once and
+that `PR_OPENED` is on every path to CI.
+
+The diagram is the artifact most readers see first, and a picture that disagrees with the table is
+what produced this bug in the first place, so it is now compared against the table by the test suite
+rather than by eye.
 
 ## Alternatives considered
 
