@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v9
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       # uv reads the interpreter version from .python-version and installs it if the runner lacks it.
@@ -50,7 +50,7 @@ jobs:
       DATABASE_URL: postgresql+asyncpg://sentinel:sentinel@localhost:5432/sentinel
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v9
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - run: make install
