@@ -31,6 +31,7 @@ paths:
   - "src/sentinel/queue.py"
   - "src/sentinel/security/hmac.py"
   - "tests/conftest.py"
+  - "tests/factories.py"
   - "tests/test_models.py"
   - "uv.lock"
 ---
@@ -73,6 +74,7 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `src/sentinel/policy/dedup.py` — [Deduplicate at both the delivery and the remediation layer](../../docs/adr/2026-08-07-two-layer-deduplication.md)
 - `src/sentinel/queue.py` — [Use Postgres as the job queue instead of adding Redis](../../docs/adr/2026-08-07-postgres-as-job-queue.md)
 - `src/sentinel/security/hmac.py` — [Return a reason from signature verification instead of a boolean or an exception](../../docs/adr/2026-08-08-signature-verification-returns-a-reason.md)
-- `tests/conftest.py` — [Build the test schema by running the migrations, and test for drift](../../docs/adr/2026-08-08-migrations-are-the-schema-tests-run-against.md)
+- `tests/conftest.py` — [Build the test schema by running the migrations, and test for drift](../../docs/adr/2026-08-08-migrations-are-the-schema-tests-run-against.md), [Isolate tests by truncating between them, in the harness rather than in each test](../../docs/adr/2026-08-08-tests-are-isolated-by-the-harness.md)
+- `tests/factories.py` — [Isolate tests by truncating between them, in the harness rather than in each test](../../docs/adr/2026-08-08-tests-are-isolated-by-the-harness.md)
 - `tests/test_models.py` — [Build the test schema by running the migrations, and test for drift](../../docs/adr/2026-08-08-migrations-are-the-schema-tests-run-against.md)
 - `uv.lock` — [Manage dependencies with uv and a committed lock file](../../docs/adr/2026-08-07-uv-for-dependencies-and-the-image.md)

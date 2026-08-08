@@ -1,0 +1,130 @@
+{
+  "action": "labeled",
+  "issue": {
+    "url": "https://api.github.com/repos/taxpon/superset/issues/42876",
+    "repository_url": "https://api.github.com/repos/taxpon/superset",
+    "labels_url": "https://api.github.com/repos/taxpon/superset/issues/42876/labels{/name}",
+    "comments_url": "https://api.github.com/repos/taxpon/superset/issues/42876/comments",
+    "html_url": "https://github.com/taxpon/superset/issues/42876",
+    "id": 5086764849,
+    "node_id": "I_kwDOAlosUs8AAAABLzHfMQ",
+    "number": 42876,
+    "title": "Helm chart: database credentials cannot be loaded from existing secret",
+    "state": "open",
+    "state_reason": null,
+    "locked": false,
+    "active_lock_reason": null,
+    "comments": 3,
+    "created_at": "2026-08-07T04:06:06Z",
+    "updated_at": "2026-08-07T17:32:27Z",
+    "closed_at": null,
+    "author_association": "NONE",
+    "body": "### Bug description\n\nThe structured database credentials introduced in https://github.com/taxpon/superset/pull/41777 only allow for static values, and have no mechanism to load the password value from a secret. This breaks any workflow that only places database credentials as a secret only, such as CNPG or AWS RDS cluster integration. \n\nThis also was a problem with the previous credentials under supersetNode, but I have only encountered this now as I switched to an external database with the Superset V6 upgrade.\n\nI have partially worked around this by specifying an additional `envFromSecrets:` entry, which worked for the application container but is not passed in to the init `wait-for-postgres` job and that still fails in a loop with the stub password entry in the values.\n\n\n### Screenshots/recordings\n\n_No response_\n\n### Superset version\n\n6.1.0\n\n### Python version\n\nNot applicable\n\n### Node version\n\nNot applicable\n\n### Browser\n\nNot applicable\n\n### Additional context\n\nThis is using the latest released version of the chart, 0.22.4. \n\n### Checklist\n\n- [x] I have searched Superset docs and Slack and didn't find a solution to my problem.\n- [x] I have searched the GitHub issue tracker and didn't find a similar bug report.\n- [x] I have checked Superset's logs for errors and if I found a relevant Python stacktrace, I included it here as text in the \"additional context\" section.",
+    "user": {
+      "login": "detjensrobert",
+      "id": 12376078,
+      "node_id": "MDQ6VXNlcjEyMzc2MDc4",
+      "avatar_url": "https://avatars.githubusercontent.com/u/12376078?v=4",
+      "html_url": "https://github.com/detjensrobert",
+      "type": "User",
+      "site_admin": false
+    },
+    "labels": [
+      {
+        "id": 364743841,
+        "node_id": "MDU6TGFiZWwzNjQ3NDM4NDE=",
+        "url": "https://api.github.com/repos/taxpon/superset/labels/validation:required",
+        "name": "validation:required",
+        "color": "D93F0B",
+        "default": false,
+        "description": "A committer should validate the issue"
+      },
+      {
+        "id": 2450071268,
+        "node_id": "MDU6TGFiZWwyNDUwMDcxMjY4",
+        "url": "https://api.github.com/repos/taxpon/superset/labels/deploy:helm",
+        "name": "deploy:helm",
+        "color": "6DA78C",
+        "default": false,
+        "description": ""
+      },
+      {
+        "id": 3112285185,
+        "node_id": "MDU6TGFiZWwzMTEyMjg1MTg1",
+        "url": "https://api.github.com/repos/taxpon/superset/labels/infra:container",
+        "name": "infra:container",
+        "color": "29E7F2",
+        "default": false,
+        "description": "Infra container and K8s"
+      },
+      {
+        "id": 5807047135,
+        "node_id": "LA_kwDOAlosUs8AAAABWiCB3w",
+        "url": "https://api.github.com/repos/taxpon/superset/labels/review:checkpoint",
+        "name": "review:checkpoint",
+        "color": "FF5A5F",
+        "default": false,
+        "description": "Last PR reviewed during the daily review standup"
+      },
+      {
+        "id": 9100000001,
+        "node_id": "LA_kwDOTvMQts8AAAACJTfPQQ",
+        "url": "https://api.github.com/repos/taxpon/superset/labels/devin:autofix",
+        "name": "devin:autofix",
+        "color": "5319e7",
+        "default": false,
+        "description": "Hand this issue to Sentinel"
+      }
+    ],
+    "assignee": null,
+    "assignees": [],
+    "milestone": null
+  },
+  "label": {
+    "id": 9100000001,
+    "node_id": "LA_kwDOTvMQts8AAAACJTfPQQ",
+    "url": "https://api.github.com/repos/taxpon/superset/labels/devin:autofix",
+    "name": "devin:autofix",
+    "color": "5319e7",
+    "default": false,
+    "description": "Hand this issue to Sentinel"
+  },
+  "repository": {
+    "id": 1324552374,
+    "node_id": "R_kgDOTvMQtg",
+    "name": "superset",
+    "full_name": "taxpon/superset",
+    "private": false,
+    "html_url": "https://github.com/taxpon/superset",
+    "description": "Apache Superset is a Data Visualization and Data Exploration Platform",
+    "fork": true,
+    "url": "https://api.github.com/repos/taxpon/superset",
+    "created_at": "2026-08-05T23:15:21Z",
+    "updated_at": "2026-08-08T07:06:34Z",
+    "pushed_at": "2026-08-05T22:40:43Z",
+    "default_branch": "master",
+    "visibility": "public",
+    "archived": false,
+    "disabled": false,
+    "has_issues": true,
+    "open_issues_count": 0,
+    "owner": {
+      "login": "taxpon",
+      "id": 1885971,
+      "node_id": "MDQ6VXNlcjE4ODU5NzE=",
+      "avatar_url": "https://avatars.githubusercontent.com/u/1885971?v=4",
+      "html_url": "https://github.com/taxpon",
+      "type": "User",
+      "site_admin": false
+    }
+  },
+  "sender": {
+    "login": "detjensrobert",
+    "id": 12376078,
+    "node_id": "MDQ6VXNlcjEyMzc2MDc4",
+    "avatar_url": "https://avatars.githubusercontent.com/u/12376078?v=4",
+    "html_url": "https://github.com/detjensrobert",
+    "type": "User",
+    "site_admin": false
+  }
+}
