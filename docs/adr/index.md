@@ -13,6 +13,7 @@ question. See [when to write one](../implementation-plan.md#adrs).
 | Date | Decision | Type | Status | Areas |
 |---|---|---|---|---|
 | 2026-08-08 | [Report success, not neutral, when the scoped CI finds nothing to run](./2026-08-08-vacuous-ci-reports-success.md) | architecture | accepted | remediation, pipeline |
+| 2026-08-08 | [Return a reason from signature verification instead of a boolean or an exception](./2026-08-08-signature-verification-returns-a-reason.md) | architecture | accepted | github, api |
 | 2026-08-08 | [Disable the inherited Superset workflows so a fork head SHA yields one conclusion](./2026-08-08-one-check-suite-on-the-fork.md) | process | accepted | remediation, github |
 | 2026-08-08 | [Enforce the tests-with-source rule as a CI job that diffs the pull request](./2026-08-08-enforce-tests-with-source-by-diffing-the-pull-request.md) | process | accepted | ops |
 | 2026-08-07 | [Manage dependencies with uv and a committed lock file](./2026-08-07-uv-for-dependencies-and-the-image.md) | process | accepted | ops |
@@ -34,10 +35,10 @@ question. See [when to write one](../implementation-plan.md#adrs).
 ## By area
 
 - **analytics** — [Record every state transition as an append-only event](./2026-08-07-transitions-are-append-only-events.md)
-- **api** — [Acknowledge webhooks with 202 before making any external call](./2026-08-07-respond-202-before-external-calls.md)
+- **api** — [Acknowledge webhooks with 202 before making any external call](./2026-08-07-respond-202-before-external-calls.md), [Return a reason from signature verification instead of a boolean or an exception](./2026-08-08-signature-verification-returns-a-reason.md)
 - **data** — [Use Postgres as the job queue instead of adding Redis](./2026-08-07-postgres-as-job-queue.md), [Record every state transition as an append-only event](./2026-08-07-transitions-are-append-only-events.md), [Deduplicate at both the delivery and the remediation layer](./2026-08-07-two-layer-deduplication.md)
 - **devin** — [Give Devin the objective and constraints, not the steps](./2026-08-07-delegate-task-not-steps.md), [Use the Devin v3 API exclusively](./2026-08-07-devin-v3-only.md), [Resume the existing Devin session on CI failure rather than starting a new one](./2026-08-07-reuse-resumable-sessions.md)
-- **github** — [Disable the inherited Superset workflows so a fork head SHA yields one conclusion](./2026-08-08-one-check-suite-on-the-fork.md)
+- **github** — [Disable the inherited Superset workflows so a fork head SHA yields one conclusion](./2026-08-08-one-check-suite-on-the-fork.md), [Return a reason from signature verification instead of a boolean or an exception](./2026-08-08-signature-verification-returns-a-reason.md)
 - **ops** — [Enforce the pre-PR review step with a hook, not with CLAUDE.md alone](./2026-08-07-enforce-workflow-with-hooks.md), [Write every artifact in English, regardless of the working language](./2026-08-07-english-for-artifacts.md), [Isolate parallel sessions with git worktrees and exclusive file ownership](./2026-08-07-parallel-sessions-via-worktrees.md), [Keep the task graph in one machine-readable file](./2026-08-07-tasks-yaml-single-source.md), [Manage dependencies with uv and a committed lock file](./2026-08-07-uv-for-dependencies-and-the-image.md), [Enforce the tests-with-source rule as a CI job that diffs the pull request](./2026-08-08-enforce-tests-with-source-by-diffing-the-pull-request.md)
 - **pipeline** — [Drive the remediation state machine from a poller, not from Devin callbacks](./2026-08-07-poller-drives-state-machine.md), [Use Postgres as the job queue instead of adding Redis](./2026-08-07-postgres-as-job-queue.md), [Resume the existing Devin session on CI failure rather than starting a new one](./2026-08-07-reuse-resumable-sessions.md), [Deduplicate at both the delivery and the remediation layer](./2026-08-07-two-layer-deduplication.md), [Report success, not neutral, when the scoped CI finds nothing to run](./2026-08-08-vacuous-ci-reports-success.md)
 - **remediation** — [Require human approval for every merge](./2026-08-07-humans-approve-every-merge.md), [Add a narrow CI workflow to the fork instead of running Superset full suite](./2026-08-07-scoped-ci-on-the-fork.md), [Disable the inherited Superset workflows so a fork head SHA yields one conclusion](./2026-08-08-one-check-suite-on-the-fork.md), [Report success, not neutral, when the scoped CI finds nothing to run](./2026-08-08-vacuous-ci-reports-success.md)
@@ -52,12 +53,13 @@ Look up your task id before starting work.
 | T03 | [Record every state transition as an append-only event](./2026-08-07-transitions-are-append-only-events.md) |
 | T05 | [Manage dependencies with uv and a committed lock file](./2026-08-07-uv-for-dependencies-and-the-image.md), [Enforce the tests-with-source rule as a CI job that diffs the pull request](./2026-08-08-enforce-tests-with-source-by-diffing-the-pull-request.md) |
 | T06 | [Enforce the pre-PR review step with a hook, not with CLAUDE.md alone](./2026-08-07-enforce-workflow-with-hooks.md) |
+| T10 | [Return a reason from signature verification instead of a boolean or an exception](./2026-08-08-signature-verification-returns-a-reason.md) |
 | T11 | [Use the Devin v3 API exclusively](./2026-08-07-devin-v3-only.md) |
 | T13 | [Use Postgres as the job queue instead of adding Redis](./2026-08-07-postgres-as-job-queue.md) |
 | T15 | [Give Devin the objective and constraints, not the steps](./2026-08-07-delegate-task-not-steps.md) |
 | T16 | [Record every state transition as an append-only event](./2026-08-07-transitions-are-append-only-events.md) |
 | T21 | [Deduplicate at both the delivery and the remediation layer](./2026-08-07-two-layer-deduplication.md) |
-| T22 | [Acknowledge webhooks with 202 before making any external call](./2026-08-07-respond-202-before-external-calls.md) |
+| T22 | [Acknowledge webhooks with 202 before making any external call](./2026-08-07-respond-202-before-external-calls.md), [Return a reason from signature verification instead of a boolean or an exception](./2026-08-08-signature-verification-returns-a-reason.md) |
 | T23 | [Require human approval for every merge](./2026-08-07-humans-approve-every-merge.md), [Resume the existing Devin session on CI failure rather than starting a new one](./2026-08-07-reuse-resumable-sessions.md) |
 | T24 | [Drive the remediation state machine from a poller, not from Devin callbacks](./2026-08-07-poller-drives-state-machine.md) |
 | T41 | [Disable the inherited Superset workflows so a fork head SHA yields one conclusion](./2026-08-08-one-check-suite-on-the-fork.md) |
