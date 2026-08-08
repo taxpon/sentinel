@@ -10,12 +10,16 @@ and the enqueued job together or not at all (`docs/06-event-pipeline.md#ingress-
 therefore commits its claim before running the handler — otherwise the row stays locked for the
 length of the call it is supposed to be tracking.
 
-Three things a caller has to know:
+Four things a caller has to know:
 
 - **A claim is a lease, and the lease is the capability.** `claim()` returns a `ClaimedJob`, and
   `complete()`, `fail()` and `defer()` take it rather than an id: each matches on `locked_by` and
   raises `LeaseLost` if another worker has since reclaimed the row. Without that, a worker that
   stalled past `JOB_LEASE_TIMEOUT_SECONDS` and woke up could retire a job that is running elsewhere.
+- **The lease protects the row, not the work. Handlers must be idempotent.** A worker that is merely
+  slow, rather than dead, is still holding the job when its lease expires and another worker takes
+  it, so the handler runs twice — and for `create_session` that is two Devin sessions and two ACU
+  budgets for one issue. Check for your own effect before repeating it.
 - **Deferral is not failure.** `defer()` leaves `attempts` alone, so a job held back by the
   concurrency cap does not spend the retry budget it will need if the API later starts failing —
   `docs/06-event-pipeline.md#reliability-policy` is explicit, and T21 depends on it.
@@ -81,6 +85,10 @@ class LeaseLost(RuntimeError):
     Raised rather than returned: a worker that has lost its lease has been running a job somebody
     else now owns, and the two must not both decide what happens to the row. Callers that expect it
     — a handler slower than `JOB_LEASE_TIMEOUT_SECONDS` — catch it and abandon the result.
+
+    It says nothing about what the handler already did. By the time this is raised the outbound call
+    has been made and its ACUs are spent, and the reclaiming worker will make it again. The queue
+    cannot prevent that; only the handler can, by checking for its own effect before repeating it.
     """
 
     def __init__(self, job_id: int, worker_id: str) -> None:
@@ -114,13 +122,19 @@ class ClaimedJob:
 # lease older than `JOB_LEASE_TIMEOUT_SECONDS` belongs to a worker that is not coming back. Both are
 # selected by the same `FOR UPDATE SKIP LOCKED` subquery, so a worker still takes exactly one row
 # and never waits for another worker's transaction.
+#
+# `id` tie-breaks the ordering, which the spec's statement leaves open. `run_after` defaults to
+# `now()` — `transaction_timestamp()` — so two jobs enqueued in one transaction carry the same value
+# to the microsecond and would otherwise be claimed in whatever order the plan happened to produce.
+# The ingress writes one job per transaction today, so this decides nothing yet; it costs a column
+# in an ORDER BY and stops the queue being a queue only by coincidence.
 CLAIM = text("""
     UPDATE job SET status = 'running', locked_by = :worker_id, locked_at = now()
     WHERE id = (
         SELECT id FROM job
         WHERE (status IN ('pending', 'deferred') AND run_after <= now())
            OR (status = 'running' AND locked_at <= now() - make_interval(secs => :lease_seconds))
-        ORDER BY run_after
+        ORDER BY run_after, id
         FOR UPDATE SKIP LOCKED
         LIMIT 1
     )
@@ -177,11 +191,14 @@ def backoff_delay(
 ) -> datetime.timedelta:
     """`2^attempts * 5 s` with jitter, capped at ten minutes — the retry row of the spec.
 
-    `attempts` is the count *after* the failure, so the first retry waits ten seconds and the fifth
-    would wait 160. Jitter is equal jitter: half the schedule, plus a random half. `jitter` returns
-    a value in `[0, 1)`, so the result lies in `[base/2, base]` — never so short that a fleet of
-    workers retries a rate-limited API in lockstep, and never longer than the schedule says, which
-    keeps the cap a real ceiling. Injectable so that a test can assert the schedule exactly.
+    `attempts` is the count *after* the failure, so the first retry waits ten seconds and the fourth
+    eighty. Jitter is equal jitter: half the schedule, plus a random half. `jitter` returns a value
+    in `[0, 1)`, so the result lies in `[base/2, base]` — never so short that a fleet of workers
+    retries a rate-limited API in lockstep, and never longer than the schedule says, which keeps the
+    cap a real ceiling. Injectable so that a test can assert the schedule exactly.
+
+    At `MAX_JOB_ATTEMPTS = 5` the cap is unreachable: `fail()` gives up rather than compute a delay
+    for the fifth, so nothing waits longer than eighty seconds unless the limit is raised.
     """
     # `1 << attempts` rather than `2**attempts`: identical, and typed `int`. `int.__pow__` is
     # `Any`, which would make the whole expression untyped and the return value unchecked.

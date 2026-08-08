@@ -555,7 +555,12 @@ async def test_a_deferred_job_waits_and_then_is_claimable_again(
 ) -> None:
     """Deferral rests in its own status so an operator can tell a queue held back by the
     concurrency cap from one backing off (`docs/09-operations.md`), and `run_after` is what brings
-    it back a minute later."""
+    it back a minute later.
+
+    Sixty seconds is written out rather than read from `queue.DEFER_DELAY`: the spec fixes the
+    number — "the job is `deferred` with `run_after = now() + 60 s`" — so an assertion phrased in
+    terms of the constant would follow the constant anywhere it moved and pin nothing.
+    """
     job_id = await enqueue_job(session)
     claimed = await claim_one(session, settings)
     before = await now(session)
@@ -565,10 +570,10 @@ async def test_a_deferred_job_waits_and_then_is_claimable_again(
 
     row = await read_job(session, job_id)
     assert (row.status, row.locked_by, row.locked_at) == (JobStatus.DEFERRED, None, None)
-    assert row.run_after >= before + queue.DEFER_DELAY
+    assert row.run_after == before + datetime.timedelta(seconds=60)
     assert await queue.claim(session, worker_id=WORKER, settings=settings) is None
 
-    await backdate(session, job_id, by=queue.DEFER_DELAY)
+    await backdate(session, job_id, by=datetime.timedelta(seconds=60))
     assert (await claim_one(session, settings)).id == job_id
 
 
@@ -589,7 +594,7 @@ async def test_deferral_does_not_consume_the_retry_budget(
         assert claimed.attempts == 0
         await queue.defer(session, claimed)
         await session.commit()
-        await backdate(session, job_id, by=queue.DEFER_DELAY)
+        await backdate(session, job_id, by=datetime.timedelta(seconds=60))
 
     assert (await read_job(session, job_id)).attempts == 0
 
