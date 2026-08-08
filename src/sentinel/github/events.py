@@ -102,10 +102,12 @@ class Reason(StrEnum):
 class MappedEvent:
     """One delivery, interpreted: what it means, what it is about, and what to apply.
 
-    The identifiers are the ones the ingress path needs in order to *find* the remediation and to
-    link its pull request. Everything else a later job wants is read from
-    `webhook_delivery.payload`, which holds the delivery verbatim — this is a routing decision, not
-    a copy of the body.
+    `repo` with exactly one of `issue_number` / `pr_number` is what finds the remediation. `pr_url`
+    and `head_sha` find nothing — they are carried for the log line and for the resume message,
+    which names the commit CI failed on. Nothing here links a pull request; the poller does that
+    ([ADR](../../../docs/adr/2026-08-08-the-poller-links-the-pull-request.md)). Everything else a
+    later job wants is read from `webhook_delivery.payload`, which holds the delivery verbatim —
+    this is a routing decision, not a copy of the body.
     """
 
     intent: Intent

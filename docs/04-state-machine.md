@@ -59,7 +59,7 @@ stateDiagram-v2
 | `QUEUED` | `SESSION_CREATED` | Worker created the session | `POST /v3/…/sessions`; store `devin_session_id`, `session_created_at` |
 | `QUEUED` | `BLOCKED` | Daily ACU budget exhausted, or issue class unrecognised | Comment on issue, add `needs-human` |
 | `SESSION_CREATED` | `RUNNING` | Poller sees any status but `new` — the session has been claimed. A session first observed at `exit` still passes through here, because invariant 5 puts `PR_OPENED` on every path to CI and `RUNNING` is the only state it is reachable from | — |
-| `RUNNING` | `PR_OPENED` | `pull_request.opened` from Devin's bot, or `pull_requests[]` on the session — **only while no pull request is linked** | Link PR to remediation, set `pr_opened_at`. Both are write-once: a later observation changes nothing. A repeat webhook delivery is recorded in `remediation_event`; a repeat poller observation is not ([ADR](./adr/2026-08-08-the-poller-records-only-what-moves.md)) |
+| `RUNNING` | `PR_OPENED` | `pull_requests[]` on the session, observed by the poller — **only while no pull request is linked**. The `pull_request.opened` webhook carries no key that can find its remediation and is dropped ([ADR](./adr/2026-08-08-the-poller-links-the-pull-request.md)) | Link PR to remediation, set `pr_opened_at`. Write-once: a later observation is recorded and otherwise ignored ([ADR](./adr/2026-08-08-the-poller-records-only-what-moves.md)) |
 | `PR_OPENED`, `RUNNING` | `CI_RUNNING` | `check_suite.requested` on the head SHA — **requires a linked pull request** | — |
 | `PR_OPENED`, `RUNNING`, `CI_RUNNING`, `CI_FAILED` | `CI_PASSED` | `check_suite.completed`, conclusion `success` — **requires a linked pull request** | Set `ci_green_at` |
 | `PR_OPENED`, `RUNNING`, `CI_RUNNING`, `CI_PASSED`, `IN_REVIEW` | `CI_FAILED` | `check_suite.completed`, conclusion `failure`/`timed_out` — **requires a linked pull request** | Enqueue `resume_session` |
@@ -68,8 +68,37 @@ stateDiagram-v2
 | `IN_REVIEW` | `CHANGES_REQUESTED` | `pull_request_review.submitted`, state `changes_requested` | Enqueue `resume_session` |
 | **`CHANGES_REQUESTED`** | **`RUNNING`** | Worker resumed the session | Forward review body and inline comments via `POST /v3/…/messages`, increment `cycle` |
 | `IN_REVIEW` | `MERGED` | `pull_request.closed` with `merged: true` | Set `merged_at`, append tag `outcome:merged`, close the issue |
-| any | `BLOCKED` | `structured_output.outcome == "blocked"` | Store `blocked_reason`, comment on issue, add `needs-human` |
-| any | `FAILED` | Session status `error`, ACU cap hit, `cycle > MAX_FIX_CYCLES`, or the work was **cancelled** — `issues.unlabeled` / `issues.closed` ([ADR](./adr/2026-08-08-cancellation-is-recorded-as-failed.md)) | Store reason in `blocked_reason`, comment on issue, add `needs-human` — **except after a cancellation**, which a human has already decided |
+| any | `BLOCKED` | `structured_output.outcome == "blocked"`, or a session Devin reports as `running` and stalled on `status_detail: waiting_for_user` ([ADR](./adr/2026-08-08-a-stalled-session-is-blocked.md)) | Store `blocked_reason`, comment on issue, add `needs-human` |
+| any | `FAILED` | Session status `error`; `cycle > MAX_FIX_CYCLES`; or, **while no pull request is linked**, `acus_consumed` reaching `ACU_CAPS[issue_class]` or Devin finishing the session with nothing to show ([ADR](./adr/2026-08-08-a-session-with-nothing-to-show-fails.md)) | Store reason, comment on issue, add `needs-human` |
+
+## Check suite events
+
+Sentinel does not choose when a check suite reports, so a `check_suite` event can arrive in **any**
+state that can hold a linked pull request: `PR_OPENED`, `RUNNING`, `CI_RUNNING`, `CI_FAILED`,
+`CI_PASSED`, `IN_REVIEW`, `CHANGES_REQUESTED`. None of them may reject one. Where the event carries
+no verdict the state does not already have, it is recorded in `remediation_event` and otherwise
+ignored — the same treatment a terminal state gives a late webhook.
+
+| Trigger | Moves from | Recorded and ignored from |
+|---|---|---|
+| `check_suite.requested` | `PR_OPENED`, `RUNNING` | `CI_RUNNING`, `CI_FAILED`, `CI_PASSED`, `IN_REVIEW`, `CHANGES_REQUESTED` |
+| `check_suite.completed` conclusion `success` | `PR_OPENED`, `RUNNING`, `CI_RUNNING`, `CI_FAILED` | `CI_PASSED`, `IN_REVIEW`, `CHANGES_REQUESTED` |
+| `check_suite.completed` conclusion `failure` | `PR_OPENED`, `RUNNING`, `CI_RUNNING`, `CI_PASSED`, `IN_REVIEW` | `CI_FAILED`, `CHANGES_REQUESTED` |
+
+Reading the rows:
+
+- **`PR_OPENED` moves on a conclusion.** This is the ordinary first lap, not an edge case. The
+  poller is what links the pull request ([ADR](./adr/2026-08-07-poller-drives-state-machine.md)),
+  and it does so up to `POLL_INTERVAL_SECONDS` after the pull request appeared — routinely after
+  the first `check_suite.requested` has already been dropped as unresolvable. The remediation is
+  therefore sitting in `PR_OPENED`, not `CI_RUNNING`, when the conclusion arrives.
+- **A suite starting again is never news.** Pulling a remediation out of review, or out of the fix
+  loop, to record that CI restarted would lose the state that matters. The conclusion follows.
+- **A second success is ignored.** `ci_green_at` is the *first* successful suite
+  ([03](./03-data-model.md)), and a success must not drag a remediation back out of review.
+- **A failure is news almost everywhere**, including `IN_REVIEW`, where nothing else would re-engage
+  the fix loop. Not in `CHANGES_REQUESTED`, which already has a `resume_session` pending that will
+  produce a fresh suite of its own, and not twice over in `CI_FAILED`.
 
 ## The review-fix loop
 

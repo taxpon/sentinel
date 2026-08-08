@@ -91,8 +91,12 @@ sequenceDiagram
     end
 
     D->>GH: push branch, open pull request
-    GH->>API: pull_request.opened
-    API->>DB: state = PR_OPENED
+    P->>D: GET /v3/organizations/{org}/sessions/{id}
+    D-->>P: pull_requests[]
+    P->>DB: link PR, state = PR_OPENED
+    Note over P,DB: the pull_request.opened webhook carries no key<br/>that finds the remediation, so the poller links it
+    GH->>API: check_suite.requested
+    API->>DB: state = CI_RUNNING
     GH->>API: check_suite.completed (success)
     API->>DB: state = CI_PASSED
     M->>GH: approve and merge

@@ -70,11 +70,20 @@ request link, so taking one would suggest it changes the answer.
 ## Consequences
 
 The caller's shape is fixed and small: map, look up or upsert, `trigger_for`, and transition only if
-it returned something. **Whatever `trigger_for` returns can be applied** — the caller never has to
-guard `transition()` against a remediation that turned out not to exist, which is the mistake this
-otherwise invites, since it is the ordinary case for a repository people also use by hand. Every
-row of the table is asserted against `trigger_for(mapped, None)` in `tests/test_events.py`, and the
-triggers it does return are put through `transition()` there rather than merely compared.
+it returned something. The caller never has to guard `transition()` against a remediation that
+turned out **not to exist** — the mistake this otherwise invites, since that is the ordinary case
+for a repository people also use by hand. Every row of the table is asserted against
+`trigger_for(mapped, None)` in `tests/test_events.py`, and the triggers it does return are put
+through `transition()` there rather than merely compared.
+
+The guarantee is about existence and nothing else. A returned trigger may still be illegal from the
+state the remediation is actually in, and should be — an impossible sequence inside the lifecycle
+raises by design (invariant 6). One such sequence is reachable today with no fault at the call site:
+a remediation in `PR_OPENED` whose `check_suite.requested` was lost, receiving the `completed` that
+follows, which neither CI trigger admits from `PR_OPENED`. See
+[the poller record](./2026-08-08-the-poller-links-the-pull-request.md) for why that `requested` is
+commonly lost and for the transition-table widening in flight with T14. Until that lands, T22 will
+see a raise it did not cause.
 
 The cost is that a reader has to know both functions to see the whole rule: `MappedEvent.trigger` is
 what the table says and `trigger_for` is what to apply, and they differ at the existence boundary.

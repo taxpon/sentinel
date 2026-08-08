@@ -388,6 +388,38 @@ def test_the_autofix_label_is_the_configured_one(settings: Settings) -> None:
     assert map_event("issues", body, settings=renamed).intent is Intent.START_REMEDIATION
 
 
+ELSEWHERE: Final = "taxpon/sentinel-demo"
+
+
+def test_the_recorded_repository_is_turned_away_when_it_is_not_the_target(
+    settings: Settings,
+) -> None:
+    """`TARGET_REPO` is the whole of what stops another repository steering the pipeline, so a
+    hardcoded one would keep accepting `taxpon/superset` however the deployment is configured."""
+    moved = settings.model_copy(update={"target_repo": ELSEWHERE})
+
+    mapped = map_event("issues", github_payload("issues.labeled"), settings=moved)
+
+    assert (mapped.intent, mapped.reason) == (Intent.IGNORED, Reason.OTHER_REPOSITORY)
+
+
+@pytest.mark.parametrize("row", SUBSCRIBED, ids=by_id)
+def test_every_row_takes_the_repository_from_the_configuration(
+    row: Row, settings: Settings
+) -> None:
+    """Reconfigured, every row behaves identically and every intent carries the new name — which
+    pins `repo` down at each of the four places a subject is built, rather than at the one place the
+    single-row test happens to reach."""
+    moved = settings.model_copy(update={"target_repo": ELSEWHERE})
+    body = row.build()
+    body["repository"]["full_name"] = ELSEWHERE
+
+    mapped = map_event(row.event, body, settings=moved)
+
+    assert (mapped.intent, mapped.trigger, mapped.reason) == (row.intent, row.trigger, row.reason)
+    assert mapped.repo == (None if mapped.ignored else ELSEWHERE)
+
+
 @pytest.mark.parametrize("conclusion", ["cancelled", "neutral", "skipped", "stale", None])
 def test_a_check_suite_conclusion_the_spec_does_not_list_is_ignored(
     conclusion: str | None, settings: Settings
@@ -484,7 +516,12 @@ AUTOFIX_LABEL: Final = {"name": "devin:autofix"}
         ),
         pytest.param(
             "check_suite",
-            {"action": "completed", "check_suite": {"conclusion": "success", "pull_requests": {}}},
+            # Non-empty, so that it reaches the subscript: an empty mapping is falsy and would be
+            # turned away by the truthiness check before the type of the container mattered.
+            {
+                "action": "completed",
+                "check_suite": {"conclusion": "success", "pull_requests": {"a": 1}},
+            },
             Reason.NO_SUBJECT,
             id="pull-requests-is-not-a-list",
         ),
@@ -498,10 +535,36 @@ AUTOFIX_LABEL: Final = {"name": "devin:autofix"}
             "issue_comment", {"action": "created", "comment": {}}, Reason.NO_MENTION, id="no-body"
         ),
         pytest.param(
+            "issue_comment",
+            {"action": "created", "comment": {"body": 42}},
+            Reason.NO_MENTION,
+            id="comment-body-is-not-a-string",
+        ),
+        pytest.param(
+            # Past the mention check, so that the missing subject is what decides it: an intent with
+            # no lookup key is the defect this whole guard exists to prevent.
+            "issue_comment",
+            {"action": "created", "comment": {"body": DEVIN_BOT_MENTION}, "issue": {}},
+            Reason.NO_SUBJECT,
+            id="mention-on-nothing",
+        ),
+        pytest.param(
             "pull_request_review",
             {"action": "submitted"},
             Reason.UNHANDLED_REVIEW_STATE,
             id="no-review",
+        ),
+        pytest.param(
+            "pull_request_review",
+            {"action": "submitted", "review": {"state": "approved"}},
+            Reason.NO_SUBJECT,
+            id="review-of-no-pull-request",
+        ),
+        pytest.param(
+            "pull_request_review",
+            {"action": "submitted", "review": {"state": "changes_requested"}, "pull_request": {}},
+            Reason.NO_SUBJECT,
+            id="review-of-a-pull-request-without-a-number",
         ),
         pytest.param("ping", {}, Reason.PING, id="ping-without-a-repository"),
     ],

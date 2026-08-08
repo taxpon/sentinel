@@ -69,12 +69,29 @@ the pull request actually opened, so time-to-PR in [07](../07-observability.md) 
 error. On a measure whose interesting values are minutes, that is acceptable; it is not free, and it
 is the number to check first if time-to-PR ever looks suspiciously uniform.
 
-A `check_suite.requested` arriving before the poller has linked the pull request is also lost — the
-lookup finds no remediation. This is not new: `Trigger.CHECK_SUITE_REQUESTED` requires a linked pull
-request, so the state machine already ordered the link first, and the CI states are re-enterable from
-`RUNNING` ([ADR](./2026-08-08-ci-states-re-entered-from-running.md)) exactly so that a missed CI
-event is recoverable.
+The second cost is not latency, and it is not yet paid off. A `check_suite.requested` arriving before
+the poller has linked the pull request is lost: the lookup finds no remediation, and `trigger_for`
+absorbs it. That the *link* comes first is by design — `Trigger.CHECK_SUITE_REQUESTED` requires a
+linked pull request, so the state machine already ordered them. What follows from the loss is not.
 
-**What would tell us this was wrong:** time-to-PR mattering at second resolution, or the session
-prompt gaining a required "Closes #N" line — either would make the webhook path both feasible and
-worth having, and this record should then be superseded rather than quietly worked around.
+The remediation is left in `PR_OPENED`, and as the transition table stands today **neither
+`check_suite.completed` trigger is legal from `PR_OPENED`**: both list `CI_RUNNING, RUNNING`, so the
+completion that arrives a minute later raises `IllegalTransitionError` rather than moving it on. Lap
+one is stranded. The re-entry from `RUNNING` that
+[ADR](./2026-08-08-ci-states-re-entered-from-running.md) provides does not cover this — it is about
+lap two onward, once a resume has already returned the remediation to `RUNNING`, whereas lap one
+sits in `PR_OPENED` precisely because linking is what put it there. And with a poll interval of 20
+seconds against the gap between a pull request opening and its first check suite, losing the
+`requested` is the ordinary ordering, not an unlucky one.
+
+The fix is one line in `src/sentinel/pipeline/state.py` — `PR_OPENED` added to the sources of both
+`completed` triggers — which is T14's file and is **in flight with T14 as of 2026-08-08**. Until it
+lands, this decision leaves lap one dependent on the `requested` webhook winning a race it usually
+loses. Recorded here rather than worked around in the mapping, because widening the transition table
+is the correct fix and belongs to the module that owns it.
+
+**What would tell us this was wrong:** remediations sitting in `PR_OPENED` with a green pull request
+— the symptom of the above, if the state machine change does not land. Beyond that: time-to-PR
+mattering at second resolution, or the session prompt gaining a required "Closes #N" line, either of
+which would make the webhook path both feasible and worth having, and this record should then be
+superseded rather than quietly worked around.
