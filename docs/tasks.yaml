@@ -10,6 +10,10 @@
 #   - Tasks in the same wave are independent of each other and may run in parallel.
 #   - `owns` is exclusive: a task must not modify files owned by another task.
 #   - `adrs` links decision records; keep in sync with docs/adr/ front matter.
+#   - Every package directory under src/sentinel/ carries an `__init__.py`, owned by the first
+#     task to create the directory and listed here explicitly. Sub-packages would resolve as
+#     namespace packages without one, but leaving it implicit means several parallel tasks each
+#     decide independently, and two deciding differently is a conflict on a file nobody owns.
 
 meta:
   repo: taxpon/sentinel
@@ -104,7 +108,8 @@ tasks:
     owns:
       - .github/workflows/ci.yml
     depends_on: [T01]
-    adrs: []
+    adrs:
+      - 2026-08-08-enforce-tests-with-source-by-diffing-the-pull-request
     notes: >-
       ruff, mypy, pytest on a Postgres service, dashboard build and tests,
       compose config validation. Also enforces P1: a change under src/sentinel/**
@@ -151,6 +156,7 @@ tasks:
     area: github
     spec: docs/06-event-pipeline.md#signature-verification
     owns:
+      - src/sentinel/security/__init__.py
       - src/sentinel/security/hmac.py
       - tests/test_hmac.py
     depends_on: [T01]
@@ -163,6 +169,7 @@ tasks:
     area: devin
     spec: docs/05-devin-integration.md#endpoints-used
     owns:
+      - src/sentinel/devin/__init__.py
       - src/sentinel/devin/client.py
       - src/sentinel/devin/schemas.py
       - tests/test_devin_client.py
@@ -179,6 +186,7 @@ tasks:
     area: github
     spec: docs/06-event-pipeline.md#subscribed-events
     owns:
+      - src/sentinel/github/__init__.py
       - src/sentinel/github/client.py
       - tests/test_github_client.py
     depends_on: [T02, T04]
@@ -203,6 +211,7 @@ tasks:
     area: pipeline
     spec: docs/04-state-machine.md
     owns:
+      - src/sentinel/pipeline/__init__.py
       - src/sentinel/pipeline/state.py
       - tests/test_state.py
     depends_on: [T01]
@@ -231,6 +240,7 @@ tasks:
     area: analytics
     spec: docs/07-observability.md#metric-definitions
     owns:
+      - src/sentinel/analytics/__init__.py
       - src/sentinel/analytics/metrics.py
       - tests/test_analytics.py
     depends_on: [T03, T04]
@@ -245,6 +255,7 @@ tasks:
     area: ops
     spec: docs/07-observability.md#logging
     owns:
+      - src/sentinel/observability/__init__.py
       - src/sentinel/observability/logging.py
       - src/sentinel/observability/prom.py
       - tests/test_logging.py
@@ -271,6 +282,7 @@ tasks:
     area: pipeline
     spec: docs/06-event-pipeline.md#reliability-policy
     owns:
+      - src/sentinel/policy/__init__.py
       - src/sentinel/policy/
       - tests/test_policy.py
     depends_on: [T03, T11, T13]
@@ -283,6 +295,7 @@ tasks:
     area: api
     spec: docs/06-event-pipeline.md#ingress-path
     owns:
+      - src/sentinel/api/__init__.py
       - src/sentinel/api/webhooks.py
       - tests/test_webhooks.py
     depends_on: [T10, T13, T20]
@@ -472,6 +485,7 @@ tasks:
     area: remediation
     spec: docs/05-devin-integration.md#scheduled-sweep
     owns:
+      - src/sentinel/scanner/__init__.py
       - src/sentinel/scanner/audit.py
       - tests/test_scanner.py
     depends_on: [T12]
