@@ -8,10 +8,19 @@ the documented default and required-ness. `.env.example` is the canonical list o
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from functools import cache
+from types import MappingProxyType
 from typing import Annotated, Any, Literal
 
-from pydantic import Field, SecretStr, ValidationError, field_validator
+from pydantic import (
+    AfterValidator,
+    Field,
+    SecretStr,
+    ValidationError,
+    field_serializer,
+    field_validator,
+)
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 DATABASE_URL_SCHEME = "postgresql+asyncpg://"
@@ -51,6 +60,8 @@ class Settings(BaseSettings):
         # Nothing writes to the settings, and `get_settings()` hands the same object to the api, the
         # worker and the poller, so one assignment anywhere would reconfigure the whole process —
         # past every validator here, and past SecretStr, since the assigned value is a plain str.
+        # Freezing stops a field being rebound; it does not reach inside one, so the two container
+        # fields below are held in immutable types of their own.
         frozen=True,
     )
 
@@ -61,8 +72,12 @@ class Settings(BaseSettings):
     devin_enterprise_id: str | None = None
     # NoDecode turns off the built-in JSON handling so that a malformed value fails as a validation
     # error naming the variable, rather than as a SettingsError raised before validation begins.
-    devin_playbook_ids: Annotated[dict[str, str], NoDecode]
-    devin_knowledge_ids: Annotated[list[str], NoDecode] = []
+    #
+    # Both are held immutably. This map decides which playbook Devin runs for an issue class, on an
+    # object every module in the process shares, so a stray write to it would silently redirect the
+    # remediation; freezing the model above stops a field being rebound but not edited in place.
+    devin_playbook_ids: Annotated[Mapping[str, str], NoDecode, AfterValidator(MappingProxyType)]
+    devin_knowledge_ids: Annotated[tuple[str, ...], NoDecode] = ()
 
     # --- GitHub ---
     github_token: SecretStr = Field(min_length=1)
@@ -99,10 +114,24 @@ class Settings(BaseSettings):
     def _parse_knowledge_ids(cls, value: Any) -> Any:
         return _decode_json(value, "DEVIN_KNOWLEDGE_IDS")
 
+    @field_serializer("devin_playbook_ids")
+    def _serialize_playbook_ids(self, value: Mapping[str, str]) -> dict[str, str]:
+        # pydantic cannot serialize a mappingproxy on its own, and `model_dump_json` is how the
+        # startup log line is built.
+        return dict(value)
+
+    @field_validator("devin_enterprise_id", mode="before")
+    @classmethod
+    def _absent_enterprise_id(cls, value: Any) -> Any:
+        # Blank means the same as omitted — fall back to the locally derived metrics. Consumers ask
+        # `is None`, so a whitespace-only value must not survive as an empty string.
+        return None if isinstance(value, str) and not value.strip() else value
+
     @field_validator("log_level", mode="before")
     @classmethod
     def _normalise_log_level(cls, value: Any) -> Any:
-        return value.lower() if isinstance(value, str) else value
+        # `str_strip_whitespace` does not reach a Literal field, so strip here too.
+        return value.strip().lower() if isinstance(value, str) else value
 
     @field_validator("database_url")
     @classmethod
@@ -118,10 +147,16 @@ def _describe(error: ValidationError) -> str:
     """Render the failures as variable names and messages, never the values they rejected."""
     lines: list[str] = []
     for item in error.errors(include_url=False):
+        location = item["loc"]
+        # An empty `loc` belongs to a model-wide error, of which there are none today. It must still
+        # not raise: an IndexError here would be raised while the ValidationError is being handled,
+        # which re-attaches it to the ConfigurationError as `__context__` and undoes the whole point
+        # of this function.
+        variable = str(location[0]).upper() if location else "configuration"
         # The tail of `loc` is kept: for DEVIN_PLAYBOOK_IDS it is the offending issue class, which
-        # the operator needs in order to find the bad entry. It is a key, never a value.
-        parts = [str(part) for part in item["loc"]]
-        variable = ".".join([parts[0].upper(), *parts[1:]])
+        # the operator needs in order to find the bad entry. It is a key or an index, never a value.
+        for part in location[1:]:
+            variable += f"[{part}]" if isinstance(part, int) else f".{part}"
         lines.append(f"  {variable}: {item['msg']}")
     return "\n".join(
         ["invalid configuration — see .env.example and docs/09-operations.md:", *lines]

@@ -1,8 +1,10 @@
 """The configuration table in `docs/09-operations.md#configuration` is the contract; these tests
-check the model against it. Names, required-ness and the defaults are read back out of the table
-itself, via the parser `tests/test_env_example.py` already uses to hold `.env.example` to it — so
-the file, the table and the model cannot drift apart in any pair. The expected *values* below are
-transcribed by hand, because a test that derives them from the model would agree with any model."""
+check the model against it. Names, required-ness and every documented default are read back out of
+the table itself, via the parser `tests/test_env_example.py` already uses to hold `.env.example` to
+it — so the file, the table and the model cannot drift apart in any pair. Two rows document no
+default at all, and for those the table can only say that the model must not invent one; their
+values are pinned by the hand-transcribed DEFAULTS below, as are the types, which the table's
+strings cannot express."""
 
 from __future__ import annotations
 
@@ -30,7 +32,7 @@ REQUIRED = {
 DEFAULTS: dict[str, object] = {
     "DEVIN_API_BASE": "https://api.devin.ai",
     "DEVIN_ENTERPRISE_ID": None,
-    "DEVIN_KNOWLEDGE_IDS": [],
+    "DEVIN_KNOWLEDGE_IDS": (),
     "TARGET_REPO": "taxpon/superset",
     "TARGET_BASE_BRANCH": "master",
     "AUTOFIX_LABEL": "devin:autofix",
@@ -107,10 +109,17 @@ def test_the_model_default_is_the_value_the_table_documents(load: Load, variable
     # comparing the unset variable against the same variable set to its documented default.
     documented = documented_variables()[variable].default
     attribute = variable.lower()
+    unset = getattr(load(**{variable: None}), attribute)
 
-    assert getattr(load(**{variable: None}), attribute) == getattr(
-        load(**{variable: documented}), attribute
-    )
+    if not documented:
+        # DEVIN_ENTERPRISE_ID and DEVIN_KNOWLEDGE_IDS document no default. Setting them to the
+        # documented value would just be setting them blank, which means unset, so the comparison
+        # below would be with themselves. What the table does say is that there is nothing to fall
+        # back to, so the model must not invent a value.
+        assert not unset
+        return
+
+    assert unset == getattr(load(**{variable: documented}), attribute)
 
 
 @pytest.mark.parametrize(("variable", "expected"), sorted(DEFAULTS.items()))
@@ -143,10 +152,22 @@ def test_a_blank_required_variable_is_rejected(load: Load, variable: str, blank:
 
 
 def test_whitespace_around_a_pasted_value_is_discarded(load: Load) -> None:
-    settings = load(DEVIN_ORG_ID="  org-pasted  ", DEVIN_API_TOKEN="  cog_pasted\t")
+    settings = load(
+        DEVIN_ORG_ID="  org-pasted  ",
+        DEVIN_API_TOKEN="  cog_pasted\t",
+        LOG_LEVEL="  INFO  ",
+    )
 
     assert settings.devin_org_id == "org-pasted"
     assert settings.devin_api_token.get_secret_value() == "cog_pasted"
+    assert settings.log_level == "info"
+
+
+def test_an_optional_variable_left_as_whitespace_reads_as_absent(load: Load) -> None:
+    # The enterprise metrics panel falls back when this is unset, and the consumer asks `is None`.
+    # An empty string would tell it the panel is configured.
+    assert load(DEVIN_ENTERPRISE_ID="   ").devin_enterprise_id is None
+    assert load(DEVIN_ENTERPRISE_ID="ent-1").devin_enterprise_id == "ent-1"
 
 
 def test_missing_required_variables_are_reported_together(load: Load) -> None:
@@ -169,10 +190,23 @@ def test_playbook_ids_parse_into_a_mapping_of_issue_class_to_playbook(load: Load
     }
 
 
-def test_knowledge_ids_parse_into_a_list(load: Load) -> None:
+def test_knowledge_ids_parse_into_a_sequence_in_the_documented_order(load: Load) -> None:
     settings = load(DEVIN_KNOWLEDGE_IDS='["note-1", "note-2"]')
 
-    assert settings.devin_knowledge_ids == ["note-1", "note-2"]
+    assert settings.devin_knowledge_ids == ("note-1", "note-2")
+
+
+def test_the_parsed_containers_cannot_be_edited_in_place(load: Load) -> None:
+    # Freezing the model stops a field being rebound, not the container behind it. This one decides
+    # which playbook Devin runs, on an object every module in the process shares.
+    settings = load()
+
+    with pytest.raises(TypeError):
+        settings.devin_playbook_ids["security"] = "hijacked"  # type: ignore[index]  # the point
+    with pytest.raises(AttributeError):
+        settings.devin_knowledge_ids.append("hijacked")  # type: ignore[attr-defined]  # the point
+
+    assert settings.devin_playbook_ids["security"] == "playbook-sec"
 
 
 @pytest.mark.parametrize(
@@ -192,6 +226,27 @@ def test_malformed_json_variables_are_rejected(load: Load, variable: str, value:
         load(**{variable: value})
 
     assert variable in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("variable", "value", "located"),
+    [
+        (
+            "DEVIN_PLAYBOOK_IDS",
+            '{"security": "ok", "flaky-test": 17}',
+            "DEVIN_PLAYBOOK_IDS.flaky-test",
+        ),
+        ("DEVIN_KNOWLEDGE_IDS", '["note-1", 17]', "DEVIN_KNOWLEDGE_IDS[1]"),
+    ],
+)
+def test_a_bad_entry_is_located_within_its_variable(
+    load: Load, variable: str, value: str, located: str
+) -> None:
+    # Naming the variable is not enough when it holds a dozen entries; the operator needs the one.
+    with pytest.raises(ConfigurationError) as raised:
+        load(**{variable: value})
+
+    assert located in str(raised.value)
 
 
 def test_the_database_url_must_name_the_asyncpg_driver(load: Load) -> None:
@@ -355,7 +410,7 @@ def test_the_blank_lines_in_env_example_do_not_configure_empty_values(load: Load
     settings = load(DEVIN_ENTERPRISE_ID="", DEVIN_KNOWLEDGE_IDS="", TARGET_REPO="")
 
     assert settings.devin_enterprise_id is None
-    assert settings.devin_knowledge_ids == []
+    assert settings.devin_knowledge_ids == ()
     assert settings.target_repo == "taxpon/superset"
 
 

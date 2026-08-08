@@ -30,12 +30,14 @@ whatever collects those logs.
 
 Every credential field is a `SecretStr`, including `DATABASE_URL`; consumers call
 `.get_secret_value()` at the point of use. The settings object is `frozen`, so no later assignment
-can replace a `SecretStr` with a bare `str` and unmask it.
+can replace a `SecretStr` with a bare `str` and unmask it. Freezing does not reach inside a field,
+so the two container fields are immutable in their own right — a `mappingproxy` and a tuple — which
+also protects `DEVIN_PLAYBOOK_IDS`, where an in-place edit would redirect which playbook Devin runs.
 
 `get_settings()` catches `ValidationError` and raises `ConfigurationError` carrying a rendering of
-each error's location and message: the variable name, plus the key path inside it where pydantic
-reports one — for `DEVIN_PLAYBOOK_IDS` that is the issue class whose entry is wrong, which the
-operator needs — and never the input that was rejected.
+each error's location and message: the variable name, plus the path inside it where pydantic reports
+one — `DEVIN_PLAYBOOK_IDS.security` for the entry whose playbook id is wrong, `DEVIN_KNOWLEDGE_IDS[1]`
+for the offending element — and never the input that was rejected.
 
 The message is built inside the `except` block and raised outside it. `raise … from None` clears
 `__cause__` and keeps the original out of a formatted traceback, but leaves `__context__` pointing
@@ -60,7 +62,8 @@ wherever a credential is used — the engine URL in `db.py`, the auth headers in
 clients — and a wrapper that must keep passing values out of the message as pydantic's error set
 grows. The exception object is covered by a test that inspects `__context__` and `__cause__`, not
 only the formatted message, because the formatted message is the one surface that was already
-clean.
+clean. `_describe` must also never raise: an error there would be raised while the
+`ValidationError` is still being handled, which re-attaches it and reopens the leak.
 
 **What would tell us this was wrong:** an operator unable to diagnose a configuration failure
 because the message withholds too much, or a credential found in a log despite this — which would
