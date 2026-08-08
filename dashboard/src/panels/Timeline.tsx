@@ -116,9 +116,12 @@ function clockTime(timestamp: string): string {
  * objects are the raw API bodies the log also carries, which are for the database, not the panel.
  */
 function detailEntries(detail: Record<string, unknown> | null): [string, string][] {
-  if (detail === null) return []
+  // Loose, for the same reason as the live table's link cells: `fetchRemediationTimeline` casts the
+  // body, and `Object.entries(undefined)` on an omitted field would throw the panel into its error
+  // boundary rather than render a timeline with one detail line missing.
+  if (detail == null) return []
   return Object.entries(detail)
-    .filter(([, value]) => value !== null && typeof value !== 'object')
+    .filter(([, value]) => value != null && typeof value !== 'object')
     .map(([key, value]) => [key, String(value)])
 }
 
@@ -163,7 +166,7 @@ function Event({ event, offsetSeconds }: { event: RemediationEvent; offsetSecond
         {` +${formatDurationSeconds(offsetSeconds)}`}
       </span>
       <span>
-        {event.from_state !== null && (
+        {event.from_state != null && (
           <span style={FROM_STYLE}>{stateLabel(event.from_state)} → </span>
         )}
         <span style={stateBadgeStyle(event.to_state)}>{stateLabel(event.to_state)}</span>

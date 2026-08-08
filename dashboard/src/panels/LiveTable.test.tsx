@@ -104,6 +104,17 @@ describe('rendering a representative payload', () => {
     expect(within(running).getByText('No pull request for issue 42 yet')).toBeInTheDocument()
   })
 
+  it('treats a field the endpoint omitted as absent rather than as a link', async () => {
+    // `fetchRemediations` casts the body instead of validating it, so a field T25 leaves out arrives
+    // as `undefined`, not `null`. An anchor with no href is exactly the broken link this avoids.
+    const { devin_session_url: _session, pr_url: _pr, ...withoutLinks } = RUNNING_ROW
+    await renderTable(resolving([withoutLinks as RemediationRow]))
+
+    expect(document.querySelectorAll('a')).toHaveLength(0)
+    expect(screen.getByText('No Devin session for issue 42 yet')).toBeInTheDocument()
+    expect(screen.getByText('No pull request for issue 42 yet')).toBeInTheDocument()
+  })
+
   it('shows the cycle count, which is the whole point of the review-fix loop', async () => {
     await renderTable(resolving())
 
@@ -148,6 +159,15 @@ describe('every state a row can be in', () => {
 
   it('agrees with the state machine about which states are terminal', () => {
     expect(ALL_STATES.filter(isTerminal)).toEqual(['MERGED', 'BLOCKED', 'FAILED'])
+  })
+
+  it('greys a terminal row, so finished work does not compete with what is in flight', async () => {
+    await renderTable(resolving())
+
+    expect(screen.getByRole('row', { name: /superset#40/ })).toHaveStyle({ color: 'var(--muted)' })
+    expect(screen.getByRole('row', { name: /superset#42/ })).not.toHaveStyle({
+      color: 'var(--muted)',
+    })
   })
 
   it('shows why a terminal row stopped, rather than only that it did', async () => {

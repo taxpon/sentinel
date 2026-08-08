@@ -167,13 +167,17 @@ function Row({ row }: { row: RemediationRow }) {
       <td style={CELL}>{row.issue_class}</td>
       <td style={CELL}>
         <span style={stateBadgeStyle(row.state)}>{stateLabel(row.state)}</span>
-        {row.blocked_reason !== null && <small style={REASON_STYLE}>{row.blocked_reason}</small>}
+        {row.blocked_reason != null && <small style={REASON_STYLE}>{row.blocked_reason}</small>}
       </td>
       <td style={NUMERIC_CELL}>{row.cycle}</td>
       <td style={NUMERIC_CELL}>{formatNumber(row.acus_consumed)}</td>
       <td style={NUMERIC_CELL}>{formatDurationSeconds(row.elapsed_seconds)}</td>
       <td style={LINKS_CELL}>
-        {row.devin_session_url === null ? (
+        {/* Loose equality throughout this row: `fetchRemediations` casts the body rather than
+            validating it, so a field the endpoint omits arrives as `undefined`. A strict check would
+            take the link branch and render an anchor with no href — the broken link `MissingLink`
+            exists to prevent. */}
+        {row.devin_session_url == null ? (
           <MissingLink label={`No Devin session for issue ${row.issue_number} yet`} />
         ) : (
           <a
@@ -186,7 +190,7 @@ function Row({ row }: { row: RemediationRow }) {
           </a>
         )}
         {' · '}
-        {row.pr_url === null ? (
+        {row.pr_url == null ? (
           <MissingLink label={`No pull request for issue ${row.issue_number} yet`} />
         ) : (
           <a
