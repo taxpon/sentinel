@@ -2,7 +2,7 @@
 name = "sentinel"
 version = "0.1.0"
 description = "Event-driven remediation pipeline built on the Devin API v3"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = [
     "alembic>=1.14",
     "asyncpg>=0.30",
@@ -35,7 +35,7 @@ packages = ["src/sentinel"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py314"
 src = ["src", "tests"]
 # These three predate ruff and belong to other tasks, so T01 must not reformat them; every other
 # file under scripts/ is linted normally. T06 (session_context, seed_issues) and T07 (gen_adr_index)
@@ -53,7 +53,7 @@ select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "RUF"]
 known-first-party = ["sentinel"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.14"
 strict = true
 plugins = ["pydantic.mypy"]
 files = ["src/sentinel"]

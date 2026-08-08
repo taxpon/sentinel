@@ -1,6 +1,6 @@
 # One image for all three processes. `api`, `worker` and `poller` differ only by command; see the
 # topology in docs/09-operations.md.
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 COPY --from=ghcr.io/astral-sh/uv:0.7.2 /uv /usr/local/bin/uv
 
