@@ -64,8 +64,15 @@ order they are applied, each reported by name rather than dropping a finding sil
 declares a constraint for the package and that constraint already admits the fixed version, nothing
 in any manifest changes and the remediation is `pip-compile` or `npm install` — rejected. If nothing
 declares the package, or the range cannot be read, the fallback is the version boundary: a fix
-inside the same major — the same minor below 1.0, which is where every resolver puts the boundary —
-is carried by regenerating the lock, and one that crosses it forces every dependent to be checked.
+inside the same major — the same minor below 1.0 — is carried by regenerating the lock, and one
+that crosses it forces every dependent to be checked.
+
+That fallback boundary is deliberately one tier coarser than semver's caret rule, which pins the
+leftmost non-zero component and so refuses even `0.0.3 → 0.0.4`. `python-multipart` sits at `0.0.29`
+in this tree with four advisories fixed at `0.0.30` and `0.0.31`; `pip-compile` picks those up
+without anybody being asked, and treating each as a forced decision would file four issues for one
+recompile. The caret rule is still applied exactly where it belongs — reading a declared `^` range
+— because there it is the manifest's own statement rather than a proxy for one.
 
 An advisory that states only `last_affected` is treated as having its fix immediately above that
 bound, and is filed *with the fact that OSV never published a fixed version stated in the body*.

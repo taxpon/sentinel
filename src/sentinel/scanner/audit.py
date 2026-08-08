@@ -104,9 +104,17 @@ tonight are closed."""
 
 MARKER: Final = "sentinel-advisory"
 _MARKER_LINE: Final = re.compile(
-    rf"<!--\s*{MARKER}:\s*(?P<ecosystem>[^/\s]+)/(?P<package>[^/\s]+)/(?P<advisory>[^\s]+)\s*-->"
+    rf"<!--\s*{MARKER}:\s*(?P<ecosystem>[^/\s]+)/"
+    r"(?P<package>@[^/\s]+/[^/\s]+|[^/\s]+)/(?P<advisory>[^\s]+)\s*-->"
 )
-"""The fingerprint carried by every issue the sweep files, and the only thing it reads back."""
+"""The fingerprint carried by every issue the sweep files, and the only thing it reads back.
+
+The package alternative is not `[^/\\s]+`. An npm scope is part of the name and carries a slash of
+its own, so `npm/@deck.gl/mesh-layers/GHSA-…` has four segments rather than three — and a pattern
+that assumed three would read the package as `@deck.gl`, never match the finding it was written
+for, and re-file the issue every night. The deck.gl family is precisely the population this sweep
+is calibrated to find (`docs/remediation-candidates.md`, C4), so the scoped form is the case that
+matters rather than an edge of it."""
 
 
 # --- What the sweep refuses to file ----------------------------------------------------------
@@ -205,11 +213,34 @@ def _compare(left: str, right: str) -> int:
     return (first > second) - (first < second)
 
 
-def significant(version: str) -> tuple[int, ...]:
-    """The component of a version that cannot change without the dependents being asked.
+def caret_bound(version: str) -> tuple[int, ...]:
+    """The prefix a caret range pins: semver's **leftmost non-zero** component.
 
-    The major, except below 1.0 where semver gives the minor that role and every ecosystem's
-    resolvers follow it — `^0.7.5` admits `0.7.9` and refuses `0.8.0`.
+    `^3.5.1` admits `3.9.0`, `^0.7.5` refuses `0.8.0`, and `^0.0.3` refuses even `0.0.4` — each
+    leading zero shifts the boundary one place right, because a project that has not reached 1.0
+    has promised nothing about the components above it. A version that is zero throughout has no
+    non-zero component to find and is pinned whole.
+    """
+    parts = release(version)
+    for index, part in enumerate(parts):
+        if part:
+            return parts[: index + 1]
+    return parts
+
+
+def significant(version: str) -> tuple[int, ...]:
+    """The component a resolver will not cross on its own — the boundary `_lock_refresh` falls back
+    to when no manifest declares a range.
+
+    The major, or the minor below 1.0. Deliberately one tier coarser than `caret_bound`, and the
+    two disagree only about `0.0.x`. This is not the caret rule and must not be used as one: it
+    answers "would regenerating the lock have carried this quietly", and two zeros deep the answer
+    is yes for the ecosystem this mostly meets. `python-multipart` sits at `0.0.29` with four
+    advisories fixed in `0.0.30` and `0.0.31`; `pip-compile` picks those up without anybody being
+    asked, and treating each as a forced decision would file four issues for one `pip-compile` run
+    — the noise `docs/adr/2026-08-08-the-sweep-files-only-what-forces-a-decision.md` exists to
+    remove. The cost is that an npm `0.0.x` patch, which a caret range really would refuse, is
+    treated as a lock refresh; that errs toward filing less, which is the direction to err in.
     """
     parts = release(version)
     if not parts:
@@ -263,7 +294,9 @@ def _npm_clauses(text: str) -> list[_Clause] | None:
         parts = release(body[1:])
         if not parts:
             return None
-        upper = significant(body[1:]) if body[0] == "^" else parts[:2] or parts
+        # A caret pins up to the leftmost non-zero component; a tilde always pins the minor when
+        # one is written, so `~0.0.3` is `<0.1.0` where `^0.0.3` is `<0.0.4`.
+        upper = caret_bound(body[1:]) if body[0] == "^" else parts[:2] or parts
         return [(">=", parts), ("<", (*upper[:-1], upper[-1] + 1))]
     return _clauses(body)
 
@@ -427,14 +460,22 @@ def _constraint_of(line: SourceLine, name: str) -> str | None:
     `None` when the declaration states no range at all. Superset declares twenty-odd requirements
     as a bare name — `"pgsanity"`, `"parsedatetime"` — and those express no opinion about which
     version is acceptable, which is a different thing from expressing one this cannot read.
+
+    The name is matched after PEP 503 normalisation, not by prefix. `name` has been normalised
+    (`flask-caching`) while the line carries the file's own spelling (`Flask_Caching>=2.1.0, <3`),
+    and a comparison that tolerated case but not separators would leave the name attached to the
+    range. `admits` would then answer `None` for a range it can read perfectly well, and
+    `_lock_refresh` would fall through to a proxy for a question the manifest already answers.
     """
     if line.path.endswith(".json"):
         parts = line.text.split('"')
-        constraint = parts[3] if len(parts) > 3 else ""
-    else:
-        body = line.text.split("#")[0].strip().strip('",')
-        constraint = body[len(name) :].lstrip() if body.lower().startswith(name.lower()) else body
-    return constraint or None
+        return (parts[3] if len(parts) > 3 else "") or None
+
+    body = line.text.split("#")[0].strip().strip('",')
+    declared = _REQUIREMENT.match(body)
+    if declared is None or normalise(declared.group("name")) != normalise(name):
+        return body or None
+    return body[declared.end() :].lstrip() or None
 
 
 def python_dependencies(manifests: Mapping[str, str]) -> list[Dependency]:
@@ -790,9 +831,9 @@ def _lock_refresh(finding: Finding) -> str | None:
        `npm install`. Superset's Flask advisory is this exactly — the lock is stale inside a range
        that already permits the fix.
     2. **The version boundary**, when nothing declares the package or the range cannot be read. A
-       fix within the same major (the same minor, below 1.0) is carried by regenerating the lock;
-       one that crosses it forces every dependent to be checked. `dompurify` 3.4.12 to 3.4.13 is
-       the first; `image-size` 0.7.5 to above 2.0.2 is the second.
+       fix that leaves `significant()` unchanged is carried by regenerating the lock; one that
+       crosses it forces every dependent to be checked. `dompurify` 3.4.12 to 3.4.13 is the first;
+       `image-size` 0.7.5 to above 2.0.2 is the second.
 
     Both are proxies for "does a human have to decide something", and
     `docs/adr/2026-08-08-the-sweep-files-only-what-forces-a-decision.md` records what they get
@@ -882,6 +923,7 @@ def triage(
         key=lambda finding: (-finding.advisory.rank, finding.dependency.name, finding.advisory.id)
     )
     grouped = _group(keep)
+    filing, deferred = grouped[:MAX_ISSUES_PER_SWEEP], grouped[MAX_ISSUES_PER_SWEEP:]
     skipped += [
         Skipped(
             finding,
@@ -889,10 +931,23 @@ def triage(
             f"No more than {MAX_ISSUES_PER_SWEEP} issues are filed per run; this one is left for a "
             "later run rather than filed alongside them.",
         )
-        for candidate in grouped[MAX_ISSUES_PER_SWEEP:]
+        for candidate in deferred
         for finding in candidate.advisories
     ]
-    return Triage(file=tuple(grouped[:MAX_ISSUES_PER_SWEEP]), skipped=tuple(skipped))
+    # A sibling folded into a candidate gets no issue of its own, so it is reported here too. Its
+    # absence would make `SweepReport.by_reason` count fewer findings than the run examined, and
+    # the one number a reader checks first is whether those two agree.
+    skipped += [
+        Skipped(
+            finding,
+            Rejected.COVERED,
+            f"Answered by the issue filed for {candidate.finding.advisory.id} on the same package: "
+            "one upgrade fixes both.",
+        )
+        for candidate in filing
+        for finding in candidate.also
+    ]
+    return Triage(file=tuple(filing), skipped=tuple(skipped))
 
 
 def _group(surviving: Sequence[Finding]) -> list[Candidate]:
@@ -1289,16 +1344,35 @@ class OsvClient:
         await self._http.aclose()
 
     async def advisories(self, deps: Sequence[Dependency]) -> list[Advisory]:
-        """Every advisory affecting these packages, resolved against the versions installed."""
+        """Every advisory affecting these packages, resolved against the versions installed.
+
+        Each record is parsed against **only the packages OSV said it affects at the version
+        installed**, not against the whole tree. An OSV record's `affected` array covers every
+        package and every version range the advisory has ever applied to, so a record naming
+        `@babel/core` from 7.22.0 will list it whatever version is installed — and a sweep that
+        matched the record's array against the tree would report a package sitting safely below the
+        `introduced` event as vulnerable. `querybatch` has already answered that question per
+        package and per version; keeping its answer is both correct and cheaper than re-deciding it
+        from range arithmetic here.
+        """
         installed = {
             (dependency.ecosystem, dependency.name): dependency.version for dependency in deps
         }
-        records = [await self._vuln(identifier) for identifier in await self._identifiers(deps)]
-        return _merge(parse_advisory(record, installed) for record in records)
+        parsed: list[Advisory] = []
+        for identifier, packages in (await self._matches(deps)).items():
+            record = await self._vuln(identifier)
+            affected = {key: installed[key] for key in packages if key in installed}
+            parsed.append(parse_advisory(record, affected))
+        return _merge(parsed)
 
-    async def _identifiers(self, deps: Sequence[Dependency]) -> list[str]:
-        found: list[str] = []
-        seen: set[str] = set()
+    async def _matches(self, deps: Sequence[Dependency]) -> dict[str, set[tuple[str, str]]]:
+        """Advisory id to the packages `querybatch` reported it against.
+
+        `results` is index-aligned with `queries`, which is the only place the pairing exists —
+        the record fetched afterwards cannot say which of the packages it names was the one asked
+        about.
+        """
+        found: dict[str, set[tuple[str, str]]] = {}
         for batch in _batched(deps, QUERY_BATCH_SIZE):
             response = await self._http.post(
                 "/v1/querybatch",
@@ -1316,12 +1390,19 @@ class OsvClient:
                 },
             )
             _raise_for(response, "POST /v1/querybatch")
-            for result in response.json().get("results", ()):
+            results = response.json().get("results", ())
+            if len(results) != len(batch):
+                # Nothing can be paired from a response of the wrong length, and pairing what does
+                # line up would drop the tail — which is a silently incomplete sweep, the one
+                # failure mode worse than a sweep that did not run.
+                raise ScannerError(
+                    f"POST /v1/querybatch answered {len(results)} results for {len(batch)} queries"
+                )
+            for dependency, result in zip(batch, results, strict=True):
                 for vuln in result.get("vulns", ()):
-                    identifier = str(vuln["id"])
-                    if identifier not in seen:
-                        seen.add(identifier)
-                        found.append(identifier)
+                    found.setdefault(str(vuln["id"]), set()).add(
+                        (dependency.ecosystem, dependency.name)
+                    )
         return found
 
     async def _vuln(self, identifier: str) -> Mapping[str, Any]:
