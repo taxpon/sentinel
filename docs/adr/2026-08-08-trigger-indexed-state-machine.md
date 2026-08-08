@@ -26,10 +26,12 @@ after it.
 
 ## Decision
 
-`transition(state, trigger, *, cycle, max_fix_cycles)` is a pure function over a table keyed by
-`Trigger`, each entry carrying the target state and the frozen set of states it is legal from. It
-returns a `Transition` record — `from_state`, `trigger`, `to_state`, `cycle`, `absorbed`, `reason` —
-which the caller persists as one row.
+`transition(state, trigger, *, cycle, pr_linked, max_fix_cycles)` is a pure function over a table
+keyed by `Trigger`, each entry carrying the target state, the set of states it is legal from, and
+what it requires of the pull request link
+([ADR](./2026-08-08-ci-states-re-entered-from-running.md)). It returns a `Transition` record —
+`from_state`, `trigger`, `to_state`, `cycle`, `absorbed`, `reason` — which the caller persists as
+one row.
 
 Three consequences of that shape are deliberate:
 
@@ -52,10 +54,18 @@ Three consequences of that shape are deliberate:
 ## Consequences
 
 The transition matrix is a single literal readable next to the spec table, and the tests can assert
-its complement — that no edge exists which the spec does not list. Callers hold no state-machine
-logic beyond "apply the trigger, write the row, act if `moved`". The cost is that a trigger is
-restricted to one target state, so the spec's `check_suite.completed` splits into two triggers by
-conclusion, which the event mapping in T20 has to do anyway.
+its complement — that no edge exists which the spec does not list. A caller's normal path is "apply
+the trigger, write the row, act if `moved`".
+
+Not all of it, though: entering `CI_PASSED` obliges the caller to apply `automatic_trigger`'s result
+as a second transition, and nothing enforces that at any of the three call sites. That is one piece
+of lifecycle knowledge left outside the machine, kept there only because folding it in would write
+two state changes under one event. If a second such follow-up appears, the pair should move behind
+one call that returns a list of transitions.
+
+The other cost is that a trigger is restricted to one target state, so the spec's
+`check_suite.completed` splits into two triggers by conclusion, which the event mapping in T20 has
+to do anyway.
 
 **What would tell us this was wrong:** a trigger whose target legitimately depends on the state it
 is applied from. The table would then need `(state, trigger)` keys, and the target could no longer

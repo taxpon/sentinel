@@ -52,10 +52,10 @@ stateDiagram-v2
 | `QUEUED` | `SESSION_CREATED` | Worker created the session | `POST /v3/…/sessions`; store `devin_session_id`, `session_created_at` |
 | `QUEUED` | `BLOCKED` | Daily ACU budget exhausted, or issue class unrecognised | Comment on issue, add `needs-human` |
 | `SESSION_CREATED` | `RUNNING` | Poller sees status `running` | — |
-| `RUNNING` | `PR_OPENED` | `pull_request.opened` from Devin's bot, or `pull_requests[]` on the session | Link PR to remediation, set `pr_opened_at` |
-| `PR_OPENED`, `RUNNING` | `CI_RUNNING` | `check_suite.requested` on the head SHA | — |
-| `CI_RUNNING`, `RUNNING` | `CI_PASSED` | `check_suite.completed`, conclusion `success` | Set `ci_green_at` |
-| `CI_RUNNING`, `RUNNING` | `CI_FAILED` | `check_suite.completed`, conclusion `failure`/`timed_out` | Enqueue `resume_session` |
+| `RUNNING` | `PR_OPENED` | `pull_request.opened` from Devin's bot, or `pull_requests[]` on the session — **only while no pull request is linked** | Link PR to remediation, set `pr_opened_at`. Both are write-once: a later observation is recorded and otherwise ignored |
+| `PR_OPENED`, `RUNNING` | `CI_RUNNING` | `check_suite.requested` on the head SHA — **requires a linked pull request** | — |
+| `CI_RUNNING`, `RUNNING` | `CI_PASSED` | `check_suite.completed`, conclusion `success` — **requires a linked pull request** | Set `ci_green_at` |
+| `CI_RUNNING`, `RUNNING` | `CI_FAILED` | `check_suite.completed`, conclusion `failure`/`timed_out` — **requires a linked pull request** | Enqueue `resume_session` |
 | **`CI_FAILED`** | **`RUNNING`** | Worker resumed the session | Fetch failing job logs, `POST /v3/…/messages`, increment `cycle`, append tag `cycle:N` |
 | `CI_PASSED` | `IN_REVIEW` | Entering `CI_PASSED` | Request review; post the structured-output summary as a PR comment |
 | `IN_REVIEW` | `CHANGES_REQUESTED` | `pull_request_review.submitted`, state `changes_requested` | Enqueue `resume_session` |
@@ -98,7 +98,16 @@ sequenceDiagram
 
 The CI states are re-entered from `RUNNING`, not only from `PR_OPENED`: on the second and later
 passes round the loop the pull request already exists, so the check suite for the fix commit is
-observed while the session is running. `PR_OPENED` is entered once, when the pull request appears.
+observed while the session is running.
+
+That widening is bounded by the pull request itself, not by the lap count, because both halves of
+the condition have to hold. A check suite is only meaningful once a pull request is linked, so the
+CI triggers require one — which keeps `PR_OPENED` on every path into the CI states rather than
+letting `RUNNING → CI_PASSED` bypass it. And `RUNNING → PR_OPENED` is only legal while none is
+linked, so the poller, which re-reads `pull_requests[]` on every poll
+([ADR](./adr/2026-08-07-poller-drives-state-machine.md)), cannot walk the state backwards out of the
+loop or re-stamp `pr_opened_at` on lap two. A repeat observation is recorded as an event and
+otherwise ignored, exactly as for a terminal state.
 
 The message states the failure and the goal; it does not prescribe the fix. Steering Devin
 line-by-line would defeat the purpose and is explicitly avoided ([05](./05-devin-integration.md)).
@@ -113,7 +122,12 @@ line-by-line would defeat the purpose and is explicitly avoided ([05](./05-devin
    `CHANGES_REQUESTED`. `cycle > MAX_FIX_CYCLES` forces `FAILED`.
 4. **Every transition writes exactly one `remediation_event`,** in the same transaction as the
    state column update. The log can never disagree with the column.
-5. **Illegal transitions raise** rather than silently no-op, and are asserted in the test matrix
+5. **A pull request is linked exactly once, and `PR_OPENED` is on every path to CI.** `pr_number`,
+   `pr_url` and `pr_opened_at` are written when `PR_OPENED` is entered and never again. No sequence
+   of triggers reaches `CI_RUNNING`, `CI_PASSED`, `CI_FAILED`, `IN_REVIEW`, `CHANGES_REQUESTED` or
+   `MERGED` without passing through it. The funnel, the merge rate `merged / pr_opened` and
+   time-to-PR in [07](./07-observability.md) all rest on this.
+6. **Illegal transitions raise** rather than silently no-op, and are asserted in the test matrix
    ([08](./08-testing.md)).
 
 ## Escalation
