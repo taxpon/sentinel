@@ -68,7 +68,7 @@ stateDiagram-v2
 | `IN_REVIEW` | `CHANGES_REQUESTED` | `pull_request_review.submitted`, state `changes_requested` | Enqueue `resume_session` |
 | **`CHANGES_REQUESTED`** | **`RUNNING`** | Worker resumed the session | Forward review body and inline comments via `POST /v3/…/messages`, increment `cycle` |
 | `IN_REVIEW` | `MERGED` | `pull_request.closed` with `merged: true` | Set `merged_at`, append tag `outcome:merged`, close the issue |
-| any | `BLOCKED` | `structured_output.outcome == "blocked"` | Store `blocked_reason`, comment on issue, add `needs-human` |
+| any | `BLOCKED` | `structured_output.outcome == "blocked"`, or a session still working and stalled on `status_detail: waiting_for_user` ([ADR](./adr/2026-08-08-a-stalled-session-is-blocked.md)) | Store `blocked_reason`, comment on issue, add `needs-human` |
 | any | `FAILED` | Session status `error`, ACU cap hit, or `cycle > MAX_FIX_CYCLES` | Store reason, comment on issue, add `needs-human` |
 
 ## Check suite events
