@@ -37,12 +37,7 @@ packages = ["src/sentinel"]
 line-length = 100
 target-version = "py314"
 src = ["src", "tests"]
-# These two predate ruff and belong to another task, so T01 must not reformat them; every other
-# file under scripts/ is linted normally. T06 (session_context, seed_issues) runs `make format` on
-# its own files and deletes its lines here.
 extend-exclude = [
-    "scripts/seed_issues.py",
-    "scripts/session_context.py",
     # Ruff formats fenced Python inside Markdown. Most such blocks under docs/ are *quotations* of
     # code in other repositories, so reformatting one turns an accurate citation into a misquotation
     # of a file the reader is expected to open and compare against.

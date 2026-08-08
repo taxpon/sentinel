@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.14"
 # dependencies = ["pyyaml>=6"]
 # ///
 """Create and update the GitHub task issues from docs/tasks.yaml.
@@ -40,7 +40,8 @@ DOD = """## Definition of Done
 - [ ] Divergence from the spec fixed in `docs/`
 - [ ] Non-obvious decisions recorded in `docs/adr/`; `make adr-index` re-run"""
 
-UI_DOD = """- [ ] Component tests cover rendering, prop branches, empty and error states, and formatting
+UI_DOD = """\
+- [ ] Component tests cover rendering, prop branches, empty and error states, and formatting
 - [ ] No browser-level test was written — they are out of scope; any gap a component test could not
       reach is named in the pull request"""
 
@@ -84,7 +85,8 @@ def render_body(task: dict, numbers: dict[str, int]) -> str:
     owned = "\n".join(f"- `{f}`" for f in owns) if owns else "_None — this task produces no files._"
     parts.append(
         "## Owned files\n\n"
-        "Do not modify anything outside this list; it is how parallel sessions avoid collisions.\n\n"
+        "Do not modify anything outside this list; "
+        "it is how parallel sessions avoid collisions.\n\n"
         f"{owned}"
     )
 
@@ -95,7 +97,8 @@ def render_body(task: dict, numbers: dict[str, int]) -> str:
             ref = f"#{numbers[dep]}" if dep in numbers else dep
             lines.append(f"- {ref} — {dep}")
         parts.append(
-            "## Depends on\n\nAll of these must be **merged** before starting.\n\n" + "\n".join(lines)
+            "## Depends on\n\nAll of these must be **merged** before starting.\n\n"
+            + "\n".join(lines)
         )
 
     adrs = task.get("adrs") or []
@@ -125,8 +128,18 @@ def main() -> int:
     print(f"{len(tasks)} tasks, dependency graph is acyclic")
 
     existing_raw = gh(
-        "issue", "list", "-R", REPO, "--label", "task", "--state", "all",
-        "--limit", "300", "--json", "number,title",
+        "issue",
+        "list",
+        "-R",
+        REPO,
+        "--label",
+        "task",
+        "--state",
+        "all",
+        "--limit",
+        "300",
+        "--json",
+        "number,title",
     )
     numbers: dict[str, int] = {}
     for issue in json.loads(existing_raw):
@@ -146,9 +159,16 @@ def main() -> int:
             continue
         labels = ["task", f"wave:{task['wave']}", f"area:{task['area']}"]
         url = gh(
-            "issue", "create", "-R", REPO, "--title", title,
-            "--body", render_body(task, numbers),
-            "--label", ",".join(labels),
+            "issue",
+            "create",
+            "-R",
+            REPO,
+            "--title",
+            title,
+            "--body",
+            render_body(task, numbers),
+            "--label",
+            ",".join(labels),
         ).strip()
         numbers[tid] = int(url.rstrip("/").split("/")[-1])
         print(f"  created #{numbers[tid]} {title}")
@@ -159,8 +179,15 @@ def main() -> int:
 
     # Pass 2 — rewrite every body now that all dependency numbers are known.
     for tid in order:
-        gh("issue", "edit", str(numbers[tid]), "-R", REPO,
-           "--body", render_body(tasks[tid], numbers))
+        gh(
+            "issue",
+            "edit",
+            str(numbers[tid]),
+            "-R",
+            REPO,
+            "--body",
+            render_body(tasks[tid], numbers),
+        )
     print(f"resolved dependency references in {len(order)} issues")
 
     unresolved = [t for t in tasks.values() for d in t.get("depends_on", []) if d not in numbers]
