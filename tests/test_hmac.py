@@ -141,14 +141,42 @@ def test_accepts_a_body_exactly_at_the_limit() -> None:
     assert verify_signature(at_limit, sign(at_limit, SECRET), SECRET) is SignatureResult.OK
 
 
-def test_the_size_check_precedes_hashing() -> None:
-    # An oversized body reports its size rather than a mismatch even when the signature is wrong,
-    # which is only possible if the limit is applied before the digest is computed.
+def test_an_oversized_body_is_never_hashed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The point of the limit is that no attacker-supplied body of unbounded size reaches SHA-256.
+    # A returned BODY_TOO_LARGE would only prove the check precedes the comparison, so refuse to
+    # hash at all and let the digest itself report the violation.
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise AssertionError("hashed a body that exceeds the limit")
+
+    monkeypatch.setattr("sentinel.security.hmac.hmac.new", refuse)
     oversized = b"x" * 11
 
-    result = verify_signature(oversized, sign(oversized, "wrong"), SECRET, max_body_bytes=10)
+    # With no header at all the size still wins, so the endpoint answers 413 rather than 401.
+    assert verify_signature(oversized, None, SECRET, max_body_bytes=10) is (
+        SignatureResult.BODY_TOO_LARGE
+    )
+    # A well-formed header is not enough to get the body hashed either. It is a literal because
+    # `sign` would itself trip the refusal above.
+    assert (
+        verify_signature(oversized, f"sha256={GITHUB_DOCUMENTED_DIGEST}", SECRET, max_body_bytes=10)
+        is SignatureResult.BODY_TOO_LARGE
+    )
 
-    assert result is SignatureResult.BODY_TOO_LARGE
+
+def test_the_digest_comparison_is_constant_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Timing behaviour is invisible in the return value, so assert the call instead: `==` here
+    # would pass every other test in this file while leaking the digest one byte at a time.
+    calls: list[tuple[str, str]] = []
+    real = stdlib_hmac.compare_digest
+
+    def record(left: str, right: str) -> bool:
+        calls.append((left, right))
+        return bool(real(left, right))
+
+    monkeypatch.setattr("sentinel.security.hmac.hmac.compare_digest", record)
+
+    assert verify_signature(BODY, sign(BODY, SECRET), SECRET) is SignatureResult.OK
+    assert calls == [(GITHUB_DOCUMENTED_DIGEST, GITHUB_DOCUMENTED_DIGEST)]
 
 
 def test_the_documented_limit_is_five_megabytes() -> None:
