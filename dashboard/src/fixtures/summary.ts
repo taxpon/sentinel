@@ -3,6 +3,7 @@
 // second idea of what the API returns.
 
 import type { AnalyticsSummary } from '../api'
+import type { RemediationEvent, RemediationRow } from '../api'
 
 /** The example response from the spec, verbatim. */
 export const summaryFixture: AnalyticsSummary = {
@@ -54,3 +55,145 @@ export const emptySummaryFixture: AnalyticsSummary = {
   impact: { hours_saved: 0, assumption: 'baseline hours per issue class; see docs/05' },
   generated_at: '2026-08-08T04:12:03Z',
 }
+
+/**
+ * `GET /api/remediations` — the live table's rows, covering the cases the panel has to tell apart:
+ * work in flight and work finished, a loop state carrying a cycle, a terminal row with a
+ * `blocked_reason`, and rows with neither a session nor a pull request linked yet.
+ *
+ * Deliberately out of display order, and ids 12 and 13 share a `labeled_at`: a batch of issues
+ * labelled together really does, so the ordering tie is part of the fixture rather than a
+ * hypothetical.
+ */
+export const remediationRowsFixture: RemediationRow[] = [
+  {
+    id: 10,
+    repo: 'taxpon/superset',
+    issue_number: 40,
+    issue_class: 'dependency',
+    state: 'MERGED',
+    cycle: 0,
+    acus_consumed: 12.3,
+    elapsed_seconds: 6480,
+    devin_session_url: 'https://app.devin.ai/sessions/devin-4a1b',
+    pr_number: 117,
+    pr_url: 'https://github.com/taxpon/superset/pull/117',
+    blocked_reason: null,
+    labeled_at: '2026-08-07T22:00:00Z',
+  },
+  {
+    id: 12,
+    repo: 'taxpon/superset',
+    issue_number: 42,
+    issue_class: 'security',
+    state: 'RUNNING',
+    cycle: 0,
+    acus_consumed: 8.5,
+    elapsed_seconds: 1980,
+    devin_session_url: 'https://app.devin.ai/sessions/devin-9f2c',
+    pr_number: null,
+    pr_url: null,
+    blocked_reason: null,
+    labeled_at: '2026-08-08T03:40:00Z',
+  },
+  {
+    id: 9,
+    repo: 'taxpon/superset',
+    issue_number: 37,
+    issue_class: 'security',
+    state: 'BLOCKED',
+    cycle: 0,
+    acus_consumed: 3.25,
+    elapsed_seconds: 900,
+    devin_session_url: 'https://app.devin.ai/sessions/devin-2d70',
+    pr_number: null,
+    pr_url: null,
+    blocked_reason: 'requires_upstream_decision',
+    labeled_at: '2026-08-07T21:00:00Z',
+  },
+  {
+    id: 13,
+    repo: 'taxpon/superset',
+    issue_number: 43,
+    issue_class: 'typing',
+    state: 'QUEUED',
+    cycle: 0,
+    acus_consumed: 0,
+    elapsed_seconds: 12,
+    devin_session_url: null,
+    pr_number: null,
+    pr_url: null,
+    blocked_reason: null,
+    labeled_at: '2026-08-08T03:40:00Z',
+  },
+  {
+    id: 11,
+    repo: 'taxpon/superset',
+    issue_number: 41,
+    issue_class: 'flaky-test',
+    state: 'CI_FAILED',
+    cycle: 1,
+    acus_consumed: 12.25,
+    elapsed_seconds: 5400,
+    devin_session_url: 'https://app.devin.ai/sessions/devin-7c31',
+    pr_number: 118,
+    pr_url: 'https://github.com/taxpon/superset/pull/118',
+    blocked_reason: null,
+    labeled_at: '2026-08-08T02:10:00Z',
+  },
+]
+
+/**
+ * `GET /api/remediations/{id}` for remediation 12 — the append-only log behind that row.
+ *
+ * Events 102 and 103 carry an identical `created_at` because they are written in one transaction and
+ * `created_at` defaults to `now()`, which is `transaction_timestamp()`. The array is in neither
+ * timestamp nor id order, so a panel that forgets to sort, or sorts on the timestamp alone, fails.
+ */
+export const remediationTimelineFixture: RemediationEvent[] = [
+  {
+    id: 103,
+    remediation_id: 12,
+    from_state: 'QUEUED',
+    to_state: 'SESSION_CREATED',
+    kind: 'devin_call',
+    detail: { status: 201, session_id: 'devin-9f2c' },
+    created_at: '2026-08-08T03:40:12Z',
+  },
+  {
+    id: 101,
+    remediation_id: 12,
+    from_state: null,
+    to_state: 'QUEUED',
+    kind: 'transition',
+    detail: { issue: 42 },
+    created_at: '2026-08-08T03:40:00Z',
+  },
+  {
+    id: 105,
+    remediation_id: 12,
+    from_state: 'RUNNING',
+    to_state: 'PR_OPENED',
+    kind: 'transition',
+    detail: { pr_number: 119 },
+    created_at: '2026-08-08T04:05:00Z',
+  },
+  {
+    id: 102,
+    remediation_id: 12,
+    from_state: 'QUEUED',
+    to_state: 'SESSION_CREATED',
+    kind: 'transition',
+    detail: null,
+    created_at: '2026-08-08T03:40:12Z',
+  },
+  {
+    id: 104,
+    remediation_id: 12,
+    from_state: 'SESSION_CREATED',
+    to_state: 'RUNNING',
+    kind: 'transition',
+    detail: null,
+    created_at: '2026-08-08T03:41:30Z',
+  },
+]

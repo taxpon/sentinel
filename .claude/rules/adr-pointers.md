@@ -10,6 +10,8 @@ paths:
   - "dashboard/package.json"
   - "dashboard/src/App.tsx"
   - "dashboard/src/api.ts"
+  - "dashboard/src/panels/LiveTable.tsx"
+  - "dashboard/src/panels/Timeline.tsx"
   - "docs/adr/template.md"
   - "docs/tasks.yaml"
   - "pyproject.toml"
@@ -54,6 +56,8 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `dashboard/package.json` — [Pin the dashboard toolchain to versions that run on Node 20](../../docs/adr/2026-08-08-dashboard-toolchain-runs-on-node-20.md), [Draw every dashboard chart with Recharts](../../docs/adr/2026-08-08-recharts-for-the-dashboard-charts.md)
 - `dashboard/src/App.tsx` — [Panels self-register from src/panels and receive the whole request state](../../docs/adr/2026-08-08-panels-self-register-from-the-panels-directory.md)
 - `dashboard/src/api.ts` — [Panels self-register from src/panels and receive the whole request state](../../docs/adr/2026-08-08-panels-self-register-from-the-panels-directory.md), [Draw every dashboard chart with Recharts](../../docs/adr/2026-08-08-recharts-for-the-dashboard-charts.md)
+- `dashboard/src/panels/LiveTable.tsx` — [The live panels impose their own total order, tie-broken on id](../../docs/adr/2026-08-08-live-panels-sort-client-side-with-an-id-tiebreak.md)
+- `dashboard/src/panels/Timeline.tsx` — [The live panels impose their own total order, tie-broken on id](../../docs/adr/2026-08-08-live-panels-sort-client-side-with-an-id-tiebreak.md), [The timeline panel selects its own remediation](../../docs/adr/2026-08-08-timeline-panel-selects-its-own-remediation.md)
 - `docs/adr/template.md` — [Validate ADR front matter at generation time and refuse to write a partial index](../../docs/adr/2026-08-08-validate-adr-front-matter-at-generation.md)
 - `docs/tasks.yaml` — [Keep the task graph in one machine-readable file](../../docs/adr/2026-08-07-tasks-yaml-single-source.md)
 - `pyproject.toml` — [Manage dependencies with uv and a committed lock file](../../docs/adr/2026-08-07-uv-for-dependencies-and-the-image.md)
