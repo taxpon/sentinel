@@ -1,0 +1,166 @@
+/* One accent colour, with the per-class palette reserved for stacked series, and the layout
+   constraints from docs/07-observability.md: the KPI row reachable at 1440px without scrolling,
+   and no chart taller than 240px. */
+
+:root {
+  --accent: #2f6feb;
+  --accent-soft: #e8f0fe;
+
+  /* Ordinal, for stacked series only. Read through seriesColor() in api.ts. */
+  --series-1: #3b6fd4;
+  --series-2: #d98324;
+  --series-3: #3f8f68;
+  --series-4: #8a5cb8;
+  --series-5: #c25f5f;
+  --series-6: #3f8ba6;
+
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --border: #dfe3e8;
+  --text: #1c2024;
+  --muted: #5c6670;
+  --amber: #a4620a;
+  --amber-soft: #fdf3e3;
+  --danger: #b3261e;
+  --danger-soft: #fdeceb;
+
+  --radius: 8px;
+  --gap: 12px;
+  --chart-max-height: 240px;
+
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+h1,
+h2 {
+  margin: 0;
+}
+
+.app {
+  padding: var(--gap);
+  /* Wide enough for the two-column chart grid, capped so 1440px is the design width. */
+  max-width: 1440px;
+  margin: 0 auto;
+}
+
+.app-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--gap);
+  padding-bottom: var(--gap);
+}
+
+.app-header h1 {
+  font-size: 18px;
+  letter-spacing: 0.01em;
+}
+
+/* Freshness is always visible, and states its own age rather than implying it. */
+.freshness {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+.freshness--stale {
+  color: var(--amber);
+  background: var(--amber-soft);
+  border-radius: var(--radius);
+  padding: 2px 8px;
+}
+
+.banner {
+  margin: 0 0 var(--gap);
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.banner--error {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-color: var(--danger);
+}
+
+.banner--loading {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.app-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+}
+
+/* The four KPI tiles sit on one row so they are above the fold at 1440x900. */
+.kpi-row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--gap);
+}
+
+.chart-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--gap);
+}
+
+.table-region {
+  display: block;
+}
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  min-width: 0;
+}
+
+.panel__title {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+/* The constraint the spec fixes: no chart taller than 240px. Panels size their chart to this. */
+.chart-grid .panel__body {
+  height: var(--chart-max-height);
+  max-height: var(--chart-max-height);
+}
+
+.slot-empty {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  color: var(--muted);
+}
+
+@media (max-width: 1100px) {
+  .kpi-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .chart-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
