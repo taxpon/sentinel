@@ -57,10 +57,15 @@ SPEC_TRANSITIONS: list[tuple[State | None, Trigger, State]] = [
     (State.RUNNING, Trigger.PR_OPENED, State.PR_OPENED),
     (State.PR_OPENED, Trigger.CHECK_SUITE_REQUESTED, State.CI_RUNNING),
     (State.RUNNING, Trigger.CHECK_SUITE_REQUESTED, State.CI_RUNNING),
-    (State.CI_RUNNING, Trigger.CHECK_SUITE_SUCCEEDED, State.CI_PASSED),
+    (State.PR_OPENED, Trigger.CHECK_SUITE_SUCCEEDED, State.CI_PASSED),
     (State.RUNNING, Trigger.CHECK_SUITE_SUCCEEDED, State.CI_PASSED),
-    (State.CI_RUNNING, Trigger.CHECK_SUITE_FAILED, State.CI_FAILED),
+    (State.CI_RUNNING, Trigger.CHECK_SUITE_SUCCEEDED, State.CI_PASSED),
+    (State.CI_FAILED, Trigger.CHECK_SUITE_SUCCEEDED, State.CI_PASSED),
+    (State.PR_OPENED, Trigger.CHECK_SUITE_FAILED, State.CI_FAILED),
     (State.RUNNING, Trigger.CHECK_SUITE_FAILED, State.CI_FAILED),
+    (State.CI_RUNNING, Trigger.CHECK_SUITE_FAILED, State.CI_FAILED),
+    (State.CI_PASSED, Trigger.CHECK_SUITE_FAILED, State.CI_FAILED),
+    (State.IN_REVIEW, Trigger.CHECK_SUITE_FAILED, State.CI_FAILED),
     (State.CI_FAILED, Trigger.SESSION_RESUMED, State.RUNNING),
     (State.CI_PASSED, Trigger.REVIEW_REQUESTED, State.IN_REVIEW),
     (State.IN_REVIEW, Trigger.CHANGES_REQUESTED, State.CHANGES_REQUESTED),
@@ -76,6 +81,36 @@ NEEDS_A_LINKED_PR = frozenset(
     {Trigger.CHECK_SUITE_REQUESTED, Trigger.CHECK_SUITE_SUCCEEDED, Trigger.CHECK_SUITE_FAILED}
 )
 LINKS_THE_PR = frozenset({Trigger.PR_OPENED})
+
+# Transcribed from the "Check suite events" table: where each trigger is legal but does not move.
+SPEC_ABSORBED: dict[Trigger, frozenset[State]] = {
+    Trigger.CHECK_SUITE_REQUESTED: frozenset(
+        {
+            State.CI_RUNNING,
+            State.CI_FAILED,
+            State.CI_PASSED,
+            State.IN_REVIEW,
+            State.CHANGES_REQUESTED,
+        }
+    ),
+    Trigger.CHECK_SUITE_SUCCEEDED: frozenset(
+        {State.CI_PASSED, State.IN_REVIEW, State.CHANGES_REQUESTED}
+    ),
+    Trigger.CHECK_SUITE_FAILED: frozenset({State.CI_FAILED, State.CHANGES_REQUESTED}),
+}
+
+# Transcribed from the same section's prose: every state that can hold a linked pull request.
+SPEC_LINKED_STATES = frozenset(
+    {
+        State.PR_OPENED,
+        State.RUNNING,
+        State.CI_RUNNING,
+        State.CI_FAILED,
+        State.CI_PASSED,
+        State.IN_REVIEW,
+        State.CHANGES_REQUESTED,
+    }
+)
 
 # Transcribed from invariant 5: the states no path may reach without passing through PR_OPENED.
 POST_PR_STATES = frozenset(
@@ -96,13 +131,17 @@ LOOP_EDGES = [
 ]
 
 SPEC_PAIRS = {(source, trigger) for source, trigger, _ in SPEC_TRANSITIONS}
+ABSORBED_PAIRS = {
+    (source, trigger) for trigger, sources in SPEC_ABSORBED.items() for source in sources
+}
 
-# Every pair the spec does not list, terminal sources excluded — those absorb rather than raise.
+# Every pair the spec does not list. Terminal sources and the absorbed pairs are excluded: both are
+# legal and recorded, they just do not move, so they are covered by their own tests.
 ILLEGAL_PAIRS: list[tuple[State | None, Trigger]] = [
     (source, trigger)
     for source in (None, *NON_TERMINAL)
     for trigger in Trigger
-    if (source, trigger) not in SPEC_PAIRS
+    if (source, trigger) not in SPEC_PAIRS and (source, trigger) not in ABSORBED_PAIRS
 ]
 
 
@@ -195,12 +234,12 @@ def test_ci_triggers_need_a_linked_pull_request(trigger: Trigger) -> None:
         assert not is_legal(source, trigger, pr_linked=False)
 
 
-def test_no_reachable_path_skips_pr_opened() -> None:
-    """Invariant 5, by exhaustive search rather than by inspection.
+def reachable_nodes() -> set[tuple[State | None, bool]]:
+    """Every `(state, pr_linked)` a sequence of triggers can produce, from nothing.
 
-    Explores every `(state, pr_linked)` a sequence of triggers can produce. `cycle` is held at zero
-    under a limit that cannot be hit, which does not narrow the search: the cycle affects the
-    *outcome* of a resume, never its legality, and the `FAILED` it can force is already reachable.
+    `cycle` is held at zero under a limit that cannot be hit, which does not narrow the search: the
+    cycle affects the *outcome* of a resume, never its legality, and the `FAILED` it can force is
+    already reachable.
     """
     start: tuple[State | None, bool] = (None, False)
     seen = {start}
@@ -218,12 +257,98 @@ def test_no_reachable_path_skips_pr_opened() -> None:
             if node not in seen:
                 seen.add(node)
                 frontier.append(node)
+    return seen
+
+
+def test_no_reachable_path_skips_pr_opened() -> None:
+    """Invariant 5, by exhaustive search rather than by inspection."""
+    seen = reachable_nodes()
 
     unlinked = {state for state, linked in seen if not linked}
     assert unlinked == {None, State.QUEUED, State.SESSION_CREATED, State.RUNNING, *TERMINAL[1:]}
     assert not unlinked & POST_PR_STATES
     assert (State.PR_OPENED, True) in seen
     assert (State.MERGED, True) in seen
+
+
+# ------------------------------------------------------------------------------------ check suites
+
+
+def test_no_linked_state_rejects_a_check_suite_event() -> None:
+    """Sentinel does not choose when a suite reports, so no state it can reach may refuse one.
+
+    Stated over the reachable graph rather than over the current table: enumerating the sources
+    `RULES` happens to list would have passed while lap one was broken, because `PR_OPENED` was
+    reachable and unlisted.
+    """
+    linked = {state for state, pr_linked in reachable_nodes() if pr_linked and state is not None}
+
+    assert linked - set(TERMINAL) == SPEC_LINKED_STATES
+
+    for state in sorted(linked):
+        for trigger in sorted(NEEDS_A_LINKED_PR):
+            result = transition(state, trigger, pr_linked=True, max_fix_cycles=99)
+            assert result.to_state in {state, RULES[trigger].target}
+
+
+@pytest.mark.parametrize("state", sorted(SPEC_LINKED_STATES), ids=str)
+def test_a_ci_failure_is_never_silently_dropped(state: State) -> None:
+    """From every linked state a failure either engages the fix loop or is already engaged."""
+    result = transition(state, Trigger.CHECK_SUITE_FAILED, pr_linked=True)
+
+    if result.moved:
+        assert result.to_state is State.CI_FAILED
+    else:
+        assert state in {State.CI_FAILED, State.CHANGES_REQUESTED}
+
+
+@pytest.mark.parametrize(
+    "pair", sorted(ABSORBED_PAIRS, key=str), ids=lambda pair: f"{pair[0]}-{pair[1]}"
+)
+def test_a_check_suite_event_with_no_new_verdict_is_recorded_without_moving(
+    pair: tuple[State, Trigger],
+) -> None:
+    source, trigger = pair
+
+    result = transition(source, trigger, cycle=2, pr_linked=True)
+
+    assert result.to_state is source
+    assert result.cycle == 2
+    assert result.absorbed
+    assert not is_legal(source, trigger, pr_linked=True)
+
+
+def test_the_transcribed_absorbing_states_match_the_rules() -> None:
+    for trigger, sources in SPEC_ABSORBED.items():
+        assert RULES[trigger].absorbed_from == sources
+        assert sources <= RULES[trigger].sources, "an absorbing state that is not even a source"
+
+    assert {trigger for trigger, rule in RULES.items() if rule.absorbed_from} == set(SPEC_ABSORBED)
+
+
+def test_the_lap_one_ordering_completes_now_that_the_poller_links_the_pull_request() -> None:
+    """`requested` is dropped as unresolvable, the poller links, then the conclusion lands.
+
+    This is the ordinary first lap: the poll interval is wider than the gap between a pull request
+    opening and its first check suite, so the remediation is in `PR_OPENED` — not `CI_RUNNING` —
+    when the conclusion arrives.
+    """
+    walk = Walk()
+    for trigger in (Trigger.ISSUE_LABELLED, Trigger.SESSION_CREATED, Trigger.SESSION_RUNNING):
+        walk.apply(trigger)
+
+    # check_suite.requested fires here and resolves to no remediation, so nothing is applied.
+    walk.apply(Trigger.PR_OPENED)
+    assert (walk.state, walk.pr_linked) == (State.PR_OPENED, True)
+
+    walk.apply(Trigger.CHECK_SUITE_SUCCEEDED)
+    assert walk.state is State.CI_PASSED
+
+    follow_up = automatic_trigger(walk.state)
+    assert follow_up is Trigger.REVIEW_REQUESTED
+    walk.apply(follow_up)
+
+    assert walk.state is State.IN_REVIEW
 
 
 # --------------------------------------------------------------------------------- the cycle count
@@ -450,6 +575,36 @@ def test_the_transcribed_transitions_match_the_spec_document() -> None:
         (source.value if source else None, target.value) for source, _, target in SPEC_TRANSITIONS
     }
     assert documented == transcribed
+
+
+def test_the_transcribed_check_suite_table_matches_the_spec_document() -> None:
+    """Both columns, so the document and `RULES` cannot drift on which events move and which do not.
+
+    Only the trigger each row names is transcribed here; the rest is read off the document.
+    """
+    moves: dict[Trigger, set[str]] = {}
+    ignored: dict[Trigger, set[str]] = {}
+    for row in spec_table("Check suite events"):
+        text = row[0]
+        if "requested" in text:
+            trigger = Trigger.CHECK_SUITE_REQUESTED
+        elif "success" in text:
+            trigger = Trigger.CHECK_SUITE_SUCCEEDED
+        else:
+            trigger = Trigger.CHECK_SUITE_FAILED
+        moves[trigger] = set(names_in(row[1]))
+        ignored[trigger] = set(names_in(row[2]))
+
+    assert set(moves) == NEEDS_A_LINKED_PR
+    for trigger in NEEDS_A_LINKED_PR:
+        transcribed_moves = {
+            source.value
+            for source, spec_trigger, _ in SPEC_TRANSITIONS
+            if spec_trigger is trigger and source is not None
+        }
+        assert moves[trigger] == transcribed_moves
+        assert ignored[trigger] == {state.value for state in SPEC_ABSORBED[trigger]}
+        assert moves[trigger] | ignored[trigger] == {state.value for state in SPEC_LINKED_STATES}
 
 
 def test_the_transcribed_pull_request_conditions_match_the_spec_document() -> None:
