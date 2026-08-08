@@ -16,6 +16,11 @@ stateDiagram-v2
     CI_RUNNING --> CI_PASSED
     RUNNING --> CI_FAILED : requested missed
     RUNNING --> CI_PASSED : requested missed
+    PR_OPENED --> CI_FAILED : requested missed
+    PR_OPENED --> CI_PASSED : requested missed
+    CI_FAILED --> CI_PASSED : suite re-run
+    CI_PASSED --> CI_FAILED : later suite
+    IN_REVIEW --> CI_FAILED : later suite
     CI_FAILED --> RUNNING : resume, cycle + 1
     CI_PASSED --> IN_REVIEW
     IN_REVIEW --> CHANGES_REQUESTED
@@ -56,8 +61,8 @@ stateDiagram-v2
 | `SESSION_CREATED` | `RUNNING` | Poller sees status `running` | — |
 | `RUNNING` | `PR_OPENED` | `pull_request.opened` from Devin's bot, or `pull_requests[]` on the session — **only while no pull request is linked** | Link PR to remediation, set `pr_opened_at`. Both are write-once: a later observation is recorded and otherwise ignored |
 | `PR_OPENED`, `RUNNING` | `CI_RUNNING` | `check_suite.requested` on the head SHA — **requires a linked pull request** | — |
-| `CI_RUNNING`, `RUNNING` | `CI_PASSED` | `check_suite.completed`, conclusion `success` — **requires a linked pull request** | Set `ci_green_at` |
-| `CI_RUNNING`, `RUNNING` | `CI_FAILED` | `check_suite.completed`, conclusion `failure`/`timed_out` — **requires a linked pull request** | Enqueue `resume_session` |
+| `PR_OPENED`, `RUNNING`, `CI_RUNNING`, `CI_FAILED` | `CI_PASSED` | `check_suite.completed`, conclusion `success` — **requires a linked pull request** | Set `ci_green_at` |
+| `PR_OPENED`, `RUNNING`, `CI_RUNNING`, `CI_PASSED`, `IN_REVIEW` | `CI_FAILED` | `check_suite.completed`, conclusion `failure`/`timed_out` — **requires a linked pull request** | Enqueue `resume_session` |
 | **`CI_FAILED`** | **`RUNNING`** | Worker resumed the session | Fetch failing job logs, `POST /v3/…/messages`, increment `cycle`, append tag `cycle:N` |
 | `CI_PASSED` | `IN_REVIEW` | Entering `CI_PASSED` | Request review; post the structured-output summary as a PR comment |
 | `IN_REVIEW` | `CHANGES_REQUESTED` | `pull_request_review.submitted`, state `changes_requested` | Enqueue `resume_session` |
@@ -65,6 +70,35 @@ stateDiagram-v2
 | `IN_REVIEW` | `MERGED` | `pull_request.closed` with `merged: true` | Set `merged_at`, append tag `outcome:merged`, close the issue |
 | any | `BLOCKED` | `structured_output.outcome == "blocked"` | Store `blocked_reason`, comment on issue, add `needs-human` |
 | any | `FAILED` | Session status `error`, ACU cap hit, or `cycle > MAX_FIX_CYCLES` | Store reason, comment on issue, add `needs-human` |
+
+## Check suite events
+
+Sentinel does not choose when a check suite reports, so a `check_suite` event can arrive in **any**
+state that can hold a linked pull request: `PR_OPENED`, `RUNNING`, `CI_RUNNING`, `CI_FAILED`,
+`CI_PASSED`, `IN_REVIEW`, `CHANGES_REQUESTED`. None of them may reject one. Where the event carries
+no verdict the state does not already have, it is recorded in `remediation_event` and otherwise
+ignored — the same treatment a terminal state gives a late webhook.
+
+| Trigger | Moves from | Recorded and ignored from |
+|---|---|---|
+| `check_suite.requested` | `PR_OPENED`, `RUNNING` | `CI_RUNNING`, `CI_FAILED`, `CI_PASSED`, `IN_REVIEW`, `CHANGES_REQUESTED` |
+| `check_suite.completed` conclusion `success` | `PR_OPENED`, `RUNNING`, `CI_RUNNING`, `CI_FAILED` | `CI_PASSED`, `IN_REVIEW`, `CHANGES_REQUESTED` |
+| `check_suite.completed` conclusion `failure` | `PR_OPENED`, `RUNNING`, `CI_RUNNING`, `CI_PASSED`, `IN_REVIEW` | `CI_FAILED`, `CHANGES_REQUESTED` |
+
+Reading the rows:
+
+- **`PR_OPENED` moves on a conclusion.** This is the ordinary first lap, not an edge case. The
+  poller is what links the pull request ([ADR](./adr/2026-08-07-poller-drives-state-machine.md)),
+  and it does so up to `POLL_INTERVAL_SECONDS` after the pull request appeared — routinely after
+  the first `check_suite.requested` has already been dropped as unresolvable. The remediation is
+  therefore sitting in `PR_OPENED`, not `CI_RUNNING`, when the conclusion arrives.
+- **A suite starting again is never news.** Pulling a remediation out of review, or out of the fix
+  loop, to record that CI restarted would lose the state that matters. The conclusion follows.
+- **A second success is ignored.** `ci_green_at` is the *first* successful suite
+  ([03](./03-data-model.md)), and a success must not drag a remediation back out of review.
+- **A failure is news almost everywhere**, including `IN_REVIEW`, where nothing else would re-engage
+  the fix loop. Not in `CHANGES_REQUESTED`, which already has a `resume_session` pending that will
+  produce a fresh suite of its own, and not twice over in `CI_FAILED`.
 
 ## The review-fix loop
 
@@ -98,11 +132,12 @@ sequenceDiagram
     end
 ```
 
-The CI states are re-entered from `RUNNING`, not only from `PR_OPENED`: on the second and later
-passes round the loop the pull request already exists, so the check suite for the fix commit is
-observed while the session is running.
+The CI states are re-entered from `RUNNING` on the second and later passes round the loop: the pull
+request already exists, so the check suite for the fix commit is observed while the session is
+running. That is one case of the general rule above — a conclusion is accepted wherever a linked
+pull request can sit.
 
-That widening is bounded by the pull request itself, not by the lap count, because both halves of
+The widening is bounded by the pull request itself, not by the lap count, because both halves of
 the condition have to hold. A check suite is only meaningful once a pull request is linked, so the
 CI triggers require one — which keeps `PR_OPENED` on every path into the CI states rather than
 letting `RUNNING → CI_PASSED` bypass it. And `RUNNING → PR_OPENED` is only legal while none is

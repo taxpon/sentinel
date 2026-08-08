@@ -64,6 +64,15 @@ class Trigger(StrEnum):
 TERMINAL_STATES: Final = frozenset({State.MERGED, State.BLOCKED, State.FAILED})
 NON_TERMINAL_STATES: Final = frozenset(State) - TERMINAL_STATES
 
+PRE_PULL_REQUEST_STATES: Final = frozenset({State.QUEUED, State.SESSION_CREATED})
+LINKED_STATES: Final = NON_TERMINAL_STATES - PRE_PULL_REQUEST_STATES
+"""Every non-terminal state a remediation with a linked pull request can be sitting in.
+
+Sentinel does not choose when a check suite reports, so a `check_suite` event can arrive in any of
+these. All three are legal from all of them — see `Rule.absorbed_from` for the ones that record the
+event without moving.
+"""
+
 DEFAULT_MAX_FIX_CYCLES: Final = 3
 """Spec default for `MAX_FIX_CYCLES`. Deployments override it through configuration."""
 
@@ -87,12 +96,19 @@ class PullRequestCondition(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class Rule:
-    """How one trigger behaves: where it leads, and the conditions it may be applied under."""
+    """How one trigger behaves: where it leads, and the conditions it may be applied under.
+
+    `absorbed_from` is the subset of `sources` where the trigger is legal but carries nothing to
+    act on — a second failure while already in `CI_FAILED`, a success on a pull request that has
+    already been green. The event is recorded and the state left alone, rather than raising (the
+    event is real) or moving (which would walk the remediation backwards).
+    """
 
     target: State
     sources: AbstractSet[State | None]
     increments_cycle: bool = False
     pull_request: PullRequestCondition = PullRequestCondition.ANY
+    absorbed_from: AbstractSet[State] = frozenset()
 
 
 RULES: Final[Mapping[Trigger, Rule]] = {
@@ -104,20 +120,38 @@ RULES: Final[Mapping[Trigger, Rule]] = {
         frozenset({State.RUNNING}),
         pull_request=PullRequestCondition.UNLINKED,
     ),
+    # A suite starting again is not news: pulling a remediation out of review or out of the fix
+    # loop for it would lose the state that matters. Its conclusion will follow.
     Trigger.CHECK_SUITE_REQUESTED: Rule(
         State.CI_RUNNING,
-        frozenset({State.PR_OPENED, State.RUNNING}),
+        LINKED_STATES,
         pull_request=PullRequestCondition.LINKED,
+        absorbed_from=frozenset(
+            {
+                State.CI_RUNNING,
+                State.CI_FAILED,
+                State.CI_PASSED,
+                State.IN_REVIEW,
+                State.CHANGES_REQUESTED,
+            }
+        ),
     ),
+    # `ci_green_at` is the *first* successful suite, so a later success must neither re-stamp it
+    # nor drag a remediation back out of review.
     Trigger.CHECK_SUITE_SUCCEEDED: Rule(
         State.CI_PASSED,
-        frozenset({State.CI_RUNNING, State.RUNNING}),
+        LINKED_STATES,
         pull_request=PullRequestCondition.LINKED,
+        absorbed_from=frozenset({State.CI_PASSED, State.IN_REVIEW, State.CHANGES_REQUESTED}),
     ),
+    # A failure is news almost everywhere — including `IN_REVIEW`, where nothing else would engage
+    # the fix loop. Not in `CHANGES_REQUESTED`, which already has a resume pending that will
+    # produce a fresh suite, nor twice over in `CI_FAILED`.
     Trigger.CHECK_SUITE_FAILED: Rule(
         State.CI_FAILED,
-        frozenset({State.CI_RUNNING, State.RUNNING}),
+        LINKED_STATES,
         pull_request=PullRequestCondition.LINKED,
+        absorbed_from=frozenset({State.CI_FAILED, State.CHANGES_REQUESTED}),
     ),
     Trigger.SESSION_RESUMED: Rule(
         State.RUNNING,
@@ -184,7 +218,7 @@ def is_legal(state: State | None, trigger: Trigger, *, pr_linked: bool = False) 
     alone.
     """
     rule = RULES[trigger]
-    if state not in rule.sources:
+    if state not in rule.sources or state in rule.absorbed_from:
         return False
     if rule.pull_request is PullRequestCondition.LINKED:
         return pr_linked
@@ -216,11 +250,13 @@ def transition(
     spec table: the CI triggers need a linked pull request, and `PR_OPENED` needs the absence of
     one.
 
-    Two situations absorb — the result reports the state and cycle unchanged with `absorbed=True`,
+    Three situations absorb — the result reports the state and cycle unchanged with `absorbed=True`,
     so the caller records a `remediation_event` and does nothing else. A terminal state absorbs
     every trigger, so a late webhook is not an error. A `PR_OPENED` for a pull request already
     linked absorbs from any state, so the poller re-reading `pull_requests[]` on every poll neither
-    raises nor re-applies the side effect.
+    raises nor re-applies the side effect. And a trigger applied from one of its `absorbed_from`
+    states absorbs, which is how a `check_suite` event that carries no new verdict is recorded
+    without walking the remediation backwards.
 
     Anything else the spec does not allow raises `IllegalTransitionError`.
 
@@ -246,6 +282,9 @@ def transition(
             rule.target,
             because=f"{trigger} needs a pull request linked to the remediation",
         )
+
+    if state is not None and state in rule.absorbed_from:
+        return Transition(state, trigger, state, cycle, absorbed=True)
 
     if not rule.increments_cycle:
         return Transition(state, trigger, rule.target, cycle)
