@@ -37,11 +37,10 @@ packages = ["src/sentinel"]
 line-length = 100
 target-version = "py314"
 src = ["src", "tests"]
-# These three predate ruff and belong to other tasks, so T01 must not reformat them; every other
-# file under scripts/ is linted normally. T06 (session_context, seed_issues) and T07 (gen_adr_index)
-# each run `make format` on their own file and delete their line here.
+# These two predate ruff and belong to another task, so T01 must not reformat them; every other
+# file under scripts/ is linted normally. T06 (session_context, seed_issues) runs `make format` on
+# its own files and deletes its lines here.
 extend-exclude = [
-    "scripts/gen_adr_index.py",
     "scripts/seed_issues.py",
     "scripts/session_context.py",
     # Ruff formats fenced Python inside Markdown. Most such blocks under docs/ are *quotations* of

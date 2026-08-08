@@ -107,7 +107,8 @@ in [04](./04-state-machine.md).
 ## Design decisions
 
 Each row links to the decision record holding the full reasoning and the options that were
-rejected. See [`adr/index.md`](./adr/index.md).
+rejected. Every record of `type: architecture` has a row here, which `tests/test_gen_adr_index.py`
+enforces; the complete list, process decisions included, is [`adr/index.md`](./adr/index.md).
 
 | Decision | Rationale |
 |---|---|
@@ -118,6 +119,13 @@ rejected. See [`adr/index.md`](./adr/index.md).
 | [**State transitions are events, not just a column**](./adr/2026-08-07-transitions-are-append-only-events.md) | `remediation_event` is append-only. Every metric in [07](./07-observability.md) — MTTR, funnel, fix cycles — is derived from it. A mutable status column alone could not answer "how long did this take" or "how many times did it retry". |
 | [**Sessions are resumable and reused**](./adr/2026-08-07-reuse-resumable-sessions.md) | A CI failure re-engages the existing session rather than starting a new one, so Devin retains the context of its own change. This is also what makes fix-cycle count a meaningful autonomy metric. |
 | [**Humans approve every merge**](./adr/2026-08-07-humans-approve-every-merge.md) | The goal is to move the bottleneck to review, not to eliminate it. Sentinel never merges on its own. |
+| [**Signature verification returns a reason, not a boolean**](./adr/2026-08-08-signature-verification-returns-a-reason.md) | One verification answers three questions: which status code to send (`413` for an oversized body, `401` for a missing, malformed or mismatched signature), what to record for the delivery, and what to log. Every `SignatureResult` member is a fixed identifier derived from no part of the request, so the result is safe to log; the secret and the expected digest never leave the module. |
+| [**The state machine is a pure function indexed by trigger**](./adr/2026-08-08-trigger-indexed-state-machine.md) | The webhook handler, the worker and the poller all drive the same transitions, so the table in [04](./04-state-machine.md) is executable: `transition(state, trigger, …)` returns one `Transition` the caller persists as one row. A terminal state absorbs later triggers instead of raising, and the cycle limit is compared in one place rather than in each of the three callers. |
+| [**CI states are re-entered from `RUNNING`**](./adr/2026-08-08-ci-states-re-entered-from-running.md) | The fix commits of the second lap are pushed to a pull request that already exists, so their `check_suite` events arrive while the state is `RUNNING`. The widening is bounded by the pull request link rather than by a lap count, which keeps `PR_OPENED` on every path into CI — the funnel, the merge rate and time-to-PR in [07](./07-observability.md) all rest on that. |
+| [**Devin is called through v3 only**](./adr/2026-08-07-devin-v3-only.md) | v1 and v2 remain reachable and most published examples still use them, but session tags, structured output schemas, `max_acu_limit`, playbook binding and schedules exist only in the organisation-scoped v3 API. A test over the client's route table asserts that no other version appears ([05](./05-devin-integration.md)). |
+| [**Devin gets the objective and the constraints, not the steps**](./adr/2026-08-07-delegate-task-not-steps.md) | The prompt carries the issue, the definition of done and the constraints, and nothing about how to investigate. Standing context for a whole class of work lives in playbooks, and repository facts such as how to run the test suite live in knowledge notes, so neither is re-sent with every issue. |
+| [**Credentials are `SecretStr`, and configuration errors are rewritten**](./adr/2026-08-08-credentials-are-secretstr-and-config-errors-are-rewritten.md) | Configuration is validated at startup and `pydantic.ValidationError` repeats the value it rejected, so a malformed token would print itself into the first lines of a container's log. `get_settings()` raises `ConfigurationError` naming the variable and the location of the fault, never the input, and the settings object is frozen so nothing can unmask a field later ([09](./09-operations.md)). |
+| [**A fork CI run with nothing to test reports success**](./adr/2026-08-08-vacuous-ci-reports-success.md) | GitHub concludes an all-skipped workflow as `skipped`, which maps to no transition — the remediation would sit in `CI_RUNNING` with nothing to move it and nothing to escalate it. The aggregate job runs with `if: always()` and reports success with a `::warning::` stating that the conclusion reflects `pre-commit` only. |
 
 ## What crosses the boundary
 
