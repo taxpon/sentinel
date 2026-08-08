@@ -1,0 +1,623 @@
+"""Async HTTP client for the Devin v3 API.
+
+Every path is a `/v3/...` path: v1 and v2 are not reachable from here, which
+`docs/adr/2026-08-07-devin-v3-only.md` requires and a test over `ENDPOINTS` asserts. The endpoints
+are the table in `docs/05-devin-integration.md#endpoints-used`, no more and no fewer — the worker
+and the poller use the first six, `make bootstrap-devin` the next three, and the dashboard the
+last.
+
+What this module decides, so that no caller has to:
+
+- **The request body.** `create_session` takes the facts of an issue and builds the body from
+  `playbooks.py` — prompt, title, tags, playbook id, ACU cap, structured-output schema. The tag set
+  in particular is built through `session_tags`, never assembled by a caller: a tag outside the
+  registered vocabulary is a `422` at creation (B7), and this is where that is made impossible
+  rather than unlikely.
+- **What is worth retrying.** `429` and `5xx` and a connection that never answered are retried with
+  exponential backoff and jitter, honouring `Retry-After`. Every other `4xx` raises immediately —
+  a body Devin rejected as malformed will not become well-formed, and retrying it only spends
+  quota. The exception carries the response body, which `docs/06-event-pipeline.md` records in
+  `remediation_event.detail`.
+- **What is a degradation rather than a failure.** The enterprise-scoped and consumption endpoints
+  answer `403` or `404` when the credentials do not carry the scope (B5, B6). Those become an
+  `Unavailable` the caller branches on, not an exception that fails a job. Everything else,
+  including `401`, raises: a rejected token is a fault to fix, not a capability to work around.
+
+The token is a `SecretStr` and is read exactly once, into the `Authorization` header httpx masks in
+its own repr. It is not stored on this object, does not appear in `repr()`, and cannot reach an
+exception message — the messages are built from the method, the *templated* path and the response
+body. `docs/07-observability.md` requires the same of the logs, and the redaction processor in
+`observability/logging.py` enforces it independently.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import random
+import time
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
+from types import TracebackType
+from typing import Any, Final, Self
+
+import httpx
+from pydantic import BaseModel, ValidationError
+
+from sentinel.config import Settings
+from sentinel.devin.playbooks import (
+    IssueClass,
+    acu_cap_for,
+    initial_prompt,
+    playbook_id_for,
+    session_tags,
+    session_title,
+    validate_tag,
+)
+from sentinel.devin.schemas import (
+    Available,
+    Capability,
+    Consumption,
+    CreateSessionRequest,
+    Degradable,
+    KnowledgeNote,
+    Schedule,
+    Session,
+    SessionMetrics,
+    SessionPage,
+    Unavailability,
+    Unavailable,
+)
+from sentinel.observability.logging import get_logger
+from sentinel.observability.prom import METRICS, DevinOutcome, Metrics
+
+log = get_logger(__name__)
+
+# --- The route table -----------------------------------------------------------------------------
+
+# Templated paths, formatted with the ids at call time. They are also the `endpoint` label on the
+# latency histogram, which is why the template is what is passed around: a path with the session id
+# substituted in would be a new Prometheus time series per session.
+_ORGANIZATION: Final = "/v3/organizations/{org_id}"
+
+SESSIONS: Final = f"{_ORGANIZATION}/sessions"
+SESSION: Final = f"{SESSIONS}/{{session_id}}"
+SESSION_MESSAGES: Final = f"{SESSION}/messages"
+SESSION_TAGS: Final = f"{SESSION}/tags"
+ORGANIZATION_TAGS: Final = f"{_ORGANIZATION}/tags"
+KNOWLEDGE_NOTES: Final = f"{_ORGANIZATION}/knowledge/notes"
+SCHEDULES: Final = f"{_ORGANIZATION}/schedules"
+CONSUMPTION_DAILY: Final = f"{_ORGANIZATION}/consumption/daily"
+ENTERPRISE_SESSION_METRICS: Final = "/v3/enterprise/metrics/sessions"
+
+ENDPOINTS: Final[frozenset[str]] = frozenset(
+    {
+        SESSIONS,
+        SESSION,
+        SESSION_MESSAGES,
+        SESSION_TAGS,
+        ORGANIZATION_TAGS,
+        KNOWLEDGE_NOTES,
+        SCHEDULES,
+        CONSUMPTION_DAILY,
+        ENTERPRISE_SESSION_METRICS,
+    }
+)
+"""Every path this client can reach. The spec's endpoint table and this set are compared in the
+tests, in both directions, so an endpoint added here without a row there fails the suite."""
+
+TIMEOUT: Final = httpx.Timeout(30.0)
+"""30 s connect and read, from `docs/05-devin-integration.md#client-behaviour`. Session creation is
+never on the webhook request path, so it is free to take that long."""
+
+MAX_ERROR_BODY: Final = 2000
+"""How much of a rejected response is kept on the exception. Enough for a validation error naming
+the offending field; short enough to store in `remediation_event.detail` and read in a log line."""
+
+DEGRADES: Final[Mapping[int, Unavailability]] = {
+    403: Unavailability.FORBIDDEN,
+    404: Unavailability.NOT_FOUND,
+}
+"""Statuses that mean "this deployment does not have this capability" rather than "this request was
+wrong". `401` is deliberately absent: a rejected token is a misconfiguration that must be fixed,
+and silently falling back to derived figures would hide it."""
+
+
+# --- Errors --------------------------------------------------------------------------------------
+
+
+class DevinError(Exception):
+    """Anything this client could not complete. Never carries the token."""
+
+    @property
+    def retryable(self) -> bool:
+        """Whether sending the same request again could plausibly succeed."""
+        return False
+
+
+class DevinTransportError(DevinError):
+    """The request never got a response — connection refused, DNS, a timeout."""
+
+    @property
+    def retryable(self) -> bool:
+        return True
+
+
+class DevinAPIError(DevinError):
+    """Devin answered, and refused.
+
+    `body` is the response, truncated: `docs/06-event-pipeline.md` records it in
+    `remediation_event.detail`, which is what makes a `422` from an unregistered tag (B7)
+    diagnosable from Sentinel's own audit trail rather than only from the Devin dashboard.
+    """
+
+    def __init__(self, *, method: str, endpoint: str, status_code: int, body: str) -> None:
+        self.method = method
+        self.endpoint = endpoint
+        self.status_code = status_code
+        self.body = body[:MAX_ERROR_BODY]
+        super().__init__(f"{method} {endpoint} failed with {status_code}: {self.body}")
+
+    @property
+    def retryable(self) -> bool:
+        return self.status_code == 429 or self.status_code >= 500
+
+
+class DevinResponseError(DevinError):
+    """Devin accepted the request and answered with something v3 does not document.
+
+    Not retryable, and distinct from `DevinAPIError` on purpose: a session whose structured report
+    is missing a required field will report the same thing on the next poll, so the caller
+    escalates it instead of polling it for ever.
+    """
+
+
+# --- Retry policy --------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class RetryPolicy:
+    """Exponential backoff with jitter, as `docs/05-devin-integration.md#client-behaviour` states.
+
+    Bounded and short by design. The job queue retries too, over minutes and with the attempt count
+    persisted (`docs/06-event-pipeline.md#reliability`); this layer is only for the rate limit and
+    the blip that would otherwise cost a whole job attempt.
+    """
+
+    attempts: int = 3
+    base_delay: float = 0.5
+    max_delay: float = 30.0
+
+    def __post_init__(self) -> None:
+        if self.attempts < 1:
+            raise ValueError(f"attempts must be at least 1, got {self.attempts}")
+
+    def ceiling(self, attempt: int) -> float:
+        """The longest this attempt waits before the next one."""
+        return min(self.base_delay * 2.0 ** (attempt - 1), self.max_delay)
+
+
+def retry_after_seconds(response: httpx.Response) -> float | None:
+    """`Retry-After` in seconds, if the response gave one we can act on.
+
+    Only the delta-seconds form is read. The HTTP-date form would need the server's clock to agree
+    with ours, and a skewed clock turns a two-second wait into an hour.
+    """
+    header = response.headers.get("retry-after")
+    if header is None:
+        return None
+    try:
+        seconds = float(header.strip())
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
+
+
+DEFAULT_RETRY: Final = RetryPolicy()
+
+Sleep = Callable[[float], Awaitable[None]]
+
+PathParams = Mapping[str, str]
+
+
+# --- The client ----------------------------------------------------------------------------------
+
+
+class DevinClient:
+    """The Devin v3 API, as the worker, the poller and the bootstrap script use it.
+
+        async with DevinClient(settings) as devin:
+            session = await devin.create_session(
+                issue_number=42, issue_title="…", issue_body="…",
+                issue_class="security", delivery_id=run_id,
+            )
+
+    One `httpx.AsyncClient` is held for the life of the object, so connections are reused across a
+    poll cycle. `sleep` and `rng` are injectable so that the backoff can be asserted without a test
+    waiting for it.
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        retry: RetryPolicy = DEFAULT_RETRY,
+        metrics: Metrics = METRICS,
+        sleep: Sleep = asyncio.sleep,
+        rng: random.Random | None = None,
+    ) -> None:
+        self._settings = settings
+        self._retry = retry
+        self._metrics = metrics
+        self._sleep = sleep
+        self._rng = random.Random() if rng is None else rng
+        self._client = httpx.AsyncClient(
+            base_url=settings.devin_api_base,
+            timeout=TIMEOUT,
+            headers={
+                # Read once, here. Nothing else on this object holds the token, and httpx masks
+                # `Authorization` in the repr of its own headers.
+                "Authorization": f"Bearer {settings.devin_api_token.get_secret_value()}",
+                "Accept": "application/json",
+            },
+        )
+
+    def __repr__(self) -> str:
+        # Written out rather than defaulted, because a default repr of a future subclass holding
+        # the token as an attribute would print it. The two fields here identify the deployment.
+        return (
+            f"{type(self).__name__}(base_url={self._settings.devin_api_base!r}, "
+            f"org_id={self._settings.devin_org_id!r})"
+        )
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    # --- Sessions -------------------------------------------------------------------------------
+
+    async def create_session(
+        self,
+        *,
+        issue_number: int,
+        issue_title: str,
+        issue_body: str,
+        issue_class: str | IssueClass,
+        delivery_id: str,
+        repo: str | None = None,
+        base_branch: str | None = None,
+        knowledge_ids: Sequence[str] | None = None,
+    ) -> Session:
+        """Create the remediation session for one issue.
+
+        Takes the issue rather than a request body: every field of that body is derived from
+        `playbooks.py` and the configuration, and the two that a caller could get wrong — the tag
+        set and the ACU cap — are the ones a reviewer checks in the Devin dashboard.
+
+        Raises `UnknownIssueClass` for a class with no playbook and `MissingPlaybookId` for one
+        whose id was never configured, both before anything is sent.
+        """
+        repo = self._settings.target_repo if repo is None else repo
+        base_branch = self._settings.target_base_branch if base_branch is None else base_branch
+        configured = self._settings.devin_knowledge_ids
+        request = CreateSessionRequest(
+            prompt=initial_prompt(
+                issue_number=issue_number,
+                issue_title=issue_title,
+                issue_body=issue_body,
+                repo=repo,
+                base_branch=base_branch,
+            ),
+            title=session_title(issue_number, issue_title),
+            tags=tuple(
+                session_tags(
+                    repo=repo,
+                    issue_number=issue_number,
+                    issue_class=issue_class,
+                    delivery_id=delivery_id,
+                )
+            ),
+            repos=(repo,),
+            playbook_id=playbook_id_for(issue_class, self._settings.devin_playbook_ids),
+            knowledge_ids=tuple(configured if knowledge_ids is None else knowledge_ids),
+            max_acu_limit=acu_cap_for(issue_class),
+        )
+        started = time.perf_counter()
+        payload = await self._request(
+            "POST", SESSIONS, json=request.model_dump(mode="json"), path=self._org()
+        )
+        session = self._parse(Session, payload, "POST", SESSIONS)
+        log.info(
+            "devin.session.created",
+            session_id=session.session_id,
+            issue=issue_number,
+            duration_ms=_millis(time.perf_counter() - started),
+        )
+        return session
+
+    async def get_session(self, session_id: str) -> Session:
+        """One session, as the poller reconciles it: status, `status_detail`, ACUs, pull requests
+        and the structured report."""
+        payload = await self._request("GET", SESSION, path=self._org(session_id=session_id))
+        return self._parse(Session, payload, "GET", SESSION)
+
+    async def list_sessions(
+        self, *, tags: Sequence[str] = (), limit: int | None = None
+    ) -> tuple[Session, ...]:
+        """Sessions of this organisation, for backfill and in-flight listing.
+
+        `tags` filters server-side where the organisation supports it; every session Sentinel
+        creates carries the `sentinel` namespace tag, which is what makes ours findable among an
+        organisation's own.
+        """
+        params: dict[str, Any] = {}
+        if tags:
+            params["tags"] = ",".join(validate_tag(tag) for tag in tags)
+        if limit is not None:
+            params["limit"] = limit
+        payload = await self._request("GET", SESSIONS, params=params, path=self._org())
+        return self._parse(SessionPage, payload, "GET", SESSIONS).sessions
+
+    async def send_message(self, session_id: str, message: str) -> None:
+        """Feed a resumable session the next fact — a CI failure, a review requesting changes.
+
+        The message is built by `playbooks.ci_failure_message` or `changes_requested_message`,
+        which state the new fact and restate the goal without prescribing the fix.
+        """
+        await self._request(
+            "POST",
+            SESSION_MESSAGES,
+            json={"message": message},
+            path=self._org(session_id=session_id),
+        )
+
+    async def tag_session(self, session_id: str, tags: Sequence[str]) -> None:
+        """Append lifecycle tags — `cycle:2`, `outcome:merged`.
+
+        Every tag is checked against the registered vocabulary before the request is made, so an
+        unregistered one raises `UnregisteredTag` here instead of `422` at Devin (B7).
+        """
+        await self._request(
+            "POST",
+            SESSION_TAGS,
+            json={"tags": [validate_tag(tag) for tag in tags]},
+            path=self._org(session_id=session_id),
+        )
+
+    # --- Bootstrap ------------------------------------------------------------------------------
+
+    async def register_tags(self, tags: Sequence[str]) -> None:
+        """Register the organisation's allowed tag vocabulary, once, at bootstrap.
+
+        Not validated against `validate_tag`: what is registered is the vocabulary itself — the
+        namespace tag and the prefixes of `playbooks.TAG_PREFIXES` — and a prefix on its own is not
+        a tag that would pass validation.
+        """
+        await self._request("PUT", ORGANIZATION_TAGS, json={"tags": list(tags)}, path=self._org())
+
+    async def create_knowledge_note(
+        self, *, name: str, body: str, trigger_description: str | None = None
+    ) -> KnowledgeNote:
+        """Seed one repository convention, so every session starts with it instead of rediscovering
+        it. The returned id becomes an entry of `DEVIN_KNOWLEDGE_IDS`."""
+        note: dict[str, Any] = {"name": name, "body": body}
+        if trigger_description is not None:
+            note["trigger_description"] = trigger_description
+        payload = await self._request("POST", KNOWLEDGE_NOTES, json=note, path=self._org())
+        return self._parse(KnowledgeNote, payload, "POST", KNOWLEDGE_NOTES)
+
+    async def create_schedule(
+        self,
+        *,
+        name: str,
+        prompt: str,
+        frequency: str,
+        tags: Sequence[str],
+        schedule_type: str = "recurring",
+        notify_on: str = "failure",
+    ) -> Schedule:
+        """Create the nightly vulnerability sweep, whose issues re-enter at the top of the flow."""
+        payload = await self._request(
+            "POST",
+            SCHEDULES,
+            json={
+                "name": name,
+                "schedule_type": schedule_type,
+                "frequency": frequency,
+                "prompt": prompt,
+                "tags": [validate_tag(tag) for tag in tags],
+                "notify_on": notify_on,
+            },
+            path=self._org(),
+        )
+        return self._parse(Schedule, payload, "POST", SCHEDULES)
+
+    # --- Degradable ------------------------------------------------------------------------------
+
+    async def daily_consumption(self) -> Degradable[Consumption]:
+        """Daily ACU spend, for the budget guard and the cost panel.
+
+        Degrades to `Unavailable` when the organisation does not expose consumption; the caller
+        sums `acus_consumed` across sessions instead.
+        """
+        return await self._degradable(
+            Capability.ACU_SPEND, "GET", CONSUMPTION_DAILY, Consumption, path=self._org()
+        )
+
+    async def session_metrics(self) -> Degradable[SessionMetrics]:
+        """Merged-PR and ACU aggregates from Devin's own accounting — enterprise scope, optional.
+
+        Not attempted at all without `DEVIN_ENTERPRISE_ID`: the deployment has said it does not
+        claim enterprise scope, and a request that is certain to be refused is not worth a round
+        trip or a `403` in the logs on every dashboard refresh.
+        """
+        if self._settings.devin_enterprise_id is None:
+            return self._unavailable(Capability.SESSION_METRICS, Unavailability.NOT_CONFIGURED)
+        return await self._degradable(
+            Capability.SESSION_METRICS, "GET", ENTERPRISE_SESSION_METRICS, SessionMetrics
+        )
+
+    # --- Internals -------------------------------------------------------------------------------
+
+    def _org(self, **path: str) -> PathParams:
+        """The path parameters of an organisation-scoped endpoint, plus whatever else it takes."""
+        return {"org_id": self._settings.devin_org_id, **path}
+
+    async def _degradable[M: BaseModel](
+        self,
+        capability: Capability,
+        method: str,
+        endpoint: str,
+        model: type[M],
+        path: PathParams | None = None,
+    ) -> Degradable[M]:
+        try:
+            payload = await self._request(method, endpoint, path=path)
+        except DevinAPIError as exc:
+            reason = DEGRADES.get(exc.status_code)
+            if reason is None:
+                raise
+            return self._unavailable(capability, reason, exc.status_code)
+        return Available(self._parse(model, payload, method, endpoint))
+
+    def _unavailable(
+        self,
+        capability: Capability,
+        reason: Unavailability,
+        status_code: int | None = None,
+    ) -> Unavailable:
+        result = Unavailable(capability=capability, reason=reason, status_code=status_code)
+        log.warning(
+            "devin.capability.unavailable",
+            capability=capability.value,
+            reason=reason.value,
+            status=status_code,
+            fallback=result.fallback,
+        )
+        return result
+
+    async def _request(
+        self,
+        method: str,
+        endpoint: str,
+        *,
+        json: Any = None,
+        params: Mapping[str, Any] | None = None,
+        path: PathParams | None = None,
+    ) -> Any:
+        """One call, with the retry policy applied. Returns the decoded body, or `None` if empty.
+
+        `endpoint` is the template; `path` fills it. Both the metric label and every message built
+        here use the template, so no session id reaches a Prometheus label or an exception.
+        """
+        url = endpoint.format(**(path or {}))
+        for attempt in range(1, self._retry.attempts + 1):
+            started = time.perf_counter()
+            try:
+                response = await self._client.request(
+                    method, url, json=json, params=dict(params) if params else None
+                )
+            except httpx.TransportError as exc:
+                elapsed = time.perf_counter() - started
+                self._observe(method, endpoint, DevinOutcome.NETWORK_ERROR, elapsed)
+                # The class name, not the exception: a connection error renders the URL, and a
+                # proxy URL can carry credentials.
+                error: DevinError = DevinTransportError(
+                    f"{method} {endpoint}: {type(exc).__name__}"
+                )
+                retry_after: float | None = None
+                status: int | None = None
+            else:
+                elapsed = time.perf_counter() - started
+                status = response.status_code
+                self._observe(method, endpoint, DevinOutcome.from_status(status), elapsed)
+                log.debug(
+                    "devin.request",
+                    method=method,
+                    endpoint=endpoint,
+                    status=status,
+                    duration_ms=_millis(elapsed),
+                    attempt=attempt,
+                )
+                if response.is_success:
+                    return _decode(method, endpoint, response)
+                error = DevinAPIError(
+                    method=method, endpoint=endpoint, status_code=status, body=response.text
+                )
+                retry_after = retry_after_seconds(response)
+
+            if not error.retryable or attempt == self._retry.attempts:
+                log.warning(
+                    "devin.request.failed",
+                    method=method,
+                    endpoint=endpoint,
+                    status=status,
+                    attempts=attempt,
+                )
+                raise error
+
+            delay = self._delay(attempt, retry_after)
+            log.warning(
+                "devin.request.retry",
+                method=method,
+                endpoint=endpoint,
+                status=status,
+                attempt=attempt,
+                delay_ms=_millis(delay),
+            )
+            await self._sleep(delay)
+        raise AssertionError("the retry loop returns or raises on its last attempt")
+
+    def _delay(self, attempt: int, retry_after: float | None) -> float:
+        """How long to wait before the next attempt.
+
+        `Retry-After` wins when Devin sent one — it knows when the window resets and we do not —
+        capped, so a header we misread cannot stall a worker indefinitely. Otherwise the delay is
+        jittered across the top half of the exponential ceiling: enough spread to break up a burst
+        of workers retrying together, without collapsing the backoff to nearly nothing.
+        """
+        ceiling = self._retry.ceiling(attempt)
+        if retry_after is not None:
+            return min(retry_after, self._retry.max_delay)
+        return self._rng.uniform(ceiling / 2, ceiling)
+
+    def _observe(self, method: str, endpoint: str, outcome: DevinOutcome, elapsed: float) -> None:
+        self._metrics.observe_devin_request(
+            method=method, endpoint=endpoint, outcome=outcome, seconds=elapsed
+        )
+
+    def _parse[M: BaseModel](self, model: type[M], payload: Any, method: str, endpoint: str) -> M:
+        try:
+            return model.model_validate(payload)
+        except ValidationError as exc:
+            # Locations and messages only. The payload itself is not repeated into the exception:
+            # pydantic's own rendering includes the input it rejected, which is the whole body.
+            faults = "; ".join(
+                f"{'.'.join(str(part) for part in item['loc'])}: {item['msg']}"
+                for item in exc.errors(include_url=False)
+            )
+            raise DevinResponseError(
+                f"{method} {endpoint} returned a body {model.__name__} does not accept — {faults}"
+            ) from None
+
+
+def _decode(method: str, endpoint: str, response: httpx.Response) -> Any:
+    if not response.content:
+        return None
+    try:
+        return response.json()
+    except ValueError:
+        raise DevinResponseError(f"{method} {endpoint} returned a body that is not JSON") from None
+
+
+def _millis(seconds: float) -> int:
+    return round(seconds * 1000)
