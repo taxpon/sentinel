@@ -17,23 +17,22 @@ Take the current task from "code written" to "pull request open". Work through t
    something, say which gap is left uncovered in the pull request body.
 
 3. **ADRs.** Did you choose between defensible options, or do something a later reader would
-   question? Write a record in `docs/adr/` using `template.md`, then:
+   question? Write a record in `docs/adr/` using `template.md` — **and commit only that record.**
+   `docs/adr/index.md` and `.claude/rules/adr-pointers.md` are regenerated on `main` after this
+   merges, and a branch that edits them fails CI. `make adr-index` is still there if you want to
+   read the index locally; revert it before committing:
    ```bash
-   make adr-index
+   git checkout origin/main -- docs/adr/index.md .claude/rules/adr-pointers.md
    ```
-   Commit the regenerated `docs/adr/index.md` and `.claude/rules/adr-pointers.md`.
+   A record of `type: architecture` also needs a row in the **Design decisions** table of
+   `docs/02-architecture.md`. That one you do commit.
 
 4. **Catch up with `main`, if it has moved.** Do it now rather than after the review — the marker in
    step 6 covers one commit, so rebasing afterwards invalidates it.
    ```bash
    git fetch origin && git rebase origin/main
    ```
-   Two conflicts are expected on a repository this parallel, and neither needs much thought:
-   - `docs/adr/index.md` and `.claude/rules/adr-pointers.md` are **generated** from the records, so
-     the generator overwrites the conflict markers wholesale. Never edit them by hand:
-     ```bash
-     make adr-index && git add docs/adr/index.md .claude/rules/adr-pointers.md
-     ```
+   One conflict is expected on a repository this parallel:
    - `docs/02-architecture.md` conflicts when another task also added a row to the **Design
      decisions** table. Keep **both** rows; the table has no meaningful order. This is a real edit by
      someone else — read their row before you drop anything.

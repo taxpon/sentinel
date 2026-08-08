@@ -1,0 +1,51 @@
+# `docs/adr/index.md` and `.claude/rules/adr-pointers.md` are derived from the front matter of the
+# records in `docs/adr/`. Maintaining them on branches made every pull request that added a record
+# conflict with every other one, in a file nobody edits by hand.
+#
+# So branches do not maintain them: they add their record and nothing else, and main regenerates
+# here after the merge. Two branches adding a record now touch no common file at all, which is what
+# makes the conflict impossible rather than merely automatic to resolve.
+#
+# The commit this pushes is made with GITHUB_TOKEN, and GitHub does not run workflows for such a
+# push — so this cannot trigger itself.
+name: ADR index
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/adr/**"
+      - "docs/tasks.yaml"
+      - "scripts/gen_adr_index.py"
+
+concurrency:
+  group: adr-index
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  regenerate:
+    name: Regenerate the ADR index
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Regenerate
+        run: make adr-index
+
+      - name: Commit if anything changed
+        run: |
+          if git diff --quiet -- docs/adr/index.md .claude/rules/adr-pointers.md; then
+            echo "Index already matches the records; nothing to commit."
+            exit 0
+          fi
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/adr/index.md .claude/rules/adr-pointers.md
+          git commit -m 'Regenerate the ADR index'
+          git push

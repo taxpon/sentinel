@@ -37,7 +37,10 @@ invalidates the marker, so review the final state, not an earlier one.
 
 **4. Record non-obvious decisions as ADRs.**
 If you chose between defensible options, or someone will later ask "why is it like this?", write a
-record in `docs/adr/` and run `make adr-index`. Criteria and the template are in
+record in `docs/adr/`. **Add the record and nothing else** — `docs/adr/index.md` and
+`.claude/rules/adr-pointers.md` are regenerated on `main` after your pull request merges, and a
+branch that edits them fails CI. Run `make adr-index` locally if you want to read the index; just
+do not commit the result. Criteria and the template are in
 [`docs/implementation-plan.md`](docs/implementation-plan.md#adrs). Do not write one for following a
 library idiom or for a choice the spec already justifies. A record of `type: architecture` also gets
 a row in the **Design decisions** table of `docs/02-architecture.md` — a test enforces it.
