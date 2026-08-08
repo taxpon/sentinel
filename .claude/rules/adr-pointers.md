@@ -39,6 +39,8 @@ paths:
   - "src/sentinel/pipeline/handlers.py"
   - "src/sentinel/pipeline/poller.py"
   - "src/sentinel/pipeline/state.py"
+  - "src/sentinel/policy/admission.py"
+  - "src/sentinel/policy/budget.py"
   - "src/sentinel/policy/dedup.py"
   - "src/sentinel/queue.py"
   - "src/sentinel/security/hmac.py"
@@ -95,6 +97,8 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `src/sentinel/pipeline/handlers.py` — [Resume the existing Devin session on CI failure rather than starting a new one](../../docs/adr/2026-08-07-reuse-resumable-sessions.md)
 - `src/sentinel/pipeline/poller.py` — [Drive the remediation state machine from a poller, not from Devin callbacks](../../docs/adr/2026-08-07-poller-drives-state-machine.md)
 - `src/sentinel/pipeline/state.py` — [Accept a check suite event wherever a linked pull request can sit](../../docs/adr/2026-08-08-ci-states-re-entered-from-running.md), [Index the state machine by trigger, and keep the cycle limit inside it](../../docs/adr/2026-08-08-trigger-indexed-state-machine.md)
+- `src/sentinel/policy/admission.py` — [The policy releases the job it refuses, and decides the terminal verdict first](../../docs/adr/2026-08-08-the-policy-releases-the-job-it-refuses.md)
+- `src/sentinel/policy/budget.py` — [The budget guard spends against the highest figure any source reports](../../docs/adr/2026-08-08-the-budget-guard-spends-against-the-highest-figure-any-source-reports.md)
 - `src/sentinel/policy/dedup.py` — [Deduplicate at both the delivery and the remediation layer](../../docs/adr/2026-08-07-two-layer-deduplication.md)
 - `src/sentinel/queue.py` — [Use Postgres as the job queue instead of adding Redis](../../docs/adr/2026-08-07-postgres-as-job-queue.md), [Retry jitter takes away at most half the delay, so the ten-minute cap stays a ceiling](../../docs/adr/2026-08-08-equal-jitter-keeps-the-backoff-cap-a-ceiling.md), [One statement claims, un-defers and reclaims, and the lease it grants fences the release](../../docs/adr/2026-08-08-one-claim-statement-and-a-fenced-lease.md)
 - `src/sentinel/security/hmac.py` — [Return a reason from signature verification instead of a boolean or an exception](../../docs/adr/2026-08-08-signature-verification-returns-a-reason.md)
