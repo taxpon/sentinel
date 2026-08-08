@@ -42,6 +42,7 @@ paths:
   - "src/sentinel/pipeline/handlers.py"
   - "src/sentinel/pipeline/poller.py"
   - "src/sentinel/pipeline/state.py"
+  - "src/sentinel/pipeline/worker.py"
   - "src/sentinel/policy/admission.py"
   - "src/sentinel/policy/budget.py"
   - "src/sentinel/policy/dedup.py"
@@ -101,9 +102,10 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `src/sentinel/models.py` — [Record every state transition as an append-only event](../../docs/adr/2026-08-07-transitions-are-append-only-events.md), [Build the test schema by running the migrations, and test for drift](../../docs/adr/2026-08-08-migrations-are-the-schema-tests-run-against.md)
 - `src/sentinel/observability/logging.py` — [Scrub credentials out of log values, not only out of fields named like credentials](../../docs/adr/2026-08-08-log-redaction-scrubs-values-not-only-keys.md)
 - `src/sentinel/observability/prom.py` — [Keep Prometheus metrics process-local and publish cross-process figures as snapshots](../../docs/adr/2026-08-08-metrics-are-process-local.md)
-- `src/sentinel/pipeline/handlers.py` — [Resume the existing Devin session on CI failure rather than starting a new one](../../docs/adr/2026-08-07-reuse-resumable-sessions.md)
+- `src/sentinel/pipeline/handlers.py` — [Resume the existing Devin session on CI failure rather than starting a new one](../../docs/adr/2026-08-07-reuse-resumable-sessions.md), [The resume handler reads its loop edge from the state, and drops a job enqueued on the other one](../../docs/adr/2026-08-08-the-resume-edge-is-read-from-the-state.md), [An abandoned pull request still escalates, unlike a cancelled remediation](../../docs/adr/2026-08-09-an-abandoned-pull-request-still-escalates.md)
 - `src/sentinel/pipeline/poller.py` — [Drive the remediation state machine from a poller, not from Devin callbacks](../../docs/adr/2026-08-07-poller-drives-state-machine.md), [A session that ends with nothing to show fails the remediation](../../docs/adr/2026-08-08-a-session-with-nothing-to-show-fails.md), [A session that is running and waiting for a user is blocked, on the first observation](../../docs/adr/2026-08-08-a-stalled-session-is-blocked.md), [The poller records only the observations that move a remediation](../../docs/adr/2026-08-08-the-poller-records-only-what-moves.md)
 - `src/sentinel/pipeline/state.py` — [Accept a check suite event wherever a linked pull request can sit](../../docs/adr/2026-08-08-ci-states-re-entered-from-running.md), [Index the state machine by trigger, and keep the cycle limit inside it](../../docs/adr/2026-08-08-trigger-indexed-state-machine.md)
+- `src/sentinel/pipeline/worker.py` — [A rate limit GitHub named a delay for defers the job; one it did not fails it](../../docs/adr/2026-08-08-a-rate-limit-with-an-answer-defers-the-job.md)
 - `src/sentinel/policy/admission.py` — [The policy releases the job it refuses, and decides the terminal verdict first](../../docs/adr/2026-08-08-the-policy-releases-the-job-it-refuses.md)
 - `src/sentinel/policy/budget.py` — [The budget guard spends against the highest figure any source reports](../../docs/adr/2026-08-08-the-budget-guard-spends-against-the-highest-figure-any-source-reports.md)
 - `src/sentinel/policy/dedup.py` — [Deduplicate at both the delivery and the remediation layer](../../docs/adr/2026-08-07-two-layer-deduplication.md)
