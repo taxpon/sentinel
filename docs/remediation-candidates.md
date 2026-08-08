@@ -27,9 +27,9 @@ not a preference. Each candidate below names its host.
 | # | Candidate | Class | Evidence strength |
 |---|---|---|---|
 | [C1](#c1) | `is_mutating()` misses `CALL` on every dialect but Postgres | `security` | **Strong** — read the code, reproduced against sqlglot |
-| [C2](#c2) | Flask held at 2.3.3 with an unpatched advisory | `security-dep` | **Strong** — advisory resolved via OSV; constraint graph checked |
+| [C2](#c2) | paramiko 3.5.1 accepts SHA-1, and the fix crosses two majors | `security-dep` | **Strong** — advisory resolved via OSV; both blockers read in the tree |
 | [C3](#c3) | Dataset Hour Offset ignored before time-grain truncation | `bug` | **Medium-strong** — code read and confirmed; upstream issue open |
-| [C4](#c4) | DOMPurify 3.4.12 below the fixed version | `frontend-dep` | **Medium** — advisory real, exploitability at our call sites not shown |
+| [C4](#c4) | deck.gl family carries a transitive `image-size` DoS | `frontend-dep` | **Medium-strong** — advisories verified; CI cannot exercise the parsers |
 | [C5](#c5) | Skipped `BackgroundStyleDropdown` test in `Row.test.tsx` | `flaky-test` | **Strong** — root cause fully traced |
 | [C6](#c6) | O(2N) query loop in `TagDAO.create_custom_tagged_objects` | `perf` | **Strong** — code read; batching idiom already in the same file |
 | [C7](#c7) | Legacy `Query.get()` on live code paths | `deprecation` | **Strong** — 7 live sites; warnings already errors in `pytest.ini` |
@@ -112,75 +112,83 @@ what `structured_output.root_cause` is supposed to capture.
 
 ---
 
-## C2 — Flask held at 2.3.3 with an unpatched advisory {#c2}
+## C2 — paramiko 3.5.1 accepts SHA-1, and the fix crosses two majors {#c2}
 
 **Class:** `security-dep`
 
 ### Evidence
 
-`requirements/base.txt:112` pins `flask==2.3.3`. OSV reports that version as affected by
-**GHSA-68rp-wp8r-4726** / **CVE-2026-27205** (LOW, "Flask session does not add `Vary: Cookie` header
-when accessed in some ways"), with `introduced: 0` and `fixed: 3.1.3`. Some forms of session access,
-notably the Python `in` operator, do not mark the response as varying on the cookie, so a caching
-proxy in front of Superset can serve one user's page to another.
+`requirements/base.txt:283` pins `paramiko==3.5.1`. OSV reports it affected by
+**GHSA-r374-rxx8-8654** / **PYSEC-2026-2858** / **CVE-2026-44405** — "Paramiko rsakey.py allows the
+SHA-1 algorithm." A weak signature algorithm is not rejected, so an `ssh-rsa`+SHA-1 host key or
+signature is accepted where it should be refused. Relevant to Superset because SSH tunnels are a
+supported way to reach a database.
 
-The interesting part is why the pin is stuck. `pyproject.toml:55` already permits
-`flask>=2.2.5, <4.0.0`, so the abstract constraint is not the blocker. Every Flask extension in the
-lock was checked against its PyPI metadata:
+What makes this a real remediation rather than a pin bump is that **two independent, documented
+blockers sit in front of the upgrade**, both visible in the tree.
 
-| Package | Declared Flask constraint |
-|---|---|
-| `flask-appbuilder==5.2.2` | `Flask<4,>=2` |
-| `flask-jwt-extended==4.7.1` | `Flask<4.0,>=2.0` |
-| `flask-caching==2.4.1` | `flask>=2.0` |
-| `flask-session==0.8.0` | `flask>=2.2` |
-| `flask-babel==3.1.0` | `Flask (>=2.0)` |
-| `flask-limiter==3.12` | `Flask>=2` |
-| `flask-migrate==4.1.0` | `Flask>=0.9` |
-| `flask-compress==1.24` | none |
+The first is a constraint the project has already collided with. `pyproject.toml:99`:
 
-**Nothing in the graph caps Flask below 4.** The lock is simply stale. Supporting evidence that the
-current state is untested rather than intentional: `requirements/base.txt:476` pins
-`werkzeug==3.1.6` — floored deliberately in `requirements/base.in` for CVE-2026-27199 — alongside a
-Flask release that predates Werkzeug 3 entirely. That combination is off upstream's tested matrix.
+```toml
+"paramiko>=3.4.0, <4.0", # 4.0 removed DSSKey, still referenced by sshtunnel
+```
 
-`requirements/base.in` is the right place for the fix, and the file is already written in exactly
-this idiom: a list of security-driven floor pins, each with a `# Security: CVE-…` comment.
+Diffing `paramiko/__init__.py` between tags 3.5.1 and 5.0.0 confirms `DSSKey` is exported in 3.5.1
+and gone in 5.0.0. Superset does not use `DSSKey` itself, but its hard dependency `sshtunnel` does,
+and Superset imports `sshtunnel` at `superset/extensions/ssh.py:26` and `superset/models/core.py:40`
+(used at `ssh.py:115-116`, `176`, `185`, `213`, `253`).
+
+The second is easy to miss and is the better test of whether an agent actually investigates.
+`pyproject.toml:541`, inside `[tool.liccheck.authorized_packages]` under a block headed
+`# TODO REMOVE THESE DEPS FROM CODEBASE`:
+
+```toml
+paramiko = "3"  # GPL
+```
+
+That allowlist entry is keyed on the **major version**. Moving to 5.x without updating it fails the
+licence check, in a file the diff would not otherwise touch.
+
+Superset's own paramiko surface is concentrated in `superset/extensions/ssh.py`, which imports
+`RSAKey, ECDSAKey, Ed25519Key, PasswordRequiredException, PKey, SSHException` (lines 28-36) plus
+`paramiko.pkey.UnknownKeyType`, and calls `RSAKey.from_private_key` (69),
+`paramiko.PKey.from_type_string` (103) and `paramiko.Transport` / `.start_client` /
+`.get_remote_server_key` (183-186). Those are the call sites a two-major jump has to be checked
+against.
+
+**Inferred, not verified.** OSV's `affected` block gives only `last_affected: 4.0.0` with **no
+`fixed` event**. That paramiko 5.0.0 is the fixed version was inferred by reading `rsakey.py` at that
+tag, where a comment states "we no longer want to have ssh-rsa+SHA1 in HASHES". The issue body must
+carry that caveat so Devin verifies the fixed version rather than trusting it.
 
 ### Fixed means
 
-A floored pin in `requirements/base.in` (`flask>=3.1.3,<4.0.0`, with the CVE comment the file's
-convention requires), the lock recompiled with `uv pip compile`, and Superset's own call sites
-adapted to the Flask 3 API removals.
+paramiko is raised to a release that rejects SHA-1 — 5.0.0 on current evidence — with the
+`pyproject.toml:99` cap raised, the `sshtunnel`/`DSSKey` dependency resolved (upgrading `sshtunnel`
+or establishing that it no longer needs `DSSKey`), the `liccheck` entry at `pyproject.toml:541`
+updated to the new major, and the lock recompiled.
 
 ### Regression test
 
-Weaker here than elsewhere, and worth stating plainly: a dependency floor is asserted by the
-manifest, not by a behavioural test. The honest acceptance evidence is that `pre-commit` and the
-scoped `pytest` pass on the recompiled lock, plus a test in `tests/unit_tests/config_test.py`
-asserting the application still initialises. Devin should be instructed that the manifest change is
-the fix and the test suite is the guard against regression, not the proof of the CVE.
+Host: `tests/unit_tests/extensions/ssh_test.py`, which already exists and covers the tunnel factory.
+The behavioural assertion is that `ssh.py`'s key-loading and transport paths still work across the
+two-major jump. As with any dependency floor, the manifest asserts the fix and the suite guards
+against regression — but unlike a patch bump, there is a substantial chance of real breakage here,
+which is exactly what makes the test meaningful.
 
 ### Blast radius
 
-Backend, but wide by nature: `requirements/base.txt` and `requirements/development.txt` are both
-regenerated, touching many pinned lines. Application code changes should be small — the Flask 3
-removals (`flask.Markup`, `flask.escape`, `before_first_request`, `app.json_encoder`,
-`flask.json.JSONEncoder`, `_app_ctx_stack`) were grepped across `superset/` and `tests/unit_tests/`
-and **all have zero live hits**. The only `JSONEncoder` matches in `superset/utils/json.py` are
-`simplejson`, not `flask.json`. The residual risk sits in Flask-AppBuilder, not in Superset.
+Backend, and crosses more files than a dependency change usually does: `pyproject.toml` in two
+separate sections, `requirements/base.txt` and `requirements/development.txt` regenerated,
+`superset/extensions/ssh.py`, and possibly the `sshtunnel` pin. No frontend, no migration.
 
-### Why it is a good target, and where it is weak
+### Why it is a good target
 
-Good: the constraint analysis is real work — establishing that nothing blocks the upgrade required
-checking eight packages' metadata, which is precisely the kind of investigation that gets skipped
-when a human triages a dependency alert in thirty seconds.
-
-Weak: the class is defined as "a CVE fix in a dependency that requires adapting to a breaking API
-change," and the grep suggests Superset's own call sites may need **no** changes at all. If the
-recompile is clean, this degrades toward a version bump. That is a real possibility and it is why C2
-is not counted among the diagnosis-heavy candidates below. The CVE itself is also LOW severity and
-conditional on a caching proxy being deployed.
+The best dependency candidate in the set, and the one that genuinely earns the `security-dep`
+description "requires adapting to a breaking API change." The agent has to discover *why* the pin
+exists, deal with a break the maintainers already documented and worked around once, and find a
+second constraint hiding in a licence-checking table. A naive bump fails; a correct fix requires
+reading the tree.
 
 ---
 
@@ -241,64 +249,91 @@ test pointing at it — an agent has to reason about it, which is the capability
 
 ---
 
-## C4 — DOMPurify 3.4.12 below the fixed version {#c4}
+## C4 — deck.gl family carries a transitive `image-size` DoS {#c4}
 
 **Class:** `frontend-dep`
 
 ### Evidence
 
-Scanning all 2,819 unique `package@version` pairs in
-`superset-frontend/package-lock.json` against OSV returned eight hits; after removing the ones whose
-locked version is already at or above the fix, **DOMPurify is the only genuinely unpatched direct
-dependency**. The lockfile resolves `dompurify` to 3.4.12; **GHSA-55q2-fjhq-7xh7** (MODERATE,
-"IN_PLACE hook removal leaves a detached subtree executable, causing XSS") is fixed in 3.4.13.
+`npm audit` — run twice, the second time against freshly copied manifests to prove the cached result
+was not stale — reports `@deck.gl/geo-layers`, `@deck.gl/mesh-layers` and `@luma.gl/gltf` as direct
+dependencies with `isSemVerMajor: true` fixes. The chain bottoms out in `image-size`:
 
-It is declared in three manifests, all of which admit 3.4.13 under their caret ranges:
+```
+texture-compressor → @loaders.gl/textures → @loaders.gl/gltf
+                   → @luma.gl/gltf / @deck.gl/mesh-layers → @deck.gl/geo-layers
+```
 
-| Manifest | Line | Range |
-|---|---|---|
-| `superset-frontend/package.json` | 398 | `^3.4.11` |
-| `superset-frontend/packages/superset-ui-core/package.json` | 71 | `^3.4.12` |
-| `superset-frontend/plugins/legacy-preset-chart-nvd3/package.json` | 34 | `^3.4.12` |
+The two advisories on `image-size` are **GHSA-w3rx-r6r6-pgpr** (ICNS parser infinite-loop DoS) and
+**GHSA-5p2g-fcmc-qvqq** (JXL/HEIF parser). Both were independently corroborated by scanning all
+2,819 unique `package@version` pairs in `superset-frontend/package-lock.json` against OSV, which
+returned `image-size 0.7.5` carrying exactly that pair.
 
-Call sites: `superset-frontend/plugins/legacy-preset-chart-nvd3/src/utils.ts` (seven `sanitize()`
-calls at lines 112, 141, 165, 195, 226, 274, 290),
-`superset-frontend/packages/superset-ui-core/src/components/AsyncAceEditor/Tooltip.tsx:35`, and
-references in `superset-frontend/src/utils/navigationUtils.ts`.
+The three flagged packages are declared at `superset-frontend/package.json:99,101,121` and
+`superset-frontend/plugins/preset-chart-deckgl/package.json:33,36`.
 
-**Honest limit on exploitability.** The advisory's attack path requires `IN_PLACE` sanitization
-combined with a hook that removes an element. Grepping the frontend for `IN_PLACE`, `addHook` and
-`removeHook` found **no matches** — every Superset call site uses the default string-in/string-out
-`sanitize()`. So the dependency is unambiguously below its fixed version, but the specific attack
-described in the advisory does not obviously reach Superset. The issue should say this rather than
-overstate the risk.
+**The interesting part.** Grepping the frontend source for those three package names returns
+**zero import sites** — the only matches are the manifest declarations themselves. They exist purely
+to hold the deck.gl family's peer versions together. The real exposure is the family: deck.gl
+requires matching majors across subpackages, so remediating one forces all of them, and that reaches
+**30 import lines across 23 files** under `plugins/preset-chart-deckgl/src/**`:
+
+| Subpackage | Import lines |
+|---|---|
+| `@deck.gl/core` | 15 (e.g. `DeckGLContainer.tsx:34`) |
+| `@deck.gl/layers` | 6 |
+| `@deck.gl/aggregation-layers` | 5 |
+| `@deck.gl/mapbox` | 4 (across 2 files) |
+
+The family is pinned with tildes in the 9.2/9.3 range — `~9.2.5` for most, with
+`@deck.gl/aggregation-layers` at `~9.2.11`, `@deck.gl/extensions` at `~9.2.9` and `@deck.gl/mapbox`
+at `~9.3.7` in the plugin manifest. All are within major 9, which is what the lockstep requirement
+actually constrains.
 
 ### Fixed means
 
-The lockfile resolves `dompurify` to ≥3.4.13, with the caret ranges left alone since they already
-permit it, plus a short call-site audit recording that no `IN_PLACE` or hook usage exists.
+The deck.gl and luma.gl subpackages are moved together to a major that resolves `image-size` above
+both advisories, with the 30 import sites updated for whatever the major bump changes, and the
+`preset-chart-deckgl` plugin's own jest suite passing.
 
 ### Regression test
 
-Host: `superset-frontend/plugins/legacy-preset-chart-nvd3/test/utils.test.ts` (358 lines, exercises
-the tooltip sanitizers directly). Scoped jest runs it because the package manifest changes. As with
-C2, the honest framing is that the version floor is the fix and the existing suite guards against
-sanitizer-behaviour regressions across the bump; a test cannot assert "not vulnerable."
+Host: the plugin's existing suites, ten of them, including
+`superset-frontend/plugins/preset-chart-deckgl/src/DeckGLContainer.test.tsx`,
+`CategoricalDeckGLContainer.test.tsx`, `Multi/Multi.test.tsx` and `layers/*.test.ts`. Scoped jest
+runs them because the package is touched.
+
+**The CI signal is weaker here than for any other candidate, and this must be said in the issue.**
+The narrowed CI can prove that the deck.gl plugin still renders and that its tests pass across the
+major bump — which is the real risk, since the bump breaks call sites. It cannot exercise the
+vulnerable `image-size` parsers at all, because nothing in Superset's test suite feeds an ICNS, JXL
+or HEIF file through them. The evidence is "the upgrade did not break the plugin," not "the
+vulnerability is gone."
 
 ### Blast radius
 
-Frontend only, three manifests plus `package-lock.json`. A patch-level bump within the same major,
-so API breakage is unlikely. This is the one candidate that exercises the scoped-jest half of the CI
-narrowing, which is worth having represented in the portfolio.
+Frontend only, but the largest diff of the eight: two manifests, `package-lock.json`, and up to 23
+source files across `plugins/preset-chart-deckgl/src/**`. It does not cross into the backend. This
+is the candidate that exercises the scoped-jest half of the CI narrowing.
 
-### Why it is weak
+### Why it is a good target, and where it is weak
 
-The weakest of the eight, and marked as such. A patch bump inside a major version with no forced
-call-site change is close to the "just a dependency bumper" failure mode
-[01](./01-overview.md) explicitly warns against. It earns its place by covering the
-`frontend-dep` class and the jest path, not by difficulty. Two further hits worth noting sit
-adjacent to it: `nanoid` and `js-yaml` appear only transitively, and `image-size 0.7.5` is reachable
-only through a dev toolchain path.
+Good: it is a genuinely instructive shape — the flagged packages are not the ones that matter, and
+an agent that stops at "bump the three packages `npm audit` named" will produce a broken lockfile.
+Working out that the fix is a family-wide major bump touching 30 call sites requires understanding
+deck.gl's version coupling, which is real diagnosis.
+
+Weak: the vulnerability itself is a denial of service in an image parser reached through a 3D model
+loader — a long way from anything a Superset user does. And the CI limitation above means the
+strongest available evidence is indirect. It is the right candidate for the class, but the security
+value is modest and the issue should not pretend otherwise.
+
+**Adjacent hits considered and not selected.** `dompurify` was also direct and genuinely unpatched
+(3.4.12 locked, **GHSA-55q2-fjhq-7xh7** fixed in 3.4.13), but patch-only within the same major with
+no forced call-site change, and grepping found no `IN_PLACE` or `addHook` usage, so the advisory's
+attack path does not obviously reach Superset. `lerna` is build-only with no import sites.
+`eslint-plugin-i18n-strings` is a malware finding with no fix available. `nanoid` and `js-yaml`
+appear only transitively.
 
 ---
 
@@ -469,13 +504,13 @@ permanent rather than a one-off edit.
 Backend only, seven files, one line each, plus `pytest.ini`. Wide but shallow. `session.get()` and
 `Query.get()` have the same identity-map semantics, so behaviour is unchanged.
 
-### Relationship to C2
+### Why it is a good target
 
-These two are the closest pair in the portfolio and the relationship should be acknowledged rather
-than glossed over: both touch the Flask/SQLAlchemy stack being held back. They are kept distinct by
-scope and by ordering. C7 is valid *within* SQLAlchemy 1.4 today and does not depend on any upgrade;
-C2 is a Flask floor in a different manifest. C7 should be filed and merged first so the two never
-collide in the same file.
+Bounded, mechanical and permanently enforced once the `filterwarnings` entry lands — the fix cannot
+silently regress. It is the least intellectually demanding backend candidate, and it is in the set
+for exactly that reason: the portfolio needs to show the pipeline handling routine work as well as
+diagnosis. The judgement being tested is **scope discipline** — recognising that the seven-site
+`.get()` shape is the reviewable slice of a 588-occurrence problem, and stopping there.
 
 ---
 
@@ -554,9 +589,10 @@ much better story; that outcome cannot be promised in advance.
 |---|---|---|
 | `test_update_with_password_mask`, `tests/unit_tests/databases/api_test.py:350` | `flaky-test` | `@pytest.mark.skip(reason="Works locally but fails on CI")`, asserting that updating a gsheets database with a masked private key does not clobber the stored secret. Genuinely flaky and correctly located under `tests/unit_tests/`. Not selected because the fork has **no CI history to reproduce against** ([B2](./blockers.md)), so the agent would be diagnosing a failure it cannot observe. Promote this if C5 proves too small once run. |
 | `Column.test.tsx:180` | `flaky-test` | Requires a wholesale rewrite (Enzyme idioms against an RTL render), which makes success unmeasurable. |
-| `cryptography==49.0.0` — GHSA-g6cj-pr64-35w5 (HIGH) | `security-dep` | Fixed only in 50.0.0, which is excluded by a deliberate `cryptography>=49.0.0,<50.0.0` cap in both `pyproject.toml:53` and `requirements/base.in`. Raising the cap is a maintainer decision, not an autofix. |
-| `setuptools==80.9.0` — GHSA-h35f-9h28-mq5c | `security-dep` | Held by an explicit `setuptools<81` pin whose reason is documented in `requirements/base.in` and in `docs/docs/contributing/pkg-resources-migration.md`. Bumping it contradicts a recorded decision. |
-| `paramiko==3.5.1` — GHSA-r374-rxx8-8654 | `security-dep` | `last_affected: 4.0.0` with no fixed version published. Nothing to upgrade to. |
+| `cryptography==49.0.0` — GHSA-g6cj-pr64-35w5 (HIGH, PKCS#7 Bleichenbacher oracle) | `security-dep` | Real, and higher severity than C2. Rejected because the 50.0.0 changelog lists **no backwards-incompatible entries** and Superset's only uses are `default_backend`, `x509` loading and `serialization.load_pem_private_key` — none touched by the fix. An honest pin bump, which fails the "genuine diagnosis" bar the class is meant to demonstrate. |
+| `flask==2.3.3` — GHSA-68rp-wp8r-4726 / CVE-2026-27205 (LOW) | `security-dep` | Genuinely unpatched (fixed in 3.1.3), and the constraint analysis was interesting: `pyproject.toml:55` already permits `flask>=2.2.5, <4.0.0`, and checking all eight Flask extensions' PyPI metadata showed **nothing in the graph caps Flask below 4** — the lock is simply stale. But that is the problem: the fix is already inside the allowed range, so it is a recompile. The Flask 3 removals (`flask.Markup`, `before_first_request`, `app.json_encoder`, `_app_ctx_stack`) have **zero live hits** in `superset/`, so no call-site adaptation is forced. |
+| `setuptools==80.9.0` — GHSA-h35f-9h28-mq5c | `security-dep` | Held by an explicit `setuptools<81` pin whose reason is documented in `requirements/base.in` and in `docs/docs/contributing/pkg-resources-migration.md`. Also sdist build-time only, with no runtime call site. Bumping it contradicts a recorded decision. |
+| `dompurify 3.4.12` — GHSA-55q2-fjhq-7xh7 | `frontend-dep` | Direct and genuinely unpatched, but patch-only within major 3 with no forced call-site change, and no `IN_PLACE`/`addHook` usage anywhere in the frontend, so the advisory's attack path does not obviously reach Superset. The closest runner-up for the class; see the adjacent-hits note under [C4](#c4). |
 | `xlsx 0.20.3` — GHSA-4r6h-8v6p-xvw6, GHSA-5pgg-2g8v-p4x9 | `frontend-dep` | A permanent false positive. Both advisories carry `introduced: 0` and **no fixed version**, because the npm package is abandoned; the patched builds (0.19.3, 0.20.2) exist only on the SheetJS CDN. `superset-frontend/package.json:236` already pins the CDN tarball `xlsx-0.20.3`, which is *above* both thresholds. Not a defect — but see the operational note below. |
 | `db.session.merge()` at `superset/daos/base.py:508` | `deprecation` | Inside `BaseDAO.update()`, inherited by roughly 28 DAOs. Correct in principle, blast radius too large to review confidently. |
 | Broad `session.query(...)` conversion | `deprecation` | 588 occurrences across 217 files. Unreviewable. |
@@ -576,15 +612,19 @@ Stated here rather than buried, per [08](./08-testing.md).
 
 - **The `(#104810)` reference** near `superset/models/helpers.py:3298` matches no real
   `apache/superset` issue. Treated as a placeholder in this fork. (C3)
-- **Whether Flask 3.1.3 resolves cleanly.** No resolver run was attempted — the constraint analysis
-  is from PyPI metadata for each package, not from an executed `uv pip compile`. Flask-AppBuilder
-  5.2.2 declares `Flask<4,>=2` but was not tested against Flask 3.1.3. (C2)
+- **That paramiko 5.0.0 is the fixed version.** OSV gives only `last_affected: 4.0.0` with **no
+  `fixed` event**. 5.0.0 was inferred by reading `rsakey.py` at that tag, where a comment states "we
+  no longer want to have ssh-rsa+SHA1 in HASHES". Devin must confirm the fixed version rather than
+  trusting this. (C2)
+- **Whether paramiko 5.x resolves at all.** No resolver run was attempted. Whether `sshtunnel` has
+  dropped its `DSSKey` dependency, and whether a compatible `sshtunnel` release exists, was not
+  checked — that investigation is the substance of the task. (C2)
+- **Which deck.gl major actually resolves `image-size`.** `npm audit` reports `isSemVerMajor: true`
+  fixes for the three flagged packages, but the target version was not pinned down, and no upgrade
+  was attempted against the 30 import sites. (C4)
 - **Whether C5's missing test id is the *only* reason the test was skipped.** The jest suite was not
   executed; the root cause is established by static reading. A second cause may surface once the
   test runs. (C5)
-- **DOMPurify exploitability at Superset's call sites.** No `IN_PLACE` or hook usage was found, so
-  the advisory's described path appears not to apply. This is an absence-of-evidence argument, not a
-  proof of safety. (C4)
 - **C6's actual query counts.** Derived by reading the loop, not measured. `2N + 1` is the
   statement count implied by the code, not an observed figure. (C6)
 - **Whether C8 surfaces a real defect.** Expected to be a mypy blind spot around SQLAlchemy
@@ -607,42 +647,71 @@ over doubling up on the strongest class, so that a failure in any single candida
 one class rather than leaving a class unrepresented
 ([ADR](./adr/2026-08-08-select-only-unit-testable-targets.md)).
 
-### At least two showing genuine diagnosis — **met**
+### At least two showing genuine diagnosis — **met, with substantial margin**
 
-Four qualify, which gives headroom if one falls through:
+Six of the eight qualify, which gives real headroom if one or two fall through:
 
 - **C1** — requires reading a SQL parser and understanding why `exp.Command` defeats node-type
   matching. No test, lint rule or advisory points at it.
+- **C2** — requires discovering *why* the pin exists, handling a break the maintainers already
+  documented and worked around once, and finding a second constraint hidden in a licence-checking
+  table. A naive bump fails.
 - **C3** — requires noticing that two files compensate for something a third never did. Invisible
   from any single file.
-- **C6** — requires building query-counting instrumentation the repository does not have.
+- **C4** — requires working out that the three packages `npm audit` names have no import sites at
+  all, and that the real fix is a family-wide major bump across 30 call sites.
 - **C5** — requires establishing that a test id referenced by the test exists nowhere in the tree.
+- **C6** — requires building query-counting instrumentation the repository does not have.
 
-C2, C4, C7 and C8 are the mechanical half of the portfolio, which is the correct proportion: the
-point is a system that handles both, not eight hard problems.
+Only **C7** and **C8** are mechanical. That is a reasonable proportion — the point is a system that
+handles both, not eight hard problems — but it is worth noting that swapping in paramiko and deck.gl
+moved the balance decisively toward diagnosis, at the cost of two candidates that are now more
+likely to need several fix cycles ([B11](./blockers.md)).
 
 ### No two attacking the same underlying problem — **met, with one caveat**
 
-Eight distinct root causes. The one pair worth flagging is **C2 and C7**, both touching the
-Flask/SQLAlchemy stack that is being held back. They are separated by scope (a Flask floor in
-`requirements/base.in` versus seven `Query.get()` call sites), by manifest, and by ordering — C7
-merges first. A reviewer could reasonably call them adjacent, so it is recorded here rather than
-left to be noticed.
+Eight distinct root causes, in eight different subsystems.
 
-**C2 and C4** are both dependency advisories, but the taxonomy separates `security-dep` and
-`frontend-dep` by design, and they share no package, ecosystem, manifest or call site.
+The pair worth flagging is **C2 and C4**. Their root causes are unrelated — a SHA-1 signature
+algorithm in an SSH library, versus a DoS in an image parser reached through a 3D model loader — and
+they share no package, ecosystem, manifest or call site. But their *remediation shape* is nearly
+identical: in both, the advisory sits below the surface, and the fix is a major-version family
+upgrade that breaks call sites. The criterion is about the underlying problem, which is satisfied,
+but a reviewer looking at the two pull requests will see the same story twice. Recorded here rather
+than left to be noticed.
+
+C7 (`Query.get()`) is unrelated to every other candidate: it is valid within SQLAlchemy 1.4 as
+pinned today and depends on no upgrade, so it shares nothing with the two dependency candidates
+beyond being backend work.
 
 ### Weakest candidates, ranked
 
-1. **C4 (DOMPurify)** — a patch bump inside a major version, with no forced call-site change and no
-   demonstrated exploitability. Closest to the "dependency bumper" failure mode. Kept for
-   `frontend-dep` coverage and because it is the only candidate exercising the scoped-jest path.
-2. **C2 (Flask)** — the constraint analysis is genuine, but if the recompile is clean it degrades to
-   a version bump. The CVE is LOW and conditional on a caching proxy.
-3. **C8 (typing)** — safe and bounded, but the "surfacing real defects" half of the class may not
-   materialise.
+1. **C8 (typing)** — safe and bounded, but the "surfacing real defects" half of the class may not
+   materialise. Now the weakest in the set.
+2. **C4 (deck.gl)** — strong as an engineering task, weak as a security story: a DoS in an image
+   parser Superset never knowingly invokes, and the narrowed CI cannot exercise the vulnerable code
+   at all. The evidence it can produce is "the upgrade did not break the plugin."
+3. **C7 (deprecation)** — correct and permanently enforced, but mechanical. Its value is scope
+   discipline, not difficulty.
 
-C4 and C2 together are why the diagnosis criterion was over-satisfied rather than met exactly.
+Note what changed: the two weakest candidates in the previous draft were both dependency bumps
+carried purely for class coverage. Replacing them with paramiko and deck.gl removed that problem —
+no candidate is now in the set *only* to fill a class.
+
+### Risk to the set as a whole
+
+Every candidate names a test host that the narrowed CI actually runs, so none can fail for the
+structural reason that eliminated the alternatives. Residual risks are per-candidate and stated in
+each section. The three worth watching in the first runs:
+
+- **C6** — the missing `assert_num_queries` helper means the regression test is a small piece of
+  infrastructure work rather than an assertion.
+- **C2** — a two-major dependency jump with an unresolved transitive blocker (`sshtunnel`/`DSSKey`).
+  The most likely candidate to end in `outcome: blocked`, which is itself worth observing.
+- **C4** — the largest diff of the eight, up to 23 source files, against a CI signal that cannot
+  reach the vulnerability.
+
+All three are the most likely to consume their ACU budget in the test loop ([B11](./blockers.md)).
 
 ### Risk to the set as a whole
 

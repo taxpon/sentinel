@@ -56,15 +56,22 @@ single failed candidate costs one class rather than leaving a class empty.
 
 The costs are real and are stated in the candidate document rather than hidden. The set is biased
 toward defects that happen to sit in unit-testable modules, which is not the same as the most
-important defects — genuinely severe integration-only findings were passed over. One-per-class also
-means the two weakest candidates (C4 DOMPurify, C2 Flask) are carried for coverage rather than
-merit, and both sit close to the "dependency bumper" failure mode. The compensation is that the
-diagnosis criterion was over-satisfied: four candidates require real root-cause analysis where two
-were required.
+important defects — genuinely severe integration-only findings were passed over. A related bias runs
+alongside it: the filter selects for demonstrable work rather than for severity. The clearest
+instance is `cryptography` 49.0.0 (GHSA-g6cj-pr64-35w5, HIGH), passed over in favour of a
+lower-severity paramiko advisory because the cryptography fix is an honest pin bump with no
+call-site consequence.
+
+One-per-class carries a second risk — that a class with a thin supply of good defects forces a weak
+candidate in purely for coverage. That happened in the first draft, where both dependency classes
+were filled by version bumps. It was corrected by finding harder candidates within the same classes
+rather than by abandoning the allocation, and the diagnosis criterion ended up over-satisfied: six
+of eight candidates require real root-cause analysis where two were required.
 
 **What would tell us this was wrong.** If several remediations pass the narrowed CI and are then
 found broken by a heavier workflow before merge, the filter is selecting for testability against the
 wrong signal, and the CI narrowing — not the selection rule — needs revisiting. Equally, if the
-weakest one-per-class candidates merge with no fix cycles and no reviewer comments, they are
-demonstrating nothing, and the next set should concentrate on the classes with real defect supply
-and accept fewer classes.
+mechanical candidates merge with no fix cycles and no reviewer comments, they are demonstrating
+nothing, and the next set should concentrate on the classes with real defect supply and accept fewer
+classes. And if a class can only be filled by a version bump two rounds running, the one-per-class
+allocation is costing more than the coverage buys.
