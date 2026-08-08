@@ -131,9 +131,12 @@ async def remediations(session: SessionDep) -> list[RemediationRowJson]:
     silently dropped would be worse than a long table. The volume is the one the metrics module
     reduces in Python for the same reason — tens of remediations, not thousands.
 
-    The order is only a tiebreak-free default; both live panels impose their own
-    (`docs/adr/2026-08-08-live-panels-sort-client-side-with-an-id-tiebreak.md`). It is stated here
-    anyway so that two polls of an unchanged database cannot disagree.
+    Both live panels re-sort what they receive
+    (`docs/adr/2026-08-08-live-panels-sort-client-side-with-an-id-tiebreak.md`), so this order is
+    not the one the table displays. It is a total order anyway, tie-broken on `id`, so that two
+    polls of an unchanged database cannot disagree: a batch of issues labelled together shares a
+    `labeled_at` to the microsecond, and an untie-broken tie is free to come back differently each
+    time.
     """
     now = datetime.datetime.now(datetime.UTC)
     rows = await session.scalars(

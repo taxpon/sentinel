@@ -587,6 +587,32 @@ async def test_remediations_is_not_windowed(
     assert [row["issue_number"] for row in rows] == [105, 104, 103, 102, 101, 106]
 
 
+async def test_the_live_table_breaks_a_shared_labeled_at_on_id(
+    client: httpx.AsyncClient, session: AsyncSession
+) -> None:
+    """A batch of issues labelled together really does share a `labeled_at` to the microsecond.
+
+    `dashboard/src/fixtures/summary.ts` gives two of its rows the same one for that reason, calling
+    the tie part of the fixture rather than a hypothetical. Without the `id` tiebreak the three rows
+    below come back in exactly the opposite order — the endpoint disagreeing with its own previous
+    poll about a database that did not change.
+    """
+    labelled_together = NOW - hours(2)
+    session.add_all(
+        a_remediation(
+            issue_number=300 + offset, issue_class="security", labeled_at=labelled_together
+        )
+        for offset in range(3)
+    )
+    await session.commit()
+
+    rows = (await client.get(REMEDIATIONS_URL)).json()
+
+    tied = [row for row in rows if row["issue_number"] >= 300]
+    assert [row["issue_number"] for row in tied] == [302, 301, 300]
+    assert [row["id"] for row in tied] == sorted((row["id"] for row in tied), reverse=True)
+
+
 async def test_a_remediation_that_reached_nothing_reports_nulls_rather_than_omitting_the_fields(
     client: httpx.AsyncClient, session: AsyncSession
 ) -> None:
@@ -637,6 +663,21 @@ async def test_timestamps_are_formatted_the_way_the_schema_writes_them(
 
     for row in rows:
         assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", row["labeled_at"]), row
+
+
+def test_an_instant_at_another_offset_is_converted_before_it_is_stamped_with_a_z() -> None:
+    """`_format` directly — the one thing in this module no request can reach.
+
+    asyncpg normalises every `timestamptz` to UTC, so the conversion is a no-op on every path
+    through the tests above and the regex on their output cannot see whether it happened. It is not
+    dead code: the `Z` is an assertion about the offset, so dropping the conversion would render a
+    Tokyo noon as `12:00:00Z` — nine hours wrong, and wrong in a way `Date.parse` believes.
+    """
+    tokyo = datetime.timezone(datetime.timedelta(hours=9))
+
+    formatted = analytics._format(datetime.datetime(2026, 8, 8, 12, 0, tzinfo=tokyo))
+
+    assert formatted == "2026-08-08T03:00:00Z"
 
 
 async def test_remediations_of_an_empty_database_is_an_empty_list(
