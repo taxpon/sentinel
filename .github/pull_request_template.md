@@ -16,7 +16,7 @@ Closes #
 
 - [ ] Implemented as specified in `docs/`
 - [ ] Unit tests added for everything changed; `make test` green
-- [ ] UI changes have component tests (browser-level tests were proposed on the issue first, if any)
+- [ ] UI changes have component tests (browser-level tests are out of scope)
 - [ ] `ruff` and `mypy` pass
 - [ ] No files changed outside this task's owned files in `docs/tasks.yaml`
 - [ ] `/finish-task` run: review applied, no findings remaining

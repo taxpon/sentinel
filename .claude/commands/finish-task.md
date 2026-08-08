@@ -13,8 +13,8 @@ Take the current task from "code written" to "pull request open". Work through t
    - If the code diverged from the spec, `docs/` was updated in the same branch.
 
 2. **UI tasks:** confirm component tests cover rendering, prop branches, empty and error states, and
-   number formatting. If a browser-level test is genuinely needed, confirm it was proposed on the
-   issue and answered — never start one unilaterally.
+   number formatting. Browser-level tests are out of scope; if a component test could not reach
+   something, say which gap is left uncovered in the pull request body.
 
 3. **ADRs.** Did you choose between defensible options, or do something a later reader would
    question? Write a record in `docs/adr/` using `template.md`, then:

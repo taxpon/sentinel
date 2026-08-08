@@ -1,5 +1,6 @@
 ---
 paths:
+  - ".claude/rules/ui-testing.md"
   - ".claude/settings.json"
   - ".github/workflows/ci.yml"
   - "Dockerfile"
@@ -28,6 +29,7 @@ You are editing a file covered by an existing decision record. Read the linked A
 changing the behaviour it describes. If you are deliberately overturning it, supersede the
 ADR in the same pull request rather than leaving it contradicted by the code.
 
+- `.claude/rules/ui-testing.md` — [Test the dashboard with component tests only, never a real browser](../../docs/adr/2026-08-08-no-browser-level-tests.md)
 - `.claude/settings.json` — [Enforce the pre-PR review step with a hook, not with CLAUDE.md alone](../../docs/adr/2026-08-07-enforce-workflow-with-hooks.md)
 - `.github/workflows/ci.yml` — [Enforce the tests-with-source rule as a CI job that diffs the pull request](../../docs/adr/2026-08-08-enforce-tests-with-source-by-diffing-the-pull-request.md)
 - `Dockerfile` — [Manage dependencies with uv and a committed lock file](../../docs/adr/2026-08-07-uv-for-dependencies-and-the-image.md)

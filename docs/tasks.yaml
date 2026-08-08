@@ -370,12 +370,16 @@ tasks:
       - dashboard/src/App.tsx
       - dashboard/src/api.ts
       - dashboard/src/theme.css
+      - dashboard/vitest.config.ts
     depends_on: [T01]
-    adrs: []
+    adrs: [2026-08-08-no-browser-level-tests]
     ui: true
     notes: >-
       Buildable against the API contract in the spec, before T25 exists.
-      Includes the 5-second polling loop and the freshness indicator.
+      Includes the 5-second polling loop and the freshness indicator. Takes
+      Dockerfile from T01 to add the dashboard build stage, which T01 deferred
+      because a stage copying a directory that did not exist would have broken
+      `docker build` on main.
 
   - id: T31
     title: Dashboard — KPI row, funnel and throughput
@@ -387,7 +391,7 @@ tasks:
       - dashboard/src/panels/Funnel.tsx
       - dashboard/src/panels/Throughput.tsx
     depends_on: [T30]
-    adrs: []
+    adrs: [2026-08-08-no-browser-level-tests]
     ui: true
 
   - id: T32
@@ -401,7 +405,7 @@ tasks:
       - dashboard/src/panels/Autonomy.tsx
       - dashboard/src/panels/Failures.tsx
     depends_on: [T30]
-    adrs: []
+    adrs: [2026-08-08-no-browser-level-tests]
     ui: true
     notes: The cost panel must show whether the figure came from Devin or was derived locally.
 
@@ -414,7 +418,7 @@ tasks:
       - dashboard/src/panels/LiveTable.tsx
       - dashboard/src/panels/Timeline.tsx
     depends_on: [T30]
-    adrs: []
+    adrs: [2026-08-08-no-browser-level-tests]
     ui: true
     notes: Every row links to both the Devin session and the pull request.
 

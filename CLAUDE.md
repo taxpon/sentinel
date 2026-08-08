@@ -25,9 +25,10 @@ part of the contract reviewers verify independently.
 
 **2. UI changes carry UI tests.**
 Component tests (Vitest + Testing Library) are mandatory for anything under `dashboard/`: rendering,
-prop branches, empty and error states, number formatting. Browser-level end-to-end tests
-(Playwright, screenshot comparison) are **not** started without asking — comment on the issue and
-wait for a human answer. See [`.claude/rules/ui-testing.md`](.claude/rules/ui-testing.md).
+prop branches, empty and error states, number formatting. Browser-level tests (Playwright, Cypress,
+screenshot comparison) are **out of scope** — do not write them and do not propose them. This does
+not apply to `tests/test_e2e.py`, which is in-process and required. See
+[`.claude/rules/ui-testing.md`](.claude/rules/ui-testing.md).
 
 **3. Run the PR review toolkit before opening a pull request, and resolve everything it finds.**
 Use `/finish-task`, which runs `pr-review-toolkit:review-pr` and records the result. A `PreToolUse`
