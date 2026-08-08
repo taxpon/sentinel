@@ -1,0 +1,59 @@
+# Topology: docs/09-operations.md#topology
+#
+# Parallel worktrees must not fight over container names and ports. Each one exports its own:
+#   export COMPOSE_PROJECT_NAME=sentinel-t11
+#   export POSTGRES_PORT=54321
+#   export API_PORT=8001
+#
+# There is deliberately no top-level `name:` — Compose already defaults the project name to the
+# directory, and older versions do not interpolate that field, which silently produces a project
+# literally called "compose_project_name-sentinel".
+#
+# `api`, `worker` and `poller` run commands that only exist once T26 has landed. Until then `make db`
+# is the useful target; `make up` will crash-loop those three services.
+
+x-app: &app
+  build: .
+  env_file: .env
+  environment:
+    # The containers reach Postgres by service name; DATABASE_URL in .env points at the host.
+    DATABASE_URL: postgresql+asyncpg://sentinel:sentinel@db:5432/sentinel
+  depends_on:
+    db:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: sentinel
+      POSTGRES_DB: sentinel
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel -d sentinel"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    <<: *app
+    command: ["uvicorn", "sentinel.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${API_PORT:-8000}:8000"
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "sentinel", "worker"]
+
+  poller:
+    <<: *app
+    command: ["python", "-m", "sentinel", "poller"]
+
+volumes:
+  pgdata:

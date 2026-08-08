@@ -58,7 +58,8 @@ flowchart LR
 ```
 
 `api`, `worker` and `poller` share one image and differ only by command. `dashboard/` is built at
-image build time and served statically by `api`.
+image build time and served statically by `api`; that build stage is added by T30, so until then the
+image serves the API alone.
 
 ```bash
 cp .env.example .env      # fill in the required values

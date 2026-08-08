@@ -1,0 +1,67 @@
+[project]
+name = "sentinel"
+version = "0.1.0"
+description = "Event-driven remediation pipeline built on the Devin API v3"
+requires-python = ">=3.14"
+dependencies = [
+    "alembic>=1.14",
+    "asyncpg>=0.30",
+    "fastapi>=0.115",
+    "httpx>=0.27",
+    "prometheus-client>=0.21",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "sqlalchemy[asyncio]>=2.0",
+    "structlog>=24.4",
+    "uvicorn[standard]>=0.32",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "respx>=0.21",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sentinel"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+src = ["src", "tests"]
+# These three predate ruff and belong to other tasks, so T01 must not reformat them; every other
+# file under scripts/ is linted normally. T06 (session_context, seed_issues) and T07 (gen_adr_index)
+# each run `make format` on their own file and delete their line here.
+extend-exclude = [
+    "scripts/gen_adr_index.py",
+    "scripts/seed_issues.py",
+    "scripts/session_context.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["sentinel"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+plugins = ["pydantic.mypy"]
+files = ["src/sentinel"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q --strict-markers --strict-config"
+
+[tool.coverage.run]
+source = ["src/sentinel"]
