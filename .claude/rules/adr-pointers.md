@@ -23,6 +23,7 @@ paths:
   - "src/sentinel/config.py"
   - "src/sentinel/devin/client.py"
   - "src/sentinel/devin/playbooks.py"
+  - "src/sentinel/github/client.py"
   - "src/sentinel/models.py"
   - "src/sentinel/observability/logging.py"
   - "src/sentinel/observability/prom.py"
@@ -69,6 +70,7 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `src/sentinel/config.py` — [Hold credentials as SecretStr and rewrite configuration errors before raising them](../../docs/adr/2026-08-08-credentials-are-secretstr-and-config-errors-are-rewritten.md)
 - `src/sentinel/devin/client.py` — [Use the Devin v3 API exclusively](../../docs/adr/2026-08-07-devin-v3-only.md)
 - `src/sentinel/devin/playbooks.py` — [Give Devin the objective and constraints, not the steps](../../docs/adr/2026-08-07-delegate-task-not-steps.md), [Accept DEVIN_PLAYBOOK_IDS keyed by issue class or by playbook name](../../docs/adr/2026-08-08-playbook-ids-keyed-by-class-or-name.md), [Tell the session which fix cycle it is on and how many remain](../../docs/adr/2026-08-08-resume-messages-state-the-cycle-budget.md)
+- `src/sentinel/github/client.py` — [A GitHub rate-limit wait is bounded, and the remainder is handed back to the queue](../../docs/adr/2026-08-08-github-waits-are-bounded-and-handed-back-to-the-queue.md), [The CI excerpt comes from the earliest failing job of the latest failing run](../../docs/adr/2026-08-08-the-ci-excerpt-comes-from-the-earliest-failing-job.md)
 - `src/sentinel/models.py` — [Record every state transition as an append-only event](../../docs/adr/2026-08-07-transitions-are-append-only-events.md), [Build the test schema by running the migrations, and test for drift](../../docs/adr/2026-08-08-migrations-are-the-schema-tests-run-against.md)
 - `src/sentinel/observability/logging.py` — [Scrub credentials out of log values, not only out of fields named like credentials](../../docs/adr/2026-08-08-log-redaction-scrubs-values-not-only-keys.md)
 - `src/sentinel/observability/prom.py` — [Keep Prometheus metrics process-local and publish cross-process figures as snapshots](../../docs/adr/2026-08-08-metrics-are-process-local.md)
