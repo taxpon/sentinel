@@ -28,6 +28,14 @@ function failed(data: AnalyticsSummary | null): SummaryState {
 
 const LOADING: SummaryState = { status: 'loading', data: null, error: null, receivedAt: null }
 
+/** What the daily series adds up to, which is not necessarily what the funnel counted. */
+function seriesTotal(summary: AnalyticsSummary): number {
+  return summary.throughput.reduce(
+    (sum, day) => sum + Object.values(day.by_class).reduce((a, b) => a + b, 0),
+    0,
+  )
+}
+
 /** The chart itself. The legend swatches are `.recharts-surface` too, so take the wrapper's own. */
 function chartSurface(container: HTMLElement): SVGSVGElement | null {
   return container.querySelector('.recharts-wrapper > svg')
@@ -51,6 +59,23 @@ function tableRows(container: HTMLElement): string[][] {
   return [...container.querySelectorAll('table tr')].map((row) =>
     [...row.querySelectorAll('th, td')].map((cell) => cell.textContent ?? ''),
   )
+}
+
+interface BarRect {
+  x: number
+  y: number
+  height: number
+  fill: string
+}
+
+/** Every segment the stacked bars actually drew. A zero-height segment is not drawn at all. */
+function barRects(container: HTMLElement): BarRect[] {
+  return [...container.querySelectorAll('.recharts-bar .recharts-rectangle')].map((rect) => ({
+    x: Number(rect.getAttribute('x')),
+    y: Number(rect.getAttribute('y')),
+    height: Number(rect.getAttribute('height')),
+    fill: rect.getAttribute('fill') ?? '',
+  }))
 }
 
 describe('the panel contract', () => {
@@ -103,6 +128,41 @@ describe('the daily series', () => {
     expect(container.querySelectorAll('.recharts-bar')).toHaveLength(3)
   })
 
+  it('gives a day that is missing a class a zero, and stacks the rest from the baseline', () => {
+    const { container } = render(<ThroughputPanel state={ready(busyWindowSummaryFixture)} />)
+
+    const rects = barRects(container)
+    const columns = [...new Set(rects.map((rect) => rect.x))].sort((a, b) => a - b)
+    // Nine cells over three days and three classes, of which four are zero — 08-03 merged no
+    // `dependency`, 08-04 merged only `security` — and a zero-height segment is not drawn.
+    expect(columns).toHaveLength(3)
+    expect(rects).toHaveLength(5)
+
+    // What each series merged on each day, in day order, keyed by the colour it was drawn in.
+    const merges: Record<string, number[]> = {
+      [seriesColor(0)]: [0, 0, 3],
+      [seriesColor(1)]: [1, 0, 1],
+      [seriesColor(2)]: [2, 2, 0],
+    }
+    const scales = new Set(
+      rects.map((rect) => rect.height / merges[rect.fill][columns.indexOf(rect.x)]),
+    )
+    // One pixel-per-merge scale across the whole chart: a missing class read as anything other
+    // than zero would have to stretch or shift one of these segments to fit.
+    expect(scales.size).toBe(1)
+
+    const baseline = Math.max(...rects.map((rect) => rect.y + rect.height))
+    for (const x of columns) {
+      const stack = rects.filter((rect) => rect.x === x).sort((a, b) => b.y - a.y)
+      // The lowest segment sits on the axis — the same axis on the day whose first class merged
+      // nothing — and every segment above it sits on the one below, with no gap left for the zero.
+      expect(stack[0].y + stack[0].height).toBeCloseTo(baseline, 3)
+      for (let i = 1; i < stack.length; i += 1) {
+        expect(stack[i].y + stack[i].height).toBeCloseTo(stack[i - 1].y, 3)
+      }
+    }
+  })
+
   it('puts the counts in the DOM as a table, where the bars cannot carry labels', () => {
     const { container } = render(<ThroughputPanel state={ready(busyWindowSummaryFixture)} />)
 
@@ -115,20 +175,26 @@ describe('the daily series', () => {
     ])
   })
 
-  it('totals the merges it drew, and counts the days in singular and plural', () => {
-    const total = busyWindowSummaryFixture.throughput.reduce(
-      (sum, day) => sum + Object.values(day.by_class).reduce((a, b) => a + b, 0),
-      0,
-    )
-    // The series accounts for every merge the funnel counted.
+  it('states the total plainly when the series accounts for the whole funnel', () => {
+    const total = seriesTotal(busyWindowSummaryFixture)
     expect(total).toBe(busyWindowSummaryFixture.funnel.merged)
 
-    const { unmount } = render(<ThroughputPanel state={ready(busyWindowSummaryFixture)} />)
+    render(<ThroughputPanel state={ready(busyWindowSummaryFixture)} />)
+
     expect(screen.getByText('9 merged across 3 days')).toBeInTheDocument()
-    unmount()
+  })
+
+  it('says how much of the funnel it is showing when the series does not cover it', () => {
+    // The spec's own sample payload is short: five merged in the funnel, two in the daily series.
+    // The KPI row reads `funnel.merged` from the same payload, so a bare "2 merged" here would
+    // contradict "5 merged of 8 labelled" one panel above it.
+    expect(seriesTotal(summaryFixture)).toBe(2)
+    expect(summaryFixture.funnel.merged).toBe(5)
 
     render(<ThroughputPanel state={ready(summaryFixture)} />)
-    expect(screen.getByText('2 merged across 1 day')).toBeInTheDocument()
+
+    expect(screen.getByText('2 of 5 merged across 1 day')).toBeInTheDocument()
+    expect(screen.queryByText('2 merged across 1 day')).not.toBeInTheDocument()
   })
 
   it('renders the single-day window from the spec', () => {
@@ -152,17 +218,31 @@ describe('the empty window', () => {
     expect(container.textContent).not.toMatch(/NaN|Infinity/)
   })
 
-  it('treats days that merged nothing as an empty window, not as a chart of zeros', () => {
-    const nothingMerged: AnalyticsSummary = {
-      ...summaryFixture,
+  it('draws no chart of zeros when every day merged nothing', () => {
+    const quiet: AnalyticsSummary = {
+      ...emptySummaryFixture,
       throughput: [
         { day: '2026-08-05', by_class: {} },
         { day: '2026-08-06', by_class: { security: 0 } },
       ],
     }
-    render(<ThroughputPanel state={ready(nothingMerged)} />)
+    const { container } = render(<ThroughputPanel state={ready(quiet)} />)
 
     expect(screen.getByText('Nothing was merged in this window.')).toBeInTheDocument()
+    expect(container.querySelector('svg')).toBeNull()
+  })
+
+  it('never claims nothing merged while the funnel says otherwise', () => {
+    // A truncated or missing daily series against a funnel that counted five merges. The funnel is
+    // the authority on the window total; this panel only breaks it down by day.
+    const noSeries: AnalyticsSummary = { ...summaryFixture, throughput: [] }
+    const { container } = render(<ThroughputPanel state={ready(noSeries)} />)
+
+    expect(
+      screen.getByText('The daily series is empty, though the funnel counts 5 merged.'),
+    ).toBeInTheDocument()
+    expect(screen.queryByText('Nothing was merged in this window.')).not.toBeInTheDocument()
+    expect(container.querySelector('svg')).toBeNull()
   })
 })
 

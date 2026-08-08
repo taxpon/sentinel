@@ -45,6 +45,14 @@ yet"), never as `0%` or `$0.00`. The same rule at chart scale replaces a chart w
 funnel of five zero-length bars and a throughput chart of no days are both blank boxes, so they say
 "No issues were labelled in this window." and "Nothing was merged in this window." instead.
 
+The same authority settles a panel that breaks a funnel quantity down rather than restating it. The
+throughput chart is `funnel.merged` split by day, so the funnel decides what it may say about
+merges: a daily series that arrived empty beside a funnel counting five merges is a gap in that
+panel, not a quiet window, and it says so. Where the series does not add up to `funnel.merged` — as
+it does not in the sample payload in [07](../07-observability.md), whose funnel counts five and
+whose `throughput` lists two — the caption names both numbers ("2 of 5 merged across 1 day") instead
+of presenting its own total as the window's.
+
 The formatters in `api.ts` are the second line of the same rule: each returns `NO_VALUE` for a
 non-finite input, so an API defect cannot put `Infinity%` on the dashboard even where the funnel
 looked healthy.
