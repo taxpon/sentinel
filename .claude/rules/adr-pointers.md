@@ -14,6 +14,7 @@ paths:
   - "src/sentinel/pipeline/poller.py"
   - "src/sentinel/policy/dedup.py"
   - "src/sentinel/queue.py"
+  - "src/sentinel/security/hmac.py"
   - "uv.lock"
 ---
 
@@ -39,4 +40,5 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `src/sentinel/pipeline/poller.py` — [Drive the remediation state machine from a poller, not from Devin callbacks](../../docs/adr/2026-08-07-poller-drives-state-machine.md)
 - `src/sentinel/policy/dedup.py` — [Deduplicate at both the delivery and the remediation layer](../../docs/adr/2026-08-07-two-layer-deduplication.md)
 - `src/sentinel/queue.py` — [Use Postgres as the job queue instead of adding Redis](../../docs/adr/2026-08-07-postgres-as-job-queue.md)
+- `src/sentinel/security/hmac.py` — [Return a reason from signature verification instead of a boolean or an exception](../../docs/adr/2026-08-08-signature-verification-returns-a-reason.md)
 - `uv.lock` — [Manage dependencies with uv and a committed lock file](../../docs/adr/2026-08-07-uv-for-dependencies-and-the-image.md)
