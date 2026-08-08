@@ -111,8 +111,8 @@ SUBSCRIBED: Final = [
         id="pull_request.opened",
         event="pull_request",
         build=lambda: github_payload("pull_request.opened"),
-        intent=Intent.LINK_PULL_REQUEST,
-        trigger=Trigger.PR_OPENED,
+        intent=Intent.IGNORED,
+        reason=Reason.LINKED_BY_THE_POLLER,
     ),
     Row(
         id="pull_request.closed-merged",
@@ -194,11 +194,18 @@ SUBSCRIBED: Final = [
 ]
 
 
-@pytest.mark.parametrize("row", SUBSCRIBED, ids=lambda row: row.id)
+def by_id(row: Row) -> str:
+    return row.id
+
+
+@pytest.mark.parametrize("row", SUBSCRIBED, ids=by_id)
 def test_every_subscribed_event_maps_to_its_intent(row: Row, settings: Settings) -> None:
     mapped = map_event(row.event, row.build(), settings=settings)
 
     assert (mapped.intent, mapped.trigger, mapped.reason) == (row.intent, row.trigger, row.reason)
+    # The property the ingress path branches on, asserted for every row rather than for the two the
+    # word "ignored" appears in: a wrong answer here silently drops a whole intent.
+    assert mapped.ignored == (row.intent is Intent.IGNORED)
 
 
 def test_the_table_accounts_for_every_intent() -> None:
@@ -207,12 +214,15 @@ def test_the_table_accounts_for_every_intent() -> None:
 
 
 @pytest.mark.parametrize("name", GITHUB_PAYLOADS)
-def test_every_recorded_payload_is_recognised(name: str, settings: Settings) -> None:
-    """The recordings are one per acting row of the table, so none of them may be ignored — this is
-    what catches a payload whose real shape the mapping reads through the wrong key."""
+def test_no_recorded_payload_falls_through_unclassified(name: str, settings: Settings) -> None:
+    """Every recording is a row of the table, so the only one that may be ignored is
+    `pull_request.opened`, and only for the documented reason. Any other route to `ignored` means
+    the mapping read a payload GitHub really sends through the wrong key."""
+    allowed = {Reason.LINKED_BY_THE_POLLER} if name == "pull_request.opened" else set()
+
     mapped = map_event(name.split(".")[0], github_payload(name), settings=settings)
 
-    assert not mapped.ignored, f"{name} was ignored: {mapped.reason}"
+    assert not mapped.ignored or mapped.reason in allowed, f"{name} was ignored: {mapped.reason}"
 
 
 # --------------------------------------------------------------------- what the delivery is about
@@ -224,10 +234,25 @@ def test_a_labelled_issue_carries_the_issue_it_is_about(settings: Settings) -> N
     assert (mapped.repo, mapped.issue_number) == ("taxpon/superset", 42876)
 
 
-def test_an_opened_pull_request_carries_what_linking_it_needs(settings: Settings) -> None:
+def test_an_opened_pull_request_is_left_to_the_poller(settings: Settings) -> None:
+    """It carries nothing that can find a remediation: `remediation` is keyed `(repo,
+    issue_number)`, `pr_number` is NULL until `PR_OPENED` has been applied, and the recorded body
+    references Sentry rather than the issue. The poller links it from `pull_requests[]`."""
     mapped = map_event("pull_request", github_payload("pull_request.opened"), settings=settings)
 
-    assert mapped.pr_number == 42889
+    assert (mapped.intent, mapped.reason) == (Intent.IGNORED, Reason.LINKED_BY_THE_POLLER)
+    assert mapped.trigger is None
+
+
+def test_a_closed_pull_request_is_found_by_its_number(settings: Settings) -> None:
+    """By then `remediation.pr_number` is populated, which is what makes `closed` resolvable where
+    `opened` is not."""
+    mapped = map_event(
+        "pull_request", github_payload("pull_request.closed.merged"), settings=settings
+    )
+
+    assert (mapped.repo, mapped.pr_number) == ("taxpon/superset", 42889)
+    assert mapped.issue_number is None
     assert mapped.pr_url == "https://github.com/taxpon/superset/pull/42889"
     assert mapped.head_sha == "349a7f639dfb353669c001187706d7fd0112ed2f"
 
@@ -248,6 +273,45 @@ def test_a_check_suite_attached_to_no_pull_request_is_ignored(settings: Settings
     mapped = map_event("check_suite", body, settings=settings)
 
     assert (mapped.intent, mapped.reason) == (Intent.IGNORED, Reason.NO_SUBJECT)
+
+
+def test_a_check_suite_on_several_pull_requests_takes_the_first(settings: Settings) -> None:
+    """GitHub sends every pull request a head SHA sits on. Nothing in the payload says which the
+    suite ran for, so the choice is arbitrary and pinned here rather than left to depend on how
+    many the fixtures happen to carry."""
+    recorded = github_payload("check_suite.completed.success")["check_suite"]["pull_requests"]
+    body = variant(
+        "check_suite.completed.success",
+        check_suite__pull_requests=[*recorded, {**recorded[0], "number": 99001}],
+    )
+
+    mapped = map_event("check_suite", body, settings=settings)
+
+    assert mapped.pr_number == 42889
+
+
+def test_a_comment_on_a_pull_request_is_found_by_the_pull_request_number(
+    settings: Settings,
+) -> None:
+    """GitHub delivers pull request conversation as `issue_comment`, with `issue.number` holding the
+    pull request number and `issue.pull_request` present to say so — and that is where the reviewer
+    talks to the session, so reading it as an issue number would find nothing."""
+    body = variant(
+        "issue_comment.created",
+        issue__number=42889,
+        issue__pull_request={"url": "https://api.github.com/repos/taxpon/superset/pulls/42889"},
+    )
+
+    mapped = map_event("issue_comment", body, settings=settings)
+
+    assert mapped.intent is Intent.FORWARD_COMMENT
+    assert (mapped.pr_number, mapped.issue_number) == (42889, None)
+
+
+def test_a_comment_on_a_plain_issue_is_found_by_the_issue_number(settings: Settings) -> None:
+    mapped = map_event("issue_comment", github_payload("issue_comment.created"), settings=settings)
+
+    assert (mapped.issue_number, mapped.pr_number) == (42876, None)
 
 
 # ------------------------------------------------------------------------------ what is ignored
@@ -374,45 +438,97 @@ def test_a_mention_is_recognised_whatever_its_casing(settings: Settings) -> None
     assert mapped.intent is Intent.FORWARD_COMMENT
 
 
+AUTOFIX_LABEL: Final = {"name": "devin:autofix"}
+
+
 @pytest.mark.parametrize(
-    ("event", "body"),
+    ("event", "body", "reason"),
     [
-        pytest.param("issues", {}, id="empty-body"),
-        pytest.param("issues", {"action": "labeled"}, id="no-label-and-no-issue"),
-        pytest.param(
-            "issues", {"action": "labeled", "label": {"name": "devin:autofix"}}, id="no-issue"
-        ),
-        pytest.param("issues", {"action": "labeled", "issue": "42876"}, id="issue-is-a-string"),
+        pytest.param("issues", {}, Reason.UNHANDLED_ACTION, id="empty-body"),
+        pytest.param("issues", {"action": "labeled"}, Reason.OTHER_LABEL, id="no-label"),
         pytest.param(
             "issues",
-            {"action": "labeled", "label": {"name": "devin:autofix"}, "issue": {}},
+            {"action": "labeled", "label": AUTOFIX_LABEL},
+            Reason.NO_SUBJECT,
+            id="no-issue",
+        ),
+        pytest.param(
+            "issues",
+            {"action": "labeled", "label": AUTOFIX_LABEL, "issue": "42876"},
+            Reason.NO_SUBJECT,
+            id="issue-is-a-string",
+        ),
+        pytest.param(
+            "issues",
+            {"action": "labeled", "label": AUTOFIX_LABEL, "issue": {}},
+            Reason.NO_SUBJECT,
             id="issue-without-a-number",
         ),
-        pytest.param("pull_request", {"action": "closed", "pull_request": None}, id="null-object"),
+        pytest.param(
+            "issues",
+            {"action": "labeled", "label": AUTOFIX_LABEL, "issue": {"number": True}},
+            Reason.NO_SUBJECT,
+            id="issue-number-is-a-bool",
+        ),
+        pytest.param(
+            "pull_request",
+            {"action": "closed", "pull_request": None},
+            Reason.NO_SUBJECT,
+            id="null-object",
+        ),
         pytest.param(
             "check_suite",
             {"action": "completed", "check_suite": {"conclusion": "success"}},
+            Reason.NO_SUBJECT,
             id="no-pull-requests-key",
         ),
         pytest.param(
             "check_suite",
             {"action": "completed", "check_suite": {"conclusion": "success", "pull_requests": {}}},
+            Reason.NO_SUBJECT,
             id="pull-requests-is-not-a-list",
         ),
-        pytest.param("issue_comment", {"action": "created", "comment": {}}, id="comment-no-body"),
-        pytest.param("pull_request_review", {"action": "submitted"}, id="no-review"),
-        pytest.param("ping", {}, id="ping-without-a-repository"),
+        pytest.param(
+            "check_suite",
+            {"action": "completed", "check_suite": {"conclusion": "success", "pull_requests": [7]}},
+            Reason.NO_SUBJECT,
+            id="pull-request-is-not-an-object",
+        ),
+        pytest.param(
+            "issue_comment", {"action": "created", "comment": {}}, Reason.NO_MENTION, id="no-body"
+        ),
+        pytest.param(
+            "pull_request_review",
+            {"action": "submitted"},
+            Reason.UNHANDLED_REVIEW_STATE,
+            id="no-review",
+        ),
+        pytest.param("ping", {}, Reason.PING, id="ping-without-a-repository"),
     ],
 )
 def test_a_payload_missing_what_it_should_carry_is_ignored_rather_than_raising(
-    event: str, body: dict[str, Any], settings: Settings
+    event: str, body: dict[str, Any], reason: Reason, settings: Settings
 ) -> None:
     """GitHub retries a delivery that failed, so a body the mapping cannot read has to end as a
-    `202` and not as an exception on the request path."""
+    `202` and not as an exception on the request path.
+
+    The reason is asserted exactly, not merely as "some reason": an organisation-level ping carries
+    no `repository`, and it has to reach `_ping` rather than be turned away as another repository's.
+    """
     mapped = map_event(event, body, settings=settings)
 
-    assert mapped.ignored
-    assert mapped.reason is not None
+    assert (mapped.intent, mapped.reason) == (Intent.IGNORED, reason)
+
+
+@pytest.mark.parametrize("body", [None, [], ["issues"], "labeled", 42, 4.2, True])
+def test_a_body_that_is_not_an_object_is_ignored_rather_than_raising(
+    body: Any, settings: Settings
+) -> None:
+    """`json.loads` of a well-formed body produces any of these, so the mapping is handed them
+    before anything has checked."""
+    mapped = map_event("issues", body, settings=settings)
+
+    assert (mapped.intent, mapped.reason) == (Intent.IGNORED, Reason.MALFORMED_BODY)
 
 
 # ------------------------------------------------------------- from an intent to a state machine
@@ -453,11 +569,31 @@ def test_an_intent_that_changes_no_state_has_no_trigger(
     assert trigger_for(mapped, State.IN_REVIEW) is None
 
 
-def test_an_illegal_trigger_other_than_re_labelling_is_still_returned(
-    settings: Settings,
+@pytest.mark.parametrize("row", [row for row in SUBSCRIBED if row.trigger is not None], ids=by_id)
+def test_no_trigger_survives_a_remediation_that_does_not_exist(
+    row: Row, settings: Settings
 ) -> None:
-    """Only the re-labelling case is absorbed here. A check suite for a remediation in no CI state
-    is a bug, and `transition()` is what says so."""
+    """The lookup finding nothing is the other half of the existence boundary, and every trigger
+    but `ISSUE_LABELLED` raises from `None`. Asserting it for the whole table rather than for the
+    one case that came up: this is what the caller relies on when a pull request is closed by hand
+    on the fork, or a check suite runs on a branch Sentinel never touched.
+
+    Whatever `trigger_for` hands back must be applicable, so each returned trigger is put through
+    `transition()` here rather than merely compared.
+    """
+    mapped = map_event(row.event, row.build(), settings=settings)
+
+    trigger = trigger_for(mapped, None)
+
+    if trigger is None:
+        return
+    assert trigger is Trigger.ISSUE_LABELLED
+    assert transition(None, trigger).to_state is State.QUEUED
+
+
+def test_an_illegal_trigger_within_the_lifecycle_is_still_returned(settings: Settings) -> None:
+    """Only the two edges of the existence boundary are absorbed here. A check suite for a
+    remediation that exists but is in no CI state is a bug, and `transition()` is what says so."""
     mapped = map_event(
         "check_suite", github_payload("check_suite.completed.success"), settings=settings
     )
@@ -507,7 +643,7 @@ def test_an_ignored_event_is_reported_as_such() -> None:
     assert not MappedEvent(Intent.CI_PASSED, Trigger.CHECK_SUITE_SUCCEEDED).ignored
 
 
-@pytest.mark.parametrize("row", SUBSCRIBED, ids=lambda row: row.id)
+@pytest.mark.parametrize("row", SUBSCRIBED, ids=by_id)
 def test_only_a_labelled_issue_may_create_a_remediation(row: Row, settings: Settings) -> None:
     """A delivery about a pull request or a closed issue is looked up, never upserted — otherwise
     the ingress path would create a remediation for work Sentinel never took on."""

@@ -4,9 +4,9 @@ status: accepted
 date: 2026-08-08
 type: architecture
 areas: [github, pipeline]
-tasks: [T20]
+tasks: [T20, T22, T23, T24]
 files: [src/sentinel/github/events.py]
-specs: [docs/06-event-pipeline.md, docs/04-state-machine.md]
+specs: [docs/06-event-pipeline.md, docs/04-state-machine.md, docs/07-observability.md]
 supersedes:
 ---
 
@@ -40,8 +40,21 @@ What was true when the mapping had to choose:
 
 `issues.unlabeled` carrying `AUTOFIX_LABEL`, and `issues.closed`, map to `Intent.CANCEL` with
 `Trigger.FAILED` and a `Reason` naming the cause — `autofix_label_removed` or `issue_closed`. The
-ingress path applies the trigger like any other, so the remediation ends in `FAILED`, and records
-the reason in `remediation_event.detail`.
+ingress path applies the trigger like any other, so the remediation ends in `FAILED`.
+
+**The reason is written to `remediation.blocked_reason`**, and to `remediation_event.detail` with the
+rest of the transition. The column is where it has to go for the reason to be visible: the failure
+breakdown in [07](../07-observability.md) is `count grouped by blocked_reason for state ∈ {BLOCKED,
+FAILED}`, so a cancellation with the reason only on the event would land in that panel as an
+unlabelled null bucket, and "filter it out" would mean a join the metric does not do.
+[03](../03-data-model.md) already describes the column as populated on `BLOCKED` / `FAILED`, so this
+is using it as specified rather than widening it.
+
+Escalation is **suppressed** for these two reasons. `FAILED` otherwise comments on the issue and
+applies `needs-human` ([04](../04-state-machine.md#escalation)); doing that to an issue a maintainer
+has just deliberately closed, or unlabelled, is telling a person to look at the thing they were
+looking at when they called it off. The transition is still recorded and still visible on the
+dashboard.
 
 Sentinel's own post-merge `issues.closed` needs no special case: the remediation is `MERGED`, which
 is terminal, so `transition()` absorbs it. That is what "if not yet terminal" buys.
@@ -61,17 +74,19 @@ another task's owned file and another task's migration on the strength of one ro
 ## Consequences
 
 Cancellation works today, in the layer that had the gap, without touching a file this task does not
-own. The reason is on the event, so the dashboard and the audit trail can say *why* a remediation
-ended, and the escalation path in T23/T24 can read it to decide whether to comment on the issue at
-all — commenting "this failed, a human should look" on an issue somebody has just deliberately
-closed would be noise.
+own. Because the reason lands in `blocked_reason`, the failure breakdown shows
+`autofix_label_removed` and `issue_closed` as named rows next to `daily_acu_budget_exhausted` and
+the rest — so the panel reports cancellations rather than hiding them, and reads as a list of
+reasons work stopped rather than a list of things that broke.
 
-The cost is paid in the analytics. `FAILED` is the failure bucket, so until a `CANCELLED` state
-exists, the failure breakdown and the success rate in [07](../07-observability.md) count a
-cancellation as a failure. Every such row carries a cancellation `Reason`, so the figures can be
-corrected by filtering on it — but nothing forces a consumer to, and the headline number is wrong by
-however many remediations were called off. That obligation on the escalation path is likewise
-recorded here and not enforced by anything in this module.
+The cost is paid in the aggregate figures either way. `FAILED` is the failure bucket, so until a
+`CANCELLED` state exists, the **success rate** — which is a count of states, not of reasons —
+counts a cancellation as a failure, and no amount of labelling corrects that.
+
+Two obligations land outside this module and are enforced by nothing in it: writing the reason to
+`blocked_reason` (T22), and suppressing the escalation comment and `needs-human` label for these two
+reasons (T23, T24). Both tasks are named in this record's front matter so the generated index and
+`.claude/rules/adr-pointers.md` route it to them.
 
 **What would tell us this was wrong:** cancellations becoming common enough to distort the failure
 rate — say more than one in ten terminal remediations — or a reader of the dashboard asking why the

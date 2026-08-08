@@ -36,15 +36,26 @@ Two functions, called at the two moments the ingress path can call them.
 `map_event(event, payload, *, settings) -> MappedEvent` is pure and stateless: the intent, the
 identifiers needed to find the remediation, and the trigger the *row* implies.
 
-`trigger_for(mapped, state, *, pr_linked=False) -> Trigger | None` is the second step, taken once
-the state is known. It returns `None` for an intent that carries no trigger, and `None` for a
-re-labelling — asking `is_legal(state, Trigger.ISSUE_LABELLED)`, which is `False` for every state
-except `None`. Either way the caller's branch is the same one: record the delivery against the
-remediation and stop.
+`trigger_for(mapped, state) -> Trigger | None` is the second step, taken once the state is known —
+`state` being `None` when the lookup found no remediation at all. It returns `None` in three cases,
+all of which mean the same thing to the caller: record the delivery and apply nothing.
 
-It absorbs nothing else. A `check_suite.completed` for a remediation in no CI state still reaches
-`transition()` and still raises, because that one is a bug and the spec says illegal transitions
-raise rather than silently no-op ([04](../04-state-machine.md#invariants), invariant 6).
+- The intent carries no trigger: an approval, a forwarded comment.
+- No remediation exists and the trigger cannot create one. A pull request closed by hand on the
+  fork, or a check suite on a branch Sentinel never touched, would otherwise raise.
+- A remediation exists and the trigger creates one. This is the re-labelling case.
+
+The last two are one boundary seen from either side, and the code says so rather than special-casing
+`ISSUE_LABELLED` by name: `is_legal(None, trigger)` asks the state machine which triggers create a
+remediation, and the answer must agree with whether one was found.
+
+It absorbs nothing else. A `check_suite.completed` for a remediation that exists but is in no CI
+state still reaches `transition()` and still raises, because that one is a bug and the spec says
+illegal transitions raise rather than silently no-op ([04](../04-state-machine.md#invariants),
+invariant 6).
+
+`pr_linked` is deliberately not a parameter. Nothing resolved here puts a condition on the pull
+request link, so taking one would suggest it changes the answer.
 
 ## Alternatives considered
 
@@ -53,21 +64,25 @@ raise rather than silently no-op ([04](../04-state-machine.md#invariants), invar
 | Let T22 guard the re-label case | It is the one piece of this the state machine's own docstring warns about, and the warning would then live two modules away from the code that has to heed it. The webhook handler is also not the last caller that will map an event |
 | Pass the state into `map_event` | Inverts the ingress order: the state is only known after the upsert, and the upsert needs the identifiers the mapping produces |
 | Return `None` for every illegal combination | Then a genuinely impossible sequence — CI completing for a remediation that never opened a pull request — becomes a silent no-op, and invariant 6 stops holding for the whole webhook path |
+| Absorb the re-label case only, and let the caller check for a missing remediation | What the first version of this did. The two are the same condition, so splitting them puts half the rule in the module and half in a comment somebody has to read: `trigger_for(cancel, None)` returned `Trigger.FAILED`, which `transition()` raises on, and the contract that made it safe was neither stated nor tested |
 | Have `transition()` absorb `ISSUE_LABELLED` from a live state | It is T14's file, and absorbing there would hide the same case from the poller and the worker, which have no deduplication layer standing behind them |
 
 ## Consequences
 
-The caller's shape is fixed and small: map, upsert, `trigger_for`, and transition only if it
-returned something. The two "record but do not move" rows and the re-labelling case collapse into
-one branch, so none of them can be forgotten independently, and each is a test in
-`tests/test_events.py` asserting `None` against a recorded payload.
+The caller's shape is fixed and small: map, look up or upsert, `trigger_for`, and transition only if
+it returned something. **Whatever `trigger_for` returns can be applied** — the caller never has to
+guard `transition()` against a remediation that turned out not to exist, which is the mistake this
+otherwise invites, since it is the ordinary case for a repository people also use by hand. Every
+row of the table is asserted against `trigger_for(mapped, None)` in `tests/test_events.py`, and the
+triggers it does return are put through `transition()` there rather than merely compared.
 
-The cost is that a reader now has to know both functions to see the whole rule: `MappedEvent.trigger`
-is what the table says and `trigger_for` is what to apply, and they differ for exactly one intent.
+The cost is that a reader has to know both functions to see the whole rule: `MappedEvent.trigger` is
+what the table says and `trigger_for` is what to apply, and they differ at the existence boundary.
 The field is not hidden, so a caller reaching for `mapped.trigger` directly gets the raising
 behaviour back.
 
-**What would tell us this was wrong:** a second trigger needing to be absorbed for reasons of its
-own. Two special cases in `trigger_for` means the knowledge belongs in the state machine as a
-per-trigger "absorb when illegal" flag, next to the `PullRequestCondition` that already lives there,
-rather than in a function outside it.
+**What would tell us this was wrong:** a trigger needing to be absorbed for a reason that is *not*
+about whether the remediation exists. The rule here is one predicate over one boundary; a second,
+unrelated special case would mean the knowledge belongs in the state machine as a per-trigger
+"absorb when illegal" flag, next to the `PullRequestCondition` that already lives there, rather than
+in a function outside it.

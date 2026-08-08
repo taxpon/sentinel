@@ -8,21 +8,31 @@ delivery and upserting the remediation.
 
 Two properties the spec is explicit about, both of which shape the code:
 
-- **Nothing here raises.** An unknown event, an action the table does not list, a payload from
-  another repository, a body missing the object it should carry — every one of them is
-  `Intent.IGNORED` with a `Reason`. GitHub retries a delivery it thinks failed, so an event the
-  mapping cannot classify must be a `202`, never a `5xx` that comes back forever. Every field is
-  read defensively for the same reason: a payload GitHub reshapes is a delivery to ignore, not an
-  exception on the request path.
+- **Nothing here raises**, for any `payload` whatever — including one that is not an object at all,
+  which `json.loads` will happily produce from a well-formed body. An unknown event, an action the
+  table does not list, another repository, a missing object: every one of them is `Intent.IGNORED`
+  with a `Reason`. GitHub retries a delivery it thinks failed, so an event the mapping cannot
+  classify must be a `202`, never a `5xx` that comes back forever.
 - **Mapping is separate from applying.** `map_event` sees no remediation, because the ingress path
   has not looked one up yet. `trigger_for` is the second step, taken once the state is known — see
   [ADR](../../../docs/adr/2026-08-08-the-mapping-decides-what-there-is-to-apply.md), which also
-  explains why re-labelling an issue is resolved there rather than by the caller.
+  explains why the two edges of "does this remediation exist yet" are resolved there rather than by
+  the caller.
 
-The table's `issues.unlabeled` / `issues.closed` row — "cancel if not yet terminal" — has no
-trigger and no state of its own in `docs/04-state-machine.md`. It is mapped to `Trigger.FAILED`
-with a cancellation `Reason`;
-[ADR](../../../docs/adr/2026-08-08-cancellation-is-recorded-as-failed.md) records what that costs.
+Two rows of the table needed a decision, and each has a record:
+
+- `issues.unlabeled` / `issues.closed` — "cancel if not yet terminal" — has no trigger and no state
+  of its own in `docs/04-state-machine.md`. It is mapped to `Trigger.FAILED` with a cancellation
+  `Reason`, which the caller writes to `remediation.blocked_reason`
+  ([ADR](../../../docs/adr/2026-08-08-cancellation-is-recorded-as-failed.md)).
+- `pull_request.opened` — "link the PR to its remediation" — cannot be resolved here at all, so it
+  is ignored and the poller does the linking
+  ([ADR](../../../docs/adr/2026-08-08-the-poller-links-the-pull-request.md)).
+
+**What the caller needs in order to find the remediation.** `remediation` is keyed
+`(repo, issue_number)`, and `pr_number` is NULL until `PR_OPENED` has been applied. So an intent
+carries `issue_number` when the delivery is about an issue, and `pr_number` when it is about a pull
+request that must already be linked — never neither, and the two are never both a lookup key.
 """
 
 from __future__ import annotations
@@ -54,7 +64,6 @@ class Intent(StrEnum):
     IGNORED = "ignored"
     START_REMEDIATION = "start_remediation"
     CANCEL = "cancel"
-    LINK_PULL_REQUEST = "link_pull_request"
     PULL_REQUEST_MERGED = "pull_request_merged"
     PULL_REQUEST_ABANDONED = "pull_request_abandoned"
     CI_STARTED = "ci_started"
@@ -73,6 +82,7 @@ class Reason(StrEnum):
     `remediation_event.detail` for the two intents that end a remediation early.
     """
 
+    MALFORMED_BODY = "malformed_body"
     UNKNOWN_EVENT = "unknown_event"
     UNHANDLED_ACTION = "unhandled_action"
     UNHANDLED_CONCLUSION = "unhandled_conclusion"
@@ -81,6 +91,7 @@ class Reason(StrEnum):
     OTHER_LABEL = "other_label"
     NO_MENTION = "no_mention"
     NO_SUBJECT = "no_subject"
+    LINKED_BY_THE_POLLER = "linked_by_the_poller"
     PING = "ping"
     AUTOFIX_LABEL_REMOVED = "autofix_label_removed"
     ISSUE_CLOSED = "issue_closed"
@@ -123,11 +134,17 @@ class MappedEvent:
         return self.intent is Intent.START_REMEDIATION
 
 
-def map_event(event: str, payload: Mapping[str, Any], *, settings: Settings) -> MappedEvent:
+def map_event(event: str, payload: Any, *, settings: Settings) -> MappedEvent:
     """Interpret one delivery. `event` is the `X-GitHub-Event` header, `payload` the decoded body.
 
-    Never raises, whatever the body contains.
+    Never raises, whatever the body contains. `payload` is typed `Any` rather than `Mapping` because
+    that is what it is: the caller has `json.loads` of bytes GitHub sent, and a well-formed body can
+    decode to a list, a string or a number as easily as to an object. Rejecting those here is one
+    check; making every caller prove the type first is a check in each of them.
     """
+    if not isinstance(payload, Mapping):
+        return _ignored(Reason.MALFORMED_BODY)
+
     repository = _object(payload, "repository")
     # Checked before the event is dispatched, and for every event alike: the webhook is configured
     # on one repository, so anything else is a misconfiguration or a stray delivery, and the point
@@ -145,25 +162,34 @@ def map_event(event: str, payload: Mapping[str, Any], *, settings: Settings) -> 
 def trigger_for(mapped: MappedEvent, state: State | None) -> Trigger | None:
     """The trigger to apply to a remediation currently in `state`, or `None` if there is none.
 
-    `None` covers two cases the caller should not have to tell apart, both of which mean "record the
-    delivery against the remediation and stop":
+    `state` is the remediation's state, or `None` when the lookup found no remediation at all.
 
-    - an intent that carries no trigger at all — an approving review, a comment forwarded to the
-      session — which changes no state by design;
-    - a re-labelled issue. `Trigger.ISSUE_LABELLED` is legal only from `None`, so applying it to a
-      remediation that already exists would raise. The domain deduplication layer treats a label
-      removed and re-added as one remediation, so this is the routine case rather than a fault.
+    `None` comes back in three cases, all of which mean the same thing to the caller — record the
+    delivery and apply nothing:
 
-    Every *other* illegal combination is left for `transition()` to reject. A
-    `check_suite.completed` for a remediation in no CI state is a bug worth hearing about; a second
-    `devin:autofix` label is a person clicking twice.
+    - an intent that carries no trigger at all: an approving review, a comment forwarded to the
+      session. Neither changes state by design.
+    - a delivery about a remediation that does not exist. Every trigger but one is illegal from
+      `None`, so a pull request closed on the fork by hand, or a check suite for a branch Sentinel
+      never touched, would otherwise raise.
+    - a re-labelled issue: the mirror image. `Trigger.ISSUE_LABELLED` is legal *only* from `None`,
+      so applying it to a remediation that already exists would raise, and the domain deduplication
+      layer treats a label removed and re-added as one remediation.
 
-    `pr_linked` is not asked for, because `ISSUE_LABELLED` is the only trigger resolved here and it
-    puts no condition on the pull request link. `transition()` still needs it.
+    Those last two are the same boundary seen from either side, and neither is a fault — which is
+    why they are absorbed together rather than each being a special case. Every *other* illegal
+    combination is left for `transition()` to reject: a `check_suite.completed` for a remediation
+    in no CI state is a bug worth hearing about.
+
+    `pr_linked` is not asked for, because nothing resolved here puts a condition on the pull request
+    link. `transition()` still needs it.
     """
     if mapped.trigger is None:
         return None
-    if mapped.trigger is Trigger.ISSUE_LABELLED and not is_legal(state, Trigger.ISSUE_LABELLED):
+    # `ISSUE_LABELLED` is the only trigger legal from `None`, but asking the state machine rather
+    # than naming it keeps this true if a second one is ever added.
+    creates_remediation = is_legal(None, mapped.trigger)
+    if creates_remediation != (state is None):
         return None
     return mapped.trigger
 
@@ -206,6 +232,15 @@ def _pull_request(payload: Mapping[str, Any], settings: Settings) -> MappedEvent
     if action not in {"opened", "closed"}:
         return _ignored(Reason.UNHANDLED_ACTION)
 
+    if action == "opened":
+        # Nothing in the payload can find the remediation. `remediation` is keyed
+        # `(repo, issue_number)`, `pr_number` is NULL until `PR_OPENED` has been applied, and a pull
+        # request body is not required to reference the issue it fixes — `docs/05` asks only that it
+        # explain the root cause, and the recorded one references Sentry. So the poller links the
+        # pull request from `pull_requests[]` on the session, which is authoritative, and this
+        # delivery is recorded and dropped. See the ADR: this is the decision, not an omission.
+        return _ignored(Reason.LINKED_BY_THE_POLLER)
+
     pull_request = _object(payload, "pull_request")
     pr_number = _number(pull_request, "number")
     if pr_number is None:
@@ -217,8 +252,6 @@ def _pull_request(payload: Mapping[str, Any], settings: Settings) -> MappedEvent
         "pr_url": _text(pull_request, "html_url"),
         "head_sha": _text(_object(pull_request, "head"), "sha"),
     }
-    if action == "opened":
-        return MappedEvent(Intent.LINK_PULL_REQUEST, Trigger.PR_OPENED, **subject)
     if pull_request.get("merged") is True:
         return MappedEvent(Intent.PULL_REQUEST_MERGED, Trigger.PR_MERGED, **subject)
     return MappedEvent(
@@ -272,7 +305,9 @@ def _check_suite(payload: Mapping[str, Any], settings: Settings) -> MappedEvent:
     # A check suite is resolved to its remediation through the pull request, because that is the
     # link `remediation` stores; the head SHA comes along for the log line and the resume message.
     # A suite attached to no pull request belongs to no remediation — the CI triggers require a
-    # linked one — so there is nothing to look up.
+    # linked one — so there is nothing to look up. Where a head SHA sits on several pull requests
+    # GitHub sends them all, and the first is taken: no field in the payload says which of them the
+    # suite was run for, and the lookup will match at most one remediation anyway.
     pull_requests = suite.get("pull_requests")
     first = pull_requests[0] if isinstance(pull_requests, list) and pull_requests else None
     pr_number = _number(first, "number") if isinstance(first, Mapping) else None
@@ -299,9 +334,16 @@ def _issue_comment(payload: Mapping[str, Any], settings: Settings) -> MappedEven
     if DEVIN_BOT_MENTION not in body.lower():
         return _ignored(Reason.NO_MENTION)
 
-    issue_number = _number(_object(payload, "issue"), "number")
-    if issue_number is None:
+    issue = _object(payload, "issue")
+    number = _number(issue, "number")
+    if number is None:
         return _ignored(Reason.NO_SUBJECT)
+
+    # GitHub delivers the conversation on a pull request as `issue_comment` too, with `issue.number`
+    # holding the *pull request* number and an `issue.pull_request` key present to say so. That is
+    # where the reviewer talks to the session, so reading the number into `issue_number` regardless
+    # would look the remediation up by the wrong key and quietly find nothing.
+    on_pull_request = "pull_request" in issue
 
     # No trigger: a person talking to the session does not move the remediation. It is forwarded and
     # counted against `human_message_count`, which is what makes the autonomy rate in
@@ -309,7 +351,8 @@ def _issue_comment(payload: Mapping[str, Any], settings: Settings) -> MappedEven
     return MappedEvent(
         Intent.FORWARD_COMMENT,
         repo=settings.target_repo,
-        issue_number=issue_number,
+        issue_number=None if on_pull_request else number,
+        pr_number=number if on_pull_request else None,
     )
 
 

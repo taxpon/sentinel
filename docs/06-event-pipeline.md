@@ -9,8 +9,8 @@ A single GitHub webhook on `taxpon/superset` delivering to `POST /webhooks/githu
 | Event | Action | Intent |
 |---|---|---|
 | `issues` | `labeled` (label `devin:autofix`) | **Start a remediation** |
-| `issues` | `unlabeled`, `closed` | Cancel if not yet terminal |
-| `pull_request` | `opened` | Link the PR to its remediation |
+| `issues` | `unlabeled`, `closed` | Cancel if not yet terminal: `FAILED`, with the reason in `remediation.blocked_reason` ([ADR](./adr/2026-08-08-cancellation-is-recorded-as-failed.md)) |
+| `pull_request` | `opened` | Nothing — the poller links the PR ([ADR](./adr/2026-08-08-the-poller-links-the-pull-request.md)) |
 | `pull_request` | `closed` (`merged: true`) | `MERGED` |
 | `pull_request` | `closed` (`merged: false`) | `FAILED` — abandoned |
 | `pull_request_review` | `submitted`, state `changes_requested` | **Resume the session** with the review |
@@ -23,6 +23,16 @@ A single GitHub webhook on `taxpon/superset` delivering to `POST /webhooks/githu
 
 Anything else is stored in `webhook_delivery` with `handler_result = ignored` and dropped. Unknown
 events are never an error.
+
+**Which remediation a delivery is about.** `remediation` is keyed `(repo, issue_number)`, and
+`pr_number` is null until `PR_OPENED` has been applied. So an `issues` or `issue_comment` delivery
+is resolved by issue number, and everything about a pull request — `closed`, a review, a check
+suite — by `pr_number`, which is populated by the time any of them can arrive. GitHub delivers a
+pull request's conversation as `issue_comment` with `issue.number` holding the *pull request*
+number and `issue.pull_request` present to say so; that one resolves by `pr_number` too.
+
+`pull_request.opened` is the exception, and the reason it does nothing here: it is the event that
+would establish the link, so no key exists yet to resolve it by.
 
 ## Ingress path
 
