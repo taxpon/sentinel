@@ -17,12 +17,16 @@ Three figures describe today's spend, and the guard uses the largest of them
 - **`acu_ledger`**, the same endpoint's answer as the `sync_acu` job last stored it. Organisation-
   wide and day-aligned, therefore the only figure that covers Devin sessions Sentinel did not
   create — and as stale as the last sync.
-- **`remediation.acus_consumed`**, summed over the remediations labelled today. Sentinel's own
-  reconciliation, always available and always current, and blind to anything but its own sessions.
+- **`remediation.acus_consumed`**, summed over the remediations labelled today **and the ones Devin
+  is working on right now**. Sentinel's own reconciliation: always available, always current, and
+  blind to anything but its own sessions. The second half of that selection is what stops a session
+  labelled yesterday and still burning ACUs today from being invisible — in the deployment where
+  Devin's figure is unavailable, the ledger is empty for the same reason, and this is the only
+  source left.
 
-None of the three dominates the others, and every one of them can only be *missing* spend, never
-inventing it. Taking the maximum is therefore the only combination that cannot open the gate on a
-figure that is merely incomplete. A budget guard that reads low spends real money.
+None of the three dominates the others, and none of them can invent spend. Taking the maximum is
+therefore the only combination that cannot open the gate on a figure that is merely incomplete. A
+budget guard that reads low spends real money.
 
 Reading Devin's figure is the one thing here that can fail outright — a `401`, a `503`, a network
 error all raise `DevinError` from the client and out of `daily_spend()`. That is deliberate: those
@@ -37,13 +41,14 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Final, Protocol
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sentinel.config import Settings, get_settings
 from sentinel.devin.playbooks import IssueClass, acu_cap_for
 from sentinel.devin.schemas import Consumption, Degradable, Unavailable
 from sentinel.models import AcuLedger, Remediation
+from sentinel.policy.concurrency import IN_FLIGHT_STATES
 
 BUDGET_EXHAUSTED: Final = "daily_acu_budget_exhausted"
 """`remediation.blocked_reason` when the guard refuses, spelled as `docs/06-event-pipeline.md`
@@ -124,6 +129,12 @@ def budget_allows(
     own ceiling, rather than starting one and discovering the budget mid-flight. Spending exactly
     the budget is inside it; only more than the budget is over.
 
+    **Only the admitting session's ceiling is reserved.** Sessions already in flight count at what
+    they have spent so far, not at what they may yet spend, so the pipeline can be committed to as
+    much as `(MAX_CONCURRENT_SESSIONS - 1) * max_acu_limit` beyond the budget — 40 ACUs against 100
+    at the defaults. That is the arithmetic `docs/06-event-pipeline.md#reliability-policy` states,
+    and the overshoot shrinks as the poller reconciles what those sessions have actually consumed.
+
     Raises `UnknownIssueClass` for a class with no playbook — a condition the caller already has to
     handle, since the same class has no `playbook_id` to create a session with either.
     """
@@ -149,20 +160,38 @@ async def _ledger_total(session: AsyncSession, day: datetime.date) -> Decimal:
 
 
 async def _remediation_total(session: AsyncSession, day: datetime.date) -> Decimal:
-    """`sum(acus_consumed)` over the remediations labelled on `day`.
+    """`sum(acus_consumed)` over the remediations that can have spent anything on `day`.
 
-    Selected by `labeled_at`, as
-    `docs/adr/2026-08-08-the-window-selects-remediations-by-labeled-at.md` selects them for the
-    analytics window: it is the only timestamp every remediation has. The approximation it makes is
-    that a session labelled yesterday and still running today is counted against yesterday — spend
-    the ledger does cover, on the day it is synced.
+    `acus_consumed` is a lifetime total per remediation, not a daily series, so which rows belong to
+    a day is an approximation whichever way it is drawn. Two sets of rows are taken, and their union
+    is the answer:
+
+    - **Labelled on `day`.** `labeled_at` is the only timestamp every remediation has, and
+      `docs/adr/2026-08-08-the-window-selects-remediations-by-labeled-at.md` selects rows by it for
+      the analytics window.
+    - **In flight right now**, whenever they were labelled — the states of
+      `sentinel.policy.concurrency.IN_FLIGHT_STATES`, which are exactly the ones where Devin is
+      working and therefore the only ones that can be adding to `day`'s spend without having been
+      labelled on it.
+
+    Selecting on `labeled_at` alone would miss a session labelled yesterday and still running now,
+    and that is not a gap the other two sources cover: an organisation with no consumption scope
+    never syncs the ledger *and* has no figure from Devin, which leaves this sum the only source
+    there is. Adding the in-flight rows over-counts instead — their whole lifetime spend counts
+    against today — which is the direction the `max()` above already commits to, and it is bounded,
+    because `MAX_CONCURRENT_SESSIONS` bounds how many rows can be in flight at once.
     """
     start = datetime.datetime.combine(day, datetime.time.min, tzinfo=datetime.UTC)
     total: Decimal = (
         await session.execute(
             select(func.coalesce(func.sum(Remediation.acus_consumed), 0)).where(
-                Remediation.labeled_at >= start,
-                Remediation.labeled_at < start + datetime.timedelta(days=1),
+                or_(
+                    and_(
+                        Remediation.labeled_at >= start,
+                        Remediation.labeled_at < start + datetime.timedelta(days=1),
+                    ),
+                    Remediation.state.in_([str(state) for state in IN_FLIGHT_STATES]),
+                )
             )
         )
     ).scalar_one()

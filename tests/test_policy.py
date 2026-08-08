@@ -520,15 +520,47 @@ async def test_a_local_figure_refuses_a_session_devins_would_allow(
     assert decision.detail["acus_spent"] == 95.0
 
 
+async def test_a_session_labelled_yesterday_and_still_running_counts_against_today(
+    session: AsyncSession, settings: Settings
+) -> None:
+    """The spend that would otherwise be invisible in exactly the deployment B8 describes.
+
+    With no consumption scope, Devin has no figure and the ledger is never synced from the endpoint
+    that does not answer — so this sum is the only source there is, and a session that was labelled
+    yesterday and is burning ACUs right now must not fall out of it. `labeled_at` alone would put it
+    on yesterday, where nothing is looking.
+    """
+    session.add(
+        a_remediation(
+            issue_number=1001,
+            state=str(State.RUNNING),
+            devin_session_id="devin-yesterday",
+            labeled_at=NOW - datetime.timedelta(days=1),
+            acus_consumed=Decimal("95.000"),
+        )
+    )
+    remediation = await seed_remediation(session)
+    job = await claim_job(session, settings, remediation=remediation)
+
+    decision = await admit_session(
+        session, job=job, remediation=remediation, devin=unavailable(), settings=settings
+    )
+
+    assert decision.verdict is Verdict.BLOCKED
+    assert decision.detail["acus_remediations"] == 95.0
+
+
 async def test_yesterdays_spend_does_not_count_against_todays_budget(
     session: AsyncSession, settings: Settings
 ) -> None:
-    """`DAILY_ACU_BUDGET` is daily. A ledger row and a remediation from yesterday are both past."""
+    """`DAILY_ACU_BUDGET` is daily. A ledger row and a *finished* remediation from yesterday are
+    both past: what is still in flight can add to today, and what is not, cannot."""
     yesterday = TODAY - datetime.timedelta(days=1)
     session.add(an_acu_ledger_entry(day=yesterday, acus=Decimal("99.000")))
     session.add(
         a_remediation(
             issue_number=1001,
+            state=str(State.MERGED),
             labeled_at=NOW - datetime.timedelta(days=1),
             acus_consumed=Decimal("99.000"),
         )
@@ -558,6 +590,25 @@ async def test_the_class_cap_is_added_before_the_comparison(settings: Settings) 
         issue_class="flaky-test",
         settings=settings.model_copy(update={"daily_acu_budget": 89.0}),
     )
+
+
+async def test_a_budget_that_is_not_a_binary_fraction_is_compared_as_written(
+    session: AsyncSession, settings: Settings
+) -> None:
+    """`DAILY_ACU_BUDGET` is a float and the ledger is `numeric(10,3)`, so the two have to be
+    brought together somewhere. Via `str`, so that a budget of `100.3` is a hundred and three
+    tenths: read as its binary neighbour it is a shade *under*, and a day that spends exactly the
+    budget would be refused for a rounding error nobody could see in the figures."""
+    settings = settings.model_copy(update={"daily_acu_budget": 100.3})
+    session.add(an_acu_ledger_entry(day=TODAY, acus=Decimal("80.300")))
+    remediation = await seed_remediation(session)
+    job = await claim_job(session, settings, remediation=remediation)
+
+    decision = await admit_session(
+        session, job=job, remediation=remediation, devin=reports(0.0), settings=settings
+    )
+
+    assert decision.verdict is Verdict.ADMITTED
 
 
 async def test_an_unhandled_issue_class_reaches_the_caller(settings: Settings) -> None:

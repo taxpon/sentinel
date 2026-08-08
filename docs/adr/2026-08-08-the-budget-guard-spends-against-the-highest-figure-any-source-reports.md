@@ -35,14 +35,26 @@ Three figures describe what today has cost, and each is incomplete in a differen
   own sessions. `docs/05-devin-integration.md#degradation` names it as the fallback for the
   consumption endpoint.
 
-Both local sources are in Postgres and cannot be unavailable. Every one of the three can only be
-*missing* spend — none of them can invent it.
+Both local sources are in Postgres and cannot be unavailable. None of the three can invent spend.
+
+The two are not independently blind, which is what makes the third one's *selection* part of this
+decision rather than a detail of it. `acus_consumed` is a lifetime total per remediation, not a
+daily series, so some rule has to say which rows belong to a day — and on a deployment with no
+consumption scope, Devin has no figure and the ledger is never synced from the endpoint that will
+not answer, so whatever that rule misses is missed by the guard entirely.
 
 ## Decision
 
 Today's spend is the **maximum** of the figures available, and `Unavailable` removes a source
 rather than relaxing the comparison. The guard refuses when `max(sources) + max_acu_limit` for the
 issue class exceeds `DAILY_ACU_BUDGET`; spending exactly the budget is inside it.
+
+Sentinel's own figure sums the remediations **labelled today, plus the ones in flight right now**
+whenever they were labelled — in flight meaning the `SESSION_CREATED`/`RUNNING` states the
+concurrency gate counts, which are the ones where Devin is working and therefore the only ones that
+can add to today's spend without having been labelled today. A session labelled yesterday and still
+running is counted at its whole lifetime spend, which over-counts; that is the direction this
+record has already chosen, and `MAX_CONCURRENT_SESSIONS` bounds how many such rows there can be.
 
 The class cap is reserved before the comparison, as the spec says: the guard will not start a
 session it could not afford to see run to its own ceiling.
@@ -60,15 +72,32 @@ unreadable-body cases the client already models as `Unavailable` drop the figure
 | Admit when the figure cannot be read, and rely on Devin's per-session `max_acu_limit` | The per-session cap bounds one session, not a day of them. Sixteen sessions of six ACUs each stay inside every per-session ceiling and pass a hundred-ACU daily budget without anything refusing |
 | Refuse everything when Devin's figure is unavailable | Fails safe on money and unsafe on the demo: with no enterprise scope the pipeline would block its first issue and every one after it, which is the state B8 says the deployment may well be in |
 | Sum the figures | They overlap — the ledger already includes Sentinel's own sessions — so a synced day would count its own spend twice and refuse work that is comfortably inside the budget |
+| Select Sentinel's own figure by `labeled_at` alone, as the analytics window does | That window's convention exists to keep funnel counts usable as each other's denominators, and carrying it into a money guard reads zero for a session labelled yesterday that is burning ACUs now. On the deployment where the other two sources are absent — the one this record is mostly about — that is the whole of today's spend going missing |
+| Count every non-terminal remediation, not only the ones in flight | Safer still, and unbounded: remediations waiting on a human reviewer accumulate, so a week of `IN_REVIEW` rows would exhaust the budget with spend that happened days ago and cannot grow. The gate would stop admitting anything, which is the failure this record rejects two rows above |
 
 ## Consequences
 
-There is no arrangement of missing data that makes the guard more permissive than a complete one
-would be: the worst an absent source can do is leave the decision to the other two, and the worst a
-stale one can do is under-report while a fresher source over-rules it. The escalation payload and
-`remediation_event.detail` carry all three figures, so an operator reading a refusal months later
-can see that `acus_devin` was `null` because the endpoint could not be asked, or that the ledger
-was far below Sentinel's own total because the sync had stopped.
+An absent source leaves the decision to the others rather than relaxing it, and a stale one
+under-reports while a fresher one over-rules it. What it does **not** guarantee is that a
+degraded deployment reaches the same verdict a complete one would: the sources are not independent,
+and where they are all blind to the same spend the maximum of them is blind to it too. One such gap
+is closed above by counting the in-flight remediations; the one that remains is a session that ran
+and *finished* today but was labelled on an earlier day. Its spend is real, and with no Devin
+figure and no ledger there is nothing left holding it — `acus_consumed` is a lifetime total, and
+nothing in the schema records which day of a multi-day remediation the ACUs were burned on. A
+deployment that needs the guard to be exact needs the consumption endpoint, or a per-day column.
+
+The escalation payload and `remediation_event.detail` carry all three figures, so an operator
+reading a refusal months later can see that `acus_devin` was `null` because the endpoint could not
+be asked, or that the ledger was far below Sentinel's own total because the sync had stopped.
+
+The guard also reserves only the *admitting* session's ceiling. Sessions already in flight count at
+what they have spent so far, not at what they may yet spend, so the pipeline can be committed to as
+much as `(MAX_CONCURRENT_SESSIONS - 1) * max_acu_limit` — 40 ACUs against a budget of 100 at the
+defaults — beyond what the guard has checked. That is the arithmetic
+[06](../06-event-pipeline.md#reliability-policy) specifies, and the overshoot closes as the poller
+reconciles what those sessions actually consumed; it is recorded here because the sentence "will
+not start a session it could not afford" is otherwise read as a stronger property than holds.
 
 The cost is that the guard is deliberately conservative: an organisation whose ledger includes a
 large unrelated Devin workload will have Sentinel refuse work that its own sessions could afford.
@@ -79,7 +108,9 @@ Each refusal costs one consumption call, made before the concurrency gate is con
 ([ADR](./2026-08-08-the-policy-releases-the-job-it-refuses.md)).
 
 **What would tell us this was wrong:** the three figures agreeing closely once B8 is resolved and
-credentials exist, which would make the maximum an expensive way to read one number; or
-remediations blocked while the day's *Sentinel* spend is well inside the budget, which would mean
-the organisation-wide ledger is the wrong denominator for a per-pipeline ceiling and the budget
-should be compared against Sentinel's own total alone.
+credentials exist, which would make the maximum an expensive way to read one number; remediations
+blocked while the day's *Sentinel* spend is well inside the budget, which would mean the
+organisation-wide ledger is the wrong denominator for a per-pipeline ceiling and the budget should
+be compared against Sentinel's own total alone; or a day's billed ACUs exceeding `DAILY_ACU_BUDGET`
+while no remediation was ever blocked, which would mean the gap named above is being hit and the
+schema needs to attribute spend to the day it happened.

@@ -63,6 +63,17 @@ function of its inputs alone: reading `admit_session()` does not tell you what h
 unless you also read what each verdict means. The docstring is written to answer that in the first
 ten lines, and every verdict has a test asserting the job's row afterwards.
 
+**The `DUPLICATE` check narrows the double-session window; it does not close it, and the handler
+owns what is left.** It reads committed state, so it only sees a session the first worker has
+already committed — and the scenario the fenced-lease ADR describes is a worker that is slow rather
+than dead, which reaches `complete()` and learns *there* that its lease expired. `LeaseLost` rolls
+that transaction back, so a `devin_session_id` written inside it never commits, and the reclaimer
+reads `None` and posts again. **The handler must therefore commit the session id on its own, as
+soon as the `POST` returns and before it does anything else**; how wide the remaining window is, is
+decided by that commit and by nothing in this module. Closing it entirely is not available to
+either of us — v3 takes no idempotency token, which is why that ADR names the handler's own check
+as the mitigation rather than a fix.
+
 **What would tell us this was wrong:** a second caller wanting the decision without the writes — a
 dry run, a dashboard panel showing what the policy would do — which would mean the evaluation and
 the enforcement want separating; or a deferral loop long enough to matter, which would mean the
