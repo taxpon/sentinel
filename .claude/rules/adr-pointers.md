@@ -26,6 +26,7 @@ paths:
   - "scripts/seed_issues.py"
   - "scripts/session_context.py"
   - "src/sentinel/analytics/metrics.py"
+  - "src/sentinel/api/analytics.py"
   - "src/sentinel/api/webhooks.py"
   - "src/sentinel/config.py"
   - "src/sentinel/devin/client.py"
@@ -81,6 +82,7 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `scripts/seed_issues.py` — [Single-file scripts declare the same Python floor as the project](../../docs/adr/2026-08-08-scripts-declare-the-projects-python-floor.md)
 - `scripts/session_context.py` — [Single-file scripts declare the same Python floor as the project](../../docs/adr/2026-08-08-scripts-declare-the-projects-python-floor.md)
 - `src/sentinel/analytics/metrics.py` — [Record every state transition as an append-only event](../../docs/adr/2026-08-07-transitions-are-append-only-events.md), [ACU totals are summed from the window's remediations, and cost.source reports ledger coverage](../../docs/adr/2026-08-08-acu-totals-are-summed-from-remediations-and-labelled-by-ledger-coverage.md), [A published percentile is an observed duration, taken at the nearest rank](../../docs/adr/2026-08-08-percentiles-are-nearest-rank-observations.md), [The window selects remediations by labeled_at, and every figure is computed over that set](../../docs/adr/2026-08-08-the-window-selects-remediations-by-labeled-at.md)
+- `src/sentinel/api/analytics.py` — [The analytics API serves the metrics module's own schema rather than restating it](../../docs/adr/2026-08-08-the-metrics-module-is-the-published-schema.md)
 - `src/sentinel/api/webhooks.py` — [Acknowledge webhooks with 202 before making any external call](../../docs/adr/2026-08-07-respond-202-before-external-calls.md)
 - `src/sentinel/config.py` — [Hold credentials as SecretStr and rewrite configuration errors before raising them](../../docs/adr/2026-08-08-credentials-are-secretstr-and-config-errors-are-rewritten.md)
 - `src/sentinel/devin/client.py` — [Use the Devin v3 API exclusively](../../docs/adr/2026-08-07-devin-v3-only.md), [Enterprise degradation is a returned value, not an exception](../../docs/adr/2026-08-08-enterprise-degradation-is-a-returned-value.md), [The Devin client composes the create-session body itself](../../docs/adr/2026-08-08-the-client-composes-the-session-request.md)
