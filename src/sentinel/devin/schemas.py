@@ -299,14 +299,30 @@ class Consumption(BaseModel):
 
 
 class SessionMetrics(BaseModel):
-    """The body of `GET /v3/enterprise/metrics/sessions` — the two aggregates B5 names, which the
-    dashboard prefers over the ones Sentinel derives from its own tables."""
+    """The body of `GET /v3/enterprise/metrics/sessions` — the aggregates B5 names, which the
+    dashboard prefers over the ones Sentinel derives from its own tables.
+
+    *Unverified* (B8): the spec asks for "merged-PR and ACU aggregates" and B5 names the two
+    figures, but no credential exists to check the field names against, and this is the one model
+    here whose names were invented rather than quoted. Aliases cover the spellings the same figure
+    plausibly arrives under; a body that still does not parse degrades the panel to the derived
+    figures rather than failing the request, which is the whole point of the capability being
+    optional.
+    """
 
     model_config = ConfigDict(frozen=True)
 
-    sessions_with_merged_prs_count: int
-    avg_acus_per_session: float
-    sessions_count: int | None = None
+    sessions_with_merged_prs_count: int = Field(
+        validation_alias=AliasChoices(
+            "sessions_with_merged_prs_count", "sessions_with_merged_prs", "merged_pr_count"
+        )
+    )
+    avg_acus_per_session: float = Field(
+        validation_alias=AliasChoices("avg_acus_per_session", "average_acus_per_session")
+    )
+    sessions_count: int | None = Field(
+        default=None, validation_alias=AliasChoices("sessions_count", "total_sessions")
+    )
 
 
 # --- Degradation ----------------------------------------------------------------------------------
@@ -352,6 +368,12 @@ class Unavailability(StrEnum):
 
     NOT_FOUND = "not_found"
     """`404` — the endpoint is not exposed to this organisation."""
+
+    UNREADABLE = "unreadable"
+    """Devin answered, and the body is not one the model accepts. On these two endpoints — and only
+    these — that degrades rather than raising: their field names are unverified until B8 is
+    resolved, so a name guessed wrong is the likeliest way for them to fail, and the spec's answer
+    to an unavailable capability is a labelled fallback rather than a panel that errors."""
 
 
 @dataclass(frozen=True, slots=True)

@@ -12,22 +12,29 @@ What this module decides, so that no caller has to:
   `playbooks.py` — prompt, title, tags, playbook id, ACU cap, structured-output schema. The tag set
   in particular is built through `session_tags`, never assembled by a caller: a tag outside the
   registered vocabulary is a `422` at creation (B7), and this is where that is made impossible
-  rather than unlikely.
+  rather than unlikely. Tags that are not a session's go through `registered_tag` instead, which
+  applies the vocabulary Devin was given rather than the stricter rule a session needs.
 - **What is worth retrying.** `429` and `5xx` and a connection that never answered are retried with
   exponential backoff and jitter, honouring `Retry-After`. Every other `4xx` raises immediately —
   a body Devin rejected as malformed will not become well-formed, and retrying it only spends
   quota. The exception carries the response body, which `docs/06-event-pipeline.md` records in
   `remediation_event.detail`.
 - **What is a degradation rather than a failure.** The enterprise-scoped and consumption endpoints
-  answer `403` or `404` when the credentials do not carry the scope (B5, B6). Those become an
-  `Unavailable` the caller branches on, not an exception that fails a job. Everything else,
-  including `401`, raises: a rejected token is a fault to fix, not a capability to work around.
+  answer `403` or `404` when the credentials do not carry the scope (B5, B6), and their field names
+  are unverified until credentials exist (B8). A refusal, an absent enterprise id and a body that
+  does not parse all become an `Unavailable` the caller branches on, not an exception that fails a
+  job. Everything else, including `401`, raises: a rejected token is a fault to fix, not a
+  capability to work around.
 
 The token is a `SecretStr` and is read exactly once, into the `Authorization` header httpx masks in
 its own repr. It is not stored on this object, does not appear in `repr()`, and cannot reach an
 exception message — the messages are built from the method, the *templated* path and the response
-body. `docs/07-observability.md` requires the same of the logs, and the redaction processor in
-`observability/logging.py` enforces it independently.
+body, and a transport error is rendered as its exception *class*, because the exception itself
+renders the URL and a proxy URL can carry credentials. Nothing here logs a header or a request
+body, which is asserted on the event dict *before* the redaction processor in
+`observability/logging.py` runs: that processor is the second line of defence
+(`docs/07-observability.md`), and a test that only reads its output would hold this module to
+nothing.
 """
 
 from __future__ import annotations
@@ -45,7 +52,10 @@ from pydantic import BaseModel, ValidationError
 
 from sentinel.config import Settings
 from sentinel.devin.playbooks import (
+    NAMESPACE_TAG,
+    TAG_PREFIXES,
     IssueClass,
+    UnregisteredTag,
     acu_cap_for,
     initial_prompt,
     playbook_id_for,
@@ -122,6 +132,33 @@ wrong". `401` is deliberately absent: a rejected token is a misconfiguration tha
 and silently falling back to derived figures would hide it."""
 
 
+# --- Tags ----------------------------------------------------------------------------------------
+
+
+def registered_tag(tag: str) -> str:
+    """Return `tag` if the organisation's *registered vocabulary* accepts it.
+
+    There are two rules, and they are not the same one. `playbooks.validate_tag` is the **session**
+    rule: it additionally requires a `class:` value to name an issue class Sentinel handles, because
+    a session created for a class with no playbook is a remediation nothing downstream can finish.
+    What is registered with Devin is only the namespace tag and the bare prefixes of
+    `TAG_PREFIXES`, which is a wider net: Devin accepts any value behind a registered prefix.
+
+    The difference is not hypothetical: `docs/05-devin-integration.md#scheduled-sweep` tags the
+    nightly sweep `class:scheduled-sweep`, which Devin accepts and `validate_tag` rejects, because
+    the sweep is not a remediation and "scheduled-sweep" is not an issue class. Anything that is not
+    creating a session is checked here instead.
+
+    Derived from the same two exports the bootstrap registration sends, so the check and the
+    registration cannot drift apart.
+    """
+    prefix, separator, value = tag.partition(":")
+    if tag == NAMESPACE_TAG or (separator and value and prefix in TAG_PREFIXES):
+        return tag
+    known = ", ".join([NAMESPACE_TAG, *(f"{name}:" for name in TAG_PREFIXES)])
+    raise UnregisteredTag(f"tag {tag!r} is outside the vocabulary; registered: {known}")
+
+
 # --- Errors --------------------------------------------------------------------------------------
 
 
@@ -178,14 +215,23 @@ class DevinResponseError(DevinError):
 class RetryPolicy:
     """Exponential backoff with jitter, as `docs/05-devin-integration.md#client-behaviour` states.
 
-    Bounded and short by design. The job queue retries too, over minutes and with the attempt count
-    persisted (`docs/06-event-pipeline.md#reliability`); this layer is only for the rate limit and
-    the blip that would otherwise cost a whole job attempt.
+    Bounded and short by design. The job queue retries too, with its attempt count persisted and
+    `run_after` growing from ten seconds to ten minutes
+    (`docs/06-event-pipeline.md#reliability-policy`); this layer only absorbs the rate limit and the
+    blip that would otherwise cost a whole job attempt, and hands everything else back.
+
+    `max_total_delay` is what makes that bound a wall-clock one. `max_delay` caps a *single* sleep,
+    so the total spent waiting is only bounded by it because `attempts` happens to be small — and a
+    `Retry-After` of an hour, or an attempt count raised later, would quietly turn a job into a
+    lease that expires while it is still sleeping. With the defaults the worst case is
+    `attempts * TIMEOUT + max_total_delay` = 3 * 30 s + 60 s = 150 s, against a
+    `JOB_LEASE_TIMEOUT_SECONDS` of 900.
     """
 
     attempts: int = 3
     base_delay: float = 0.5
     max_delay: float = 30.0
+    max_total_delay: float = 60.0
 
     def __post_init__(self) -> None:
         if self.attempts < 1:
@@ -357,11 +403,16 @@ class DevinClient:
 
         `tags` filters server-side where the organisation supports it; every session Sentinel
         creates carries the `sentinel` namespace tag, which is what makes ours findable among an
-        organisation's own.
+        organisation's own. Filters are checked against the registered vocabulary rather than the
+        session rule: `class:scheduled-sweep` is a legitimate thing to search for.
+
+        *Unverified* (B8): there is no pagination. The spec documents neither a cursor nor a page
+        size, so a `limit` is passed through and one page is returned; a backfill over an
+        organisation with more sessions than that would silently see only the first page.
         """
         params: dict[str, Any] = {}
         if tags:
-            params["tags"] = ",".join(validate_tag(tag) for tag in tags)
+            params["tags"] = ",".join(registered_tag(tag) for tag in tags)
         if limit is not None:
             params["limit"] = limit
         payload = await self._request("GET", SESSIONS, params=params, path=self._org())
@@ -434,7 +485,7 @@ class DevinClient:
                 "schedule_type": schedule_type,
                 "frequency": frequency,
                 "prompt": prompt,
-                "tags": [validate_tag(tag) for tag in tags],
+                "tags": [registered_tag(tag) for tag in tags],
                 "notify_on": notify_on,
             },
             path=self._org(),
@@ -448,6 +499,12 @@ class DevinClient:
 
         Degrades to `Unavailable` when the organisation does not expose consumption; the caller
         sums `acus_consumed` across sessions instead.
+
+        *Unverified* (B8): no window parameters are sent, because the spec does not document any —
+        so what comes back is whatever window Devin considers current, and `acus_on(today)` is only
+        the day's spend if that window includes today. This is the one ambiguity here that fails
+        *silently* — a different default window feeds the budget guard a wrong number rather than
+        raising — so confirm it against a real response before the guard is trusted to stop work.
         """
         return await self._degradable(
             Capability.ACU_SPEND, "GET", CONSUMPTION_DAILY, Consumption, path=self._org()
@@ -480,6 +537,15 @@ class DevinClient:
         model: type[M],
         path: PathParams | None = None,
     ) -> Degradable[M]:
+        """One optional capability: parsed, or the reason it could not be served.
+
+        A body that does not parse degrades here, where a session that does not parse raises. The
+        asymmetry is deliberate. These two endpoints are the ones whose field names the spec does
+        not give and no credentials exist to check against (B8), so the likeliest way for them to
+        fail is a name we guessed wrong — and the spec's answer to "this capability is not
+        available" is a labelled fallback, not a dashboard that errors. A session is the opposite:
+        there is no fallback for one, and a report that does not parse must escalate.
+        """
         try:
             payload = await self._request(method, endpoint, path=path)
         except DevinAPIError as exc:
@@ -487,13 +553,17 @@ class DevinClient:
             if reason is None:
                 raise
             return self._unavailable(capability, reason, exc.status_code)
-        return Available(self._parse(model, payload, method, endpoint))
+        try:
+            return Available(self._parse(model, payload, method, endpoint))
+        except DevinResponseError as exc:
+            return self._unavailable(capability, Unavailability.UNREADABLE, detail=str(exc))
 
     def _unavailable(
         self,
         capability: Capability,
         reason: Unavailability,
         status_code: int | None = None,
+        detail: str | None = None,
     ) -> Unavailable:
         result = Unavailable(capability=capability, reason=reason, status_code=status_code)
         log.warning(
@@ -501,6 +571,7 @@ class DevinClient:
             capability=capability.value,
             reason=reason.value,
             status=status_code,
+            detail=detail,
             fallback=result.fallback,
         )
         return result
@@ -520,6 +591,7 @@ class DevinClient:
         here use the template, so no session id reaches a Prometheus label or an exception.
         """
         url = endpoint.format(**(path or {}))
+        waited = 0.0
         for attempt in range(1, self._retry.attempts + 1):
             started = time.perf_counter()
             try:
@@ -565,7 +637,8 @@ class DevinClient:
                 )
                 raise error
 
-            delay = self._delay(attempt, retry_after)
+            delay = self._delay(attempt, retry_after, waited)
+            waited += delay
             log.warning(
                 "devin.request.retry",
                 method=method,
@@ -577,18 +650,24 @@ class DevinClient:
             await self._sleep(delay)
         raise AssertionError("the retry loop returns or raises on its last attempt")
 
-    def _delay(self, attempt: int, retry_after: float | None) -> float:
-        """How long to wait before the next attempt.
+    def _delay(self, attempt: int, retry_after: float | None, waited: float) -> float:
+        """How long to wait before the next attempt, given how long this call has waited already.
 
         `Retry-After` wins when Devin sent one — it knows when the window resets and we do not —
         capped, so a header we misread cannot stall a worker indefinitely. Otherwise the delay is
         jittered across the top half of the exponential ceiling: enough spread to break up a burst
         of workers retrying together, without collapsing the backoff to nearly nothing.
+
+        Whichever it is, it is then clamped to what is left of `max_total_delay`, so the wall-clock
+        cost of one call is bounded by the policy rather than by the arithmetic happening to work
+        out at the current attempt count.
         """
         ceiling = self._retry.ceiling(attempt)
         if retry_after is not None:
-            return min(retry_after, self._retry.max_delay)
-        return self._rng.uniform(ceiling / 2, ceiling)
+            delay = min(retry_after, self._retry.max_delay)
+        else:
+            delay = self._rng.uniform(ceiling / 2, ceiling)
+        return max(0.0, min(delay, self._retry.max_total_delay - waited))
 
     def _observe(self, method: str, endpoint: str, outcome: DevinOutcome, elapsed: float) -> None:
         self._metrics.observe_devin_request(

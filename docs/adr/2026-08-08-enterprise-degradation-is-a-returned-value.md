@@ -4,7 +4,7 @@ status: accepted
 date: 2026-08-08
 type: architecture
 areas: [devin]
-tasks: [T11]
+tasks: [T11, T21, T25, T40]
 files: [src/sentinel/devin/client.py, src/sentinel/devin/schemas.py]
 specs: [docs/05-devin-integration.md]
 supersedes:
@@ -33,6 +33,13 @@ The two degradable endpoints return `Available[T] | Unavailable` rather than rai
 `404` become `Unavailable`, carrying the capability, the reason, the status and the fallback text
 of the spec's table. A missing `DEVIN_ENTERPRISE_ID` returns `Unavailable` without a request at
 all. Every other status raises `DevinAPIError` as elsewhere — `401` deliberately included.
+
+A body that does not parse degrades on these two endpoints and only these. Their field names are
+the ones the spec does not give and no credential exists to check (B8), so a name guessed wrong is
+their likeliest failure — and answering it with a labelled fallback is what the spec asks for,
+where answering it with an exception would turn an optional capability into a hard one. A session
+that does not parse still raises: there is no fallback for one, and a report that breaks the
+structured-output contract has to escalate.
 
 ## Alternatives considered
 
