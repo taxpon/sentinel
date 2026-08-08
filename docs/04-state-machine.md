@@ -11,6 +11,7 @@ stateDiagram-v2
     SESSION_CREATED --> RUNNING
     RUNNING --> PR_OPENED
     PR_OPENED --> CI_RUNNING
+    RUNNING --> CI_RUNNING : fix pushed
     CI_RUNNING --> CI_FAILED
     CI_RUNNING --> CI_PASSED
     CI_FAILED --> RUNNING : resume, cycle + 1
@@ -52,9 +53,9 @@ stateDiagram-v2
 | `QUEUED` | `BLOCKED` | Daily ACU budget exhausted, or issue class unrecognised | Comment on issue, add `needs-human` |
 | `SESSION_CREATED` | `RUNNING` | Poller sees status `running` | — |
 | `RUNNING` | `PR_OPENED` | `pull_request.opened` from Devin's bot, or `pull_requests[]` on the session | Link PR to remediation, set `pr_opened_at` |
-| `PR_OPENED` | `CI_RUNNING` | `check_suite.requested` on the head SHA | — |
-| `CI_RUNNING` | `CI_PASSED` | `check_suite.completed`, conclusion `success` | Set `ci_green_at` |
-| `CI_RUNNING` | `CI_FAILED` | `check_suite.completed`, conclusion `failure`/`timed_out` | Enqueue `resume_session` |
+| `PR_OPENED`, `RUNNING` | `CI_RUNNING` | `check_suite.requested` on the head SHA | — |
+| `CI_RUNNING`, `RUNNING` | `CI_PASSED` | `check_suite.completed`, conclusion `success` | Set `ci_green_at` |
+| `CI_RUNNING`, `RUNNING` | `CI_FAILED` | `check_suite.completed`, conclusion `failure`/`timed_out` | Enqueue `resume_session` |
 | **`CI_FAILED`** | **`RUNNING`** | Worker resumed the session | Fetch failing job logs, `POST /v3/…/messages`, increment `cycle`, append tag `cycle:N` |
 | `CI_PASSED` | `IN_REVIEW` | Entering `CI_PASSED` | Request review; post the structured-output summary as a PR comment |
 | `IN_REVIEW` | `CHANGES_REQUESTED` | `pull_request_review.submitted`, state `changes_requested` | Enqueue `resume_session` |
@@ -94,6 +95,10 @@ sequenceDiagram
         Note over API: state = CI_PASSED
     end
 ```
+
+The CI states are re-entered from `RUNNING`, not only from `PR_OPENED`: on the second and later
+passes round the loop the pull request already exists, so the check suite for the fix commit is
+observed while the session is running. `PR_OPENED` is entered once, when the pull request appears.
 
 The message states the failure and the goal; it does not prescribe the fix. Steering Devin
 line-by-line would defeat the purpose and is explicitly avoided ([05](./05-devin-integration.md)).

@@ -13,6 +13,7 @@ paths:
   - "src/sentinel/models.py"
   - "src/sentinel/pipeline/handlers.py"
   - "src/sentinel/pipeline/poller.py"
+  - "src/sentinel/pipeline/state.py"
   - "src/sentinel/policy/dedup.py"
   - "src/sentinel/queue.py"
   - "src/sentinel/security/hmac.py"
@@ -40,6 +41,7 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `src/sentinel/models.py` — [Record every state transition as an append-only event](../../docs/adr/2026-08-07-transitions-are-append-only-events.md)
 - `src/sentinel/pipeline/handlers.py` — [Resume the existing Devin session on CI failure rather than starting a new one](../../docs/adr/2026-08-07-reuse-resumable-sessions.md)
 - `src/sentinel/pipeline/poller.py` — [Drive the remediation state machine from a poller, not from Devin callbacks](../../docs/adr/2026-08-07-poller-drives-state-machine.md)
+- `src/sentinel/pipeline/state.py` — [Re-enter the CI states from RUNNING so the review-fix loop closes](../../docs/adr/2026-08-08-ci-states-re-entered-from-running.md), [Index the state machine by trigger, and keep the cycle limit inside it](../../docs/adr/2026-08-08-trigger-indexed-state-machine.md)
 - `src/sentinel/policy/dedup.py` — [Deduplicate at both the delivery and the remediation layer](../../docs/adr/2026-08-07-two-layer-deduplication.md)
 - `src/sentinel/queue.py` — [Use Postgres as the job queue instead of adding Redis](../../docs/adr/2026-08-07-postgres-as-job-queue.md)
 - `src/sentinel/security/hmac.py` — [Return a reason from signature verification instead of a boolean or an exception](../../docs/adr/2026-08-08-signature-verification-returns-a-reason.md)
