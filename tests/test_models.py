@@ -471,8 +471,14 @@ async def test_a_repo_wide_job_needs_no_remediation(session: AsyncSession) -> No
 
     assert job.remediation_id is None
     assert job.attempts == 0
+
     # `run_after` defaulting to now() is what makes a job with no backoff immediately claimable.
-    assert job.run_after <= datetime.datetime.now(datetime.UTC)
+    # Compared against the database's clock rather than this process's: `now()` is
+    # `transaction_timestamp()`, so within this transaction the two are the same instant by
+    # definition, whereas the host clock can sit microseconds behind the container's and make an
+    # otherwise-correct default look like a job scheduled for the future.
+    database_now = (await session.execute(text("SELECT now()"))).scalar_one()
+    assert job.run_after <= database_now
 
 
 async def test_the_documented_claim_statement_claims_one_pending_job(
