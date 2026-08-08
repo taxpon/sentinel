@@ -65,7 +65,7 @@ from sentinel.pipeline.handlers import (
     Context,
     escalation_comment,
 )
-from sentinel.pipeline.state import CYCLE_LIMIT_EXHAUSTED, State
+from sentinel.pipeline.state import CYCLE_LIMIT_EXHAUSTED, State, Trigger
 from sentinel.policy import BUDGET_EXHAUSTED
 from sentinel.queue import ClaimedJob, JobKind, JobStatus
 
@@ -265,6 +265,10 @@ def a_ci_job(**overrides: Any) -> dict[str, Any]:
         "html_url": f"https://github.com/{REPO}/actions/runs/{RUN_ID}/job/{CI_JOB_ID}",
         **overrides,
     }
+
+
+def a_pull_request(**overrides: Any) -> dict[str, Any]:
+    return {**github_payload("pull_request.opened")["pull_request"], **overrides}
 
 
 def a_review_comment(**overrides: Any) -> dict[str, Any]:
@@ -472,6 +476,49 @@ async def test_a_reclaimed_create_session_does_not_create_a_second_session(
     [job] = await job_rows(session_factory)
     assert job.status == JobStatus.DONE
     assert len(await event_rows(session_factory)) == 1
+
+
+async def test_a_session_created_for_a_remediation_cancelled_mid_flight_is_still_recorded(
+    context: Context,
+    seed: Seed,
+    enqueue: Enqueue,
+    claim: Claim,
+    devin_api: FakeAPI,
+    github_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The orphan branch, and the promise the docstring makes of it.
+
+    The remediation is cancelled *after* admission and *while* the `POST` is in flight, so the
+    session exists and its remediation is terminal. `devin_session_id` is written anyway: it is the
+    only record that the session exists at all, and the poller — which reads the column — is the
+    only thing that could ever observe it.
+    """
+    remediation_id = await a_create_job(seed, enqueue)
+    fake_issue(github_api)
+    fake_budget(devin_api)
+
+    async def cancel_it(request: httpx.Request) -> httpx.Response:
+        async with session_factory() as db:
+            await db.execute(
+                update(Remediation)
+                .where(Remediation.id == remediation_id)
+                .values(state=State.FAILED.value, blocked_reason="issue_closed")
+            )
+            await db.commit()
+        return httpx.Response(201, json=a_session_body())
+
+    devin_api.route("POST", SESSIONS).mock(side_effect=cancel_it)
+
+    await worker.run_job(context, await claim())
+
+    remediation = await remediation_row(session_factory, remediation_id)
+    assert remediation.devin_session_id == SESSION_ID, "an orphan session must still be recorded"
+    assert remediation.devin_session_url == SESSION_URL
+    assert remediation.state == State.FAILED, "the cancellation is not walked back"
+    assert await event_rows(session_factory) == [], "no transition happened"
+    [job] = await job_rows(session_factory)
+    assert job.status == JobStatus.DONE
 
 
 async def test_create_session_defers_at_the_concurrency_cap_without_calling_devin(
@@ -790,6 +837,127 @@ async def test_changes_requested_without_a_review_id_forwards_the_body_alone(
     assert github_api.sent("GET", REVIEW_COMMENTS) == []
 
 
+async def test_a_ci_job_claimed_after_a_walk_to_the_review_edge_sends_nothing(
+    context: Context,
+    seed: Seed,
+    enqueue: Enqueue,
+    claim: Claim,
+    devin_api: FakeAPI,
+    github_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The wrong-edge bug, as reported.
+
+    `CI_FAILED -> CI_PASSED -> IN_REVIEW -> CHANGES_REQUESTED` needs no `RUNNING` — all three are
+    legal, unabsorbed transitions. A `resume_session` enqueued by the check-suite failure and
+    claimed after that walk used to take the review branch and tell the session a reviewer had
+    requested changes, with nothing to act on.
+    """
+    remediation_id = await a_resume_job(
+        seed, enqueue, state=State.CHANGES_REQUESTED, payload={"head_sha": HEAD_SHA}
+    )
+    fake_ci(github_api)
+    fake_resume(devin_api)
+
+    await handlers.resume_session(context, await claim())
+
+    assert devin_api.sent("POST", MESSAGES) == [], "no message may be sent on the wrong edge"
+    assert devin_api.sent("POST", TAGS) == []
+    remediation = await remediation_row(session_factory, remediation_id)
+    assert (remediation.state, remediation.cycle) == (State.CHANGES_REQUESTED, 0)
+    assert await event_rows(session_factory) == []
+    [job] = await job_rows(session_factory)
+    assert job.status == JobStatus.DONE
+
+
+async def test_the_real_review_is_still_forwarded_after_a_stale_ci_job_is_dropped(
+    context: Context,
+    seed: Seed,
+    enqueue: Enqueue,
+    claim: Claim,
+    devin_api: FakeAPI,
+    github_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The harm that outlived the wrong message: the stale job left the remediation `RUNNING`, so
+    the real review's own job failed `is_legal` and was completed in silence."""
+    remediation_id = await a_resume_job(
+        seed, enqueue, state=State.CHANGES_REQUESTED, payload={"head_sha": HEAD_SHA}
+    )
+    await enqueue(
+        JobKind.RESUME_SESSION,
+        {"review_id": REVIEW_ID, "review_body": "Split this up."},
+        remediation_id,
+    )
+    fake_ci(github_api)
+    github_api.responds("GET", REVIEW_COMMENTS, json=[a_review_comment()])
+    fake_resume(devin_api)
+
+    await handlers.resume_session(context, await claim())
+    await handlers.resume_session(context, await claim(OTHER_WORKER))
+
+    message = devin_api.only("POST", MESSAGES).json["message"]
+    assert message.startswith(f"A reviewer requested changes on {PR_URL}.")
+    assert "Split this up." in message
+    assert "This still swallows the DB error." in message
+
+    remediation = await remediation_row(session_factory, remediation_id)
+    assert (remediation.state, remediation.cycle) == (State.RUNNING, 1), "exactly one lap"
+    assert [job.status for job in await job_rows(session_factory)] == [JobStatus.DONE] * 2
+
+
+@pytest.mark.parametrize(
+    ("state", "payload", "sends"),
+    [
+        (State.CI_FAILED, {"trigger": "check_suite_failed", "head_sha": HEAD_SHA}, True),
+        (State.CI_FAILED, {"trigger": "changes_requested", "review_id": REVIEW_ID}, False),
+        (State.CHANGES_REQUESTED, {"trigger": "changes_requested", "review_id": REVIEW_ID}, True),
+        (State.CHANGES_REQUESTED, {"trigger": "check_suite_failed", "head_sha": HEAD_SHA}, False),
+        # No declared trigger: the review evidence is the fallback. A check-suite failure carries
+        # none of it, and a review that carried none could not have said anything either.
+        (State.CHANGES_REQUESTED, {"review_body": "No."}, True),
+        (State.CHANGES_REQUESTED, {"review_id": REVIEW_ID}, True),
+        (State.CHANGES_REQUESTED, {"head_sha": HEAD_SHA}, False),
+        (State.CHANGES_REQUESTED, {}, False),
+        # An unrecognised trigger value falls through to the evidence rather than deciding on it.
+        (State.CHANGES_REQUESTED, {"trigger": "sunspots", "review_id": REVIEW_ID}, True),
+        (State.CI_FAILED, {}, True),
+    ],
+)
+async def test_the_declared_trigger_decides_the_edge_and_the_evidence_is_the_fallback(
+    state: State,
+    payload: dict[str, Any],
+    sends: bool,
+    context: Context,
+    seed: Seed,
+    enqueue: Enqueue,
+    claim: Claim,
+    devin_api: FakeAPI,
+    github_api: FakeAPI,
+) -> None:
+    await a_resume_job(seed, enqueue, state=state, payload=payload)
+    fake_ci(github_api)
+    github_api.responds("GET", f"{PULLS}/{PR_NUMBER}", json=a_pull_request())
+    github_api.responds("GET", REVIEW_COMMENTS, json=[])
+    fake_resume(devin_api)
+
+    await handlers.resume_session(context, await claim())
+
+    assert bool(devin_api.sent("POST", MESSAGES)) is sends
+
+
+def test_a_resume_job_is_stale_only_across_the_edge_it_was_enqueued_on() -> None:
+    """The predicate on its own, over the two loop states — no database, no HTTP."""
+    assert handlers.LOOP_TRIGGERS == {
+        State.CI_FAILED: Trigger.CHECK_SUITE_FAILED,
+        State.CHANGES_REQUESTED: Trigger.CHANGES_REQUESTED,
+    }
+    for state, trigger in handlers.LOOP_TRIGGERS.items():
+        assert not handlers.enqueued_on_another_edge(state, {"trigger": trigger.value})
+        other = next(t for t in handlers.LOOP_TRIGGERS.values() if t is not trigger)
+        assert handlers.enqueued_on_another_edge(state, {"trigger": other.value})
+
+
 async def test_the_cycle_limit_fails_the_remediation_without_another_message(
     context: Context,
     seed: Seed,
@@ -930,6 +1098,79 @@ async def test_a_remediation_moved_while_the_message_was_in_flight_is_not_walked
     remediation = await remediation_row(session_factory, remediation_id)
     assert (remediation.state, remediation.cycle) == (moved_to, 1)
     assert await event_rows(session_factory) == []
+    [job] = await job_rows(session_factory)
+    assert job.status == JobStatus.DONE
+
+
+async def test_a_cycle_spent_while_the_message_was_in_flight_still_escalates(
+    context: Context,
+    seed: Seed,
+    enqueue: Enqueue,
+    claim: Claim,
+    devin_api: FakeAPI,
+    github_api: FakeAPI,
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The second place the cycle limit is reached, and the one that used to fail silently.
+
+    Worker A sends its resume; its lease expires, B completes the lap, and a fresh check suite
+    fails back into `CI_FAILED` with the last cycle spent. A's `_record_resume` re-reads, passes
+    `is_legal`, and now yields `FAILED` — which must escalate like every other route to `FAILED`,
+    not just write the column.
+    """
+    remediation_id = await a_resume_job(seed, enqueue, payload={"head_sha": HEAD_SHA})
+    fake_ci(github_api)
+    devin_api.responds("POST", MESSAGES, 202)
+
+    async def spend_the_last_cycle(request: httpx.Request) -> httpx.Response:
+        async with session_factory() as db:
+            await db.execute(
+                update(Remediation)
+                .where(Remediation.id == remediation_id)
+                .values(cycle=settings.max_fix_cycles)
+            )
+            await db.commit()
+        return httpx.Response(202)
+
+    devin_api.route("POST", TAGS).mock(side_effect=spend_the_last_cycle)
+
+    await worker.run_job(context, await claim())
+
+    remediation = await remediation_row(session_factory, remediation_id)
+    assert remediation.state == State.FAILED
+    assert remediation.blocked_reason == CYCLE_LIMIT_EXHAUSTED
+    assert remediation.closed_at is not None
+
+    resumed, escalation = await job_rows(session_factory)
+    assert resumed.status == JobStatus.DONE
+    assert escalation.kind == JobKind.ESCALATE, "a FAILED remediation must reach a human"
+    assert escalation.payload["reason"] == CYCLE_LIMIT_EXHAUSTED
+
+
+async def test_a_malformed_review_id_degrades_like_an_absent_one(
+    context: Context,
+    seed: Seed,
+    enqueue: Enqueue,
+    claim: Claim,
+    devin_api: FakeAPI,
+    github_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`int("none")` would raise, and `ValueError` is not permanent — so the remediation would be
+    retried five times and then failed over a payload value."""
+    await a_resume_job(
+        seed,
+        enqueue,
+        state=State.CHANGES_REQUESTED,
+        payload={"review_id": "not-an-id", "review_body": "Please split this."},
+    )
+    fake_resume(devin_api)
+
+    await worker.run_job(context, await claim())
+
+    assert "Please split this." in devin_api.only("POST", MESSAGES).json["message"]
+    assert github_api.sent("GET", REVIEW_COMMENTS) == []
     [job] = await job_rows(session_factory)
     assert job.status == JobStatus.DONE
 
@@ -1300,6 +1541,46 @@ async def test_a_rejected_body_fails_immediately(
     [event] = await event_rows(session_factory)
     assert event.kind == "error"
     assert event.detail["job_kind"] == JobKind.CREATE_SESSION
+
+
+async def test_a_github_4xx_fails_immediately_like_a_devin_one(
+    context: Context,
+    seed: Seed,
+    enqueue: Enqueue,
+    claim: Claim,
+    github_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The Non-retryable row applies to both APIs. The GitHub half is a different branch of
+    `_retryable` from the Devin half, and it is reached through a different exception type."""
+    remediation_id = await an_escalate_job(seed, enqueue, reason="session_error")
+    github_api.responds("POST", f"{ISSUE}/labels", 422, json={"message": "no such label"})
+
+    await worker.run_once(context, claimed_by=WORKER)
+
+    escalation = (await job_rows(session_factory))[0]
+    assert escalation.status == JobStatus.FAILED
+    assert escalation.attempts == 1, "a 4xx must not be retried"
+    assert "no such label" in (escalation.last_error or "")
+    assert (await remediation_row(session_factory, remediation_id)).state == State.FAILED
+
+
+async def test_a_github_404_is_not_retried_either(
+    context: Context,
+    seed: Seed,
+    enqueue: Enqueue,
+    claim: Claim,
+    github_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await an_escalate_job(seed, enqueue, reason="session_error")
+    github_api.responds("POST", f"{ISSUE}/labels", 404, json={"message": "Not Found"})
+
+    await worker.run_once(context, claimed_by=WORKER)
+
+    escalation = (await job_rows(session_factory))[0]
+    assert escalation.status == JobStatus.FAILED
+    assert escalation.attempts == 1
 
 
 async def test_the_last_attempt_takes_the_remediation_with_it(

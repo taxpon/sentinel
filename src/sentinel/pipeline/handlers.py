@@ -44,14 +44,21 @@ commit. v3 takes no idempotency token, so nothing available to Sentinel closes t
 
 `CI_FAILED → RUNNING` and `CHANGES_REQUESTED → RUNNING` both resume the **existing** session
 (`docs/adr/2026-08-07-reuse-resumable-sessions.md`) — a new one would rediscover context already
-paid for. Which of the two edges a job is on is read from the remediation's state and not from the
-payload; see `docs/adr/2026-08-08-the-resume-edge-is-read-from-the-state.md`. The payload carries
-only the facts the database does not hold, and every one of them is optional because every one of
-them has an answer in GitHub or a parenthetical in the prompt templates:
+paid for. Which of the two edges a job is on is read from the remediation's state, and **checked
+against the payload**, because a remediation can walk from one loop state to the other without
+passing through `RUNNING`: `CI_FAILED → CI_PASSED → IN_REVIEW → CHANGES_REQUESTED` is three legal
+transitions in `docs/04-state-machine.md`'s own diagram. A job the remediation has walked away from
+is stale and is dropped rather than sent on the wrong edge — `enqueued_on_another_edge`, and
+`docs/adr/2026-08-08-the-resume-edge-is-read-from-the-state.md`.
+
+The payload carries the facts the database does not hold. Every key has a defined absence, because
+every one of them has an answer in GitHub or a parenthetical in the prompt templates — a malformed
+value is treated as an absent one for the same reason:
 
 | Key | Kind | Used for |
 |---|---|---|
 | `delivery_id` | `create_session` | The `run:<delivery_id>` correlation tag. **Required** |
+| `trigger` | `resume_session` | Which edge the job was enqueued on, for the staleness check |
 | `head_sha` | `resume_session` | The commit CI failed on; falls back to the pull request's head |
 | `review_id` | `resume_session` | Fetching the reviewer's inline comments |
 | `review_body` | `resume_session` | The review's own text, which arrives on the webhook |
@@ -64,7 +71,14 @@ two of the reasons that reach `FAILED` are a maintainer removing the label or cl
 (`docs/adr/2026-08-08-cancellation-is-recorded-as-failed.md`). Stamping `needs-human` on an issue
 somebody has just deliberately closed is telling a person to look at the thing they were looking at
 when they called it off, so those two reasons are suppressed. The transition is still recorded and
-still visible on the dashboard.
+still visible on the dashboard. Closing the *pull request* unmerged is deliberately not suppressed —
+`docs/adr/2026-08-09-an-abandoned-pull-request-still-escalates.md` says why.
+
+**The cancellation record is not in this tree yet.** It arrives with the mapping module that
+produces those reasons, on `task/T20-events` (PR #71), which names this task in its front matter.
+The two obligations it places here — reading the reason from `remediation.blocked_reason`, and
+suppressing the escalation for those reasons — are met below. Until #71 merges, every citation of it
+in this module resolves to nothing.
 """
 
 from __future__ import annotations
@@ -143,6 +157,24 @@ for the same reason `NO_LOG_OUTPUT` is: the absence of evidence is itself worth 
 TRANSITION_EVENT: Final = "transition"
 ERROR_EVENT: Final = "error"
 """`remediation_event.kind` values from the vocabulary in `docs/03-data-model.md`."""
+
+LOOP_TRIGGERS: Final[Mapping[State, Trigger]] = {
+    State.CI_FAILED: Trigger.CHECK_SUITE_FAILED,
+    State.CHANGES_REQUESTED: Trigger.CHANGES_REQUESTED,
+}
+"""Which trigger puts a remediation into each loop state — the edge a resume job was enqueued on.
+
+`resume_session` is enqueued by exactly these two transitions (`docs/04-state-machine.md`), so the
+trigger and the state are the same fact seen from either end. `enqueued_on_another_edge` compares
+them to find a job the remediation has walked away from.
+"""
+
+LOOP_TRIGGER_VALUES: Final[frozenset[str]] = frozenset(
+    trigger.value for trigger in LOOP_TRIGGERS.values()
+)
+
+REVIEW_KEYS: Final[tuple[str, ...]] = ("review_id", "review_body")
+"""The payload keys only a `pull_request_review.submitted` delivery can supply."""
 
 MAX_ERROR_LENGTH: Final = 2000
 """How much of a failure is kept on `job.last_error` and in the event detail."""
@@ -341,11 +373,13 @@ async def resume_session(context: Context, job: ClaimedJob) -> None:
 async def _plan_resume(context: Context, job: ClaimedJob) -> _Resume | None:
     """Decide whether this resume may happen, and on which edge — or release the job and return.
 
-    Three of the four outcomes end here without a message being sent:
+    Four of the five outcomes end here without a message being sent:
 
     - the remediation is terminal, cancelled while the job waited in the queue;
     - it is already `RUNNING`, because an earlier run of this handler committed its transition and
       then lost its lease — which is exactly what that ordering exists to make detectable;
+    - it has walked to the *other* loop edge since this job was enqueued, so this job is stale and a
+      fresher one exists — `enqueued_on_another_edge` below;
     - `cycle` is spent, and `docs/06-event-pipeline.md` says `cycle > MAX_FIX_CYCLES` is `FAILED`
       rather than another lap.
 
@@ -361,25 +395,23 @@ async def _plan_resume(context: Context, job: ClaimedJob) -> _Resume | None:
             log.info("worker.resume.skipped", state=remediation.state, job_id=job.id)
             return None
 
-        outcome = _resume_transition(remediation, context.settings)
-        if outcome.to_state is not State.RUNNING:
-            await fail_remediation(
-                db,
-                remediation,
-                reason=outcome.reason or CYCLE_LIMIT_EXHAUSTED,
-                detail={
-                    "cycle": remediation.cycle,
-                    "max_fix_cycles": context.settings.max_fix_cycles,
-                },
-            )
+        if enqueued_on_another_edge(state, job.payload):
             await queue.complete(db, job)
             await db.commit()
             log.warning(
-                "worker.resume.cycle_limit",
-                cycle=remediation.cycle,
-                max_fix_cycles=context.settings.max_fix_cycles,
+                "worker.resume.wrong_edge",
+                state=remediation.state,
+                job_id=job.id,
+                payload_keys=sorted(job.payload),
                 issue=remediation.issue_number,
             )
+            return None
+
+        outcome = _resume_transition(remediation, context.settings)
+        if outcome.to_state is not State.RUNNING:
+            await _fail_for_cycle_limit(db, remediation, outcome, context.settings)
+            await queue.complete(db, job)
+            await db.commit()
             return None
 
         plan = _Resume(
@@ -418,10 +450,10 @@ async def _resume_message(context: Context, job: ClaimedJob, plan: _Resume) -> s
 
     # The review's body arrives on the webhook and is carried in the payload; the inline comments do
     # not, and a review can request changes with an empty body and say everything on the diff.
-    review_id = job.payload.get("review_id")
+    review_id = _whole_number(job.payload.get("review_id"))
     comments: Sequence[ReviewComment] = ()
     if review_id is not None:
-        comments = await context.github.get_review_comments(plan.pr_number, int(review_id))
+        comments = await context.github.get_review_comments(plan.pr_number, review_id)
     return changes_requested_message(
         pr_url=plan.pr_url,
         review_body=_text(job.payload.get("review_body")),
@@ -466,11 +498,17 @@ async def _record_resume(context: Context, job: ClaimedJob) -> None:
             return
 
         outcome = _resume_transition(remediation, context.settings)
+        if outcome.to_state is not State.RUNNING:
+            # The cycle was spent between the plan and here — another worker completed a lap while
+            # this message was in flight. `fail_remediation` rather than the columns by hand,
+            # because `FAILED` has to escalate: writing the state without the `escalate` job is a
+            # remediation that dies with nobody told (`docs/04-state-machine.md#escalation`).
+            await _fail_for_cycle_limit(db, remediation, outcome, context.settings)
+            await db.commit()
+            return
+
         remediation.state = str(outcome.to_state)
         remediation.cycle = outcome.cycle
-        if outcome.to_state is State.FAILED:
-            remediation.blocked_reason = outcome.reason
-            remediation.closed_at = _now()
         db.add(_event(remediation, outcome, {"cycle": outcome.cycle}))
         await db.commit()
         log.info(
@@ -479,6 +517,70 @@ async def _record_resume(context: Context, job: ClaimedJob) -> None:
             to_state=str(outcome.to_state),
             issue=remediation.issue_number,
         )
+
+
+async def _fail_for_cycle_limit(
+    db: AsyncSession, remediation: Remediation, outcome: Transition, settings: Settings
+) -> None:
+    """`cycle > MAX_FIX_CYCLES`: fail the remediation and escalate it, in the caller's transaction.
+
+    Both places the cycle limit can be reached share this — before the message is sent, and again
+    after it, where another worker may have spent the last cycle while this one was in flight. The
+    second is the easier of the two to write without the escalation, which is why neither writes the
+    columns itself.
+    """
+    await fail_remediation(
+        db,
+        remediation,
+        reason=outcome.reason or CYCLE_LIMIT_EXHAUSTED,
+        detail={"cycle": remediation.cycle, "max_fix_cycles": settings.max_fix_cycles},
+    )
+    log.warning(
+        "worker.resume.cycle_limit",
+        cycle=remediation.cycle,
+        max_fix_cycles=settings.max_fix_cycles,
+        issue=remediation.issue_number,
+    )
+
+
+def enqueued_on_another_edge(state: State, payload: Mapping[str, Any]) -> bool:
+    """Whether this resume job was enqueued for the loop edge the remediation is *no longer* on.
+
+    A remediation can walk from `CI_FAILED` to `CHANGES_REQUESTED` without passing through
+    `RUNNING`, and every step of it is in `docs/04-state-machine.md`'s own diagram:
+    `CI_FAILED → CI_PASSED → IN_REVIEW → CHANGES_REQUESTED`, none of them absorbed. A job enqueued
+    by the check-suite failure and claimed after that walk would otherwise be read as a review, and
+    tell the session a reviewer requested changes when none did — spending a fix cycle on nothing
+    and, worse, leaving the state `RUNNING` so the *real* review's resume job is discarded by
+    `is_legal` and the reviewer's feedback never reaches Devin. The crossing is one-directional:
+    `CHECK_SUITE_FAILED` absorbs from `CHANGES_REQUESTED`, so the reverse cannot happen.
+
+    Dropping the stale job loses nothing. Entering either loop state enqueues a `resume_session` of
+    its own (`docs/04-state-machine.md`), so a fresher job for the state the remediation is actually
+    in is already on the queue.
+
+    Two ways to tell, in order:
+
+    - **`payload["trigger"]`**, when the ingress names the trigger that enqueued the job. This is
+      the contract, it is exact, and it is the vocabulary the ingress already applies —
+      `check_suite_failed` or `changes_requested` from `sentinel.pipeline.state.Trigger`.
+    - **The review evidence**, when it does not. A `pull_request_review.submitted` delivery carries
+      the review id and body; a check-suite failure carries neither, and `docs/04-state-machine.md`
+      requires the review edge to forward "the body **and inline comments**". So a job that finds
+      `CHANGES_REQUESTED` carrying no trace of a review either came from the other edge or could not
+      have said anything anyway — the message it would send is the empty parenthetical.
+
+    The second is a fallback and is deliberately biased towards dropping: a remediation left in
+    `CHANGES_REQUESTED` with no pending job is recoverable and logs a warning per occurrence, while
+    a fabricated review message is unrecoverable — it burns a cycle and destroys the real job.
+    """
+    expected = LOOP_TRIGGERS[state]
+    declared = _text(payload.get("trigger"))
+    if declared in LOOP_TRIGGER_VALUES:
+        return declared != expected.value
+    if state is State.CHANGES_REQUESTED:
+        return not any(key in payload for key in REVIEW_KEYS)
+    return False
 
 
 def _resume_transition(remediation: Remediation, settings: Settings) -> Transition:
@@ -766,6 +868,27 @@ def _pull_request_url(remediation: Remediation) -> str:
 def _text(value: Any) -> str:
     """A payload field that should be a string, from JSONB that is entitled to hold anything."""
     return value.strip() if isinstance(value, str) else ""
+
+
+def _whole_number(value: Any) -> int | None:
+    """A payload field that should be an id, or `None` if it is not one.
+
+    `int(value)` would raise on a string JSONB is perfectly entitled to hold, and `ValueError` is
+    not in the worker's `PERMANENT` tuple — so a review id that arrived as `"none"` would be retried
+    five times and then fail the remediation. This is the one payload key whose absence already
+    degrades gracefully; a malformed one now degrades the same way, which is what the rest of
+    `docs/adr/2026-08-08-the-resume-edge-is-read-from-the-state.md` promises of every key.
+
+    `bool` is excluded because it is an `int` in Python and `True` is not a review id.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except TypeError, ValueError:
+        return None
 
 
 def describe_error(exc: BaseException) -> str:
