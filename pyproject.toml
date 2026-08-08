@@ -44,6 +44,10 @@ extend-exclude = [
     "scripts/gen_adr_index.py",
     "scripts/seed_issues.py",
     "scripts/session_context.py",
+    # Ruff formats fenced Python inside Markdown. Most such blocks under docs/ are *quotations* of
+    # code in other repositories, so reformatting one turns an accurate citation into a misquotation
+    # of a file the reader is expected to open and compare against.
+    "*.md",
 ]
 
 [tool.ruff.lint]
