@@ -22,6 +22,8 @@ paths:
   - "docs/adr/template.md"
   - "docs/tasks.yaml"
   - "pyproject.toml"
+  - "scripts/bootstrap_devin.py"
+  - "scripts/bootstrap_github.py"
   - "scripts/gen_adr_index.py"
   - "scripts/seed_issues.py"
   - "scripts/session_context.py"
@@ -33,6 +35,7 @@ paths:
   - "src/sentinel/devin/playbooks.py"
   - "src/sentinel/devin/schemas.py"
   - "src/sentinel/github/client.py"
+  - "src/sentinel/github/events.py"
   - "src/sentinel/models.py"
   - "src/sentinel/observability/logging.py"
   - "src/sentinel/observability/prom.py"
@@ -43,6 +46,7 @@ paths:
   - "src/sentinel/policy/budget.py"
   - "src/sentinel/policy/dedup.py"
   - "src/sentinel/queue.py"
+  - "src/sentinel/scanner/audit.py"
   - "src/sentinel/security/hmac.py"
   - "tests/conftest.py"
   - "tests/factories.py"
@@ -80,6 +84,8 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `docs/adr/template.md` — [Validate ADR front matter at generation time and refuse to write a partial index](../../docs/adr/2026-08-08-validate-adr-front-matter-at-generation.md)
 - `docs/tasks.yaml` — [Keep the task graph in one machine-readable file](../../docs/adr/2026-08-07-tasks-yaml-single-source.md)
 - `pyproject.toml` — [Manage dependencies with uv and a committed lock file](../../docs/adr/2026-08-07-uv-for-dependencies-and-the-image.md)
+- `scripts/bootstrap_devin.py` — [The bootstrap capability probe reports a refusal and fails on a fault](../../docs/adr/2026-08-08-a-refusal-is-reported-a-fault-is-not.md), [.env is the bootstrap script's record of what it created in the Devin organisation](../../docs/adr/2026-08-08-env-is-the-bootstrap-scripts-record.md)
+- `scripts/bootstrap_github.py` — [The bootstrap script talks to GitHub itself rather than through the pipeline's client](../../docs/adr/2026-08-08-the-bootstrap-script-does-not-borrow-the-pipelines-github-client.md), [The webhook is updated in place on every run, because its secret cannot be read back](../../docs/adr/2026-08-08-the-bootstrap-writes-the-webhook-secret-it-cannot-read.md), [Among several webhooks, the one already at the target URL is the one kept](../../docs/adr/2026-08-09-the-webhook-already-at-the-target-url-is-the-one-kept.md)
 - `scripts/gen_adr_index.py` — [Validate ADR front matter at generation time and refuse to write a partial index](../../docs/adr/2026-08-08-validate-adr-front-matter-at-generation.md)
 - `scripts/seed_issues.py` — [Single-file scripts declare the same Python floor as the project](../../docs/adr/2026-08-08-scripts-declare-the-projects-python-floor.md)
 - `scripts/session_context.py` — [Single-file scripts declare the same Python floor as the project](../../docs/adr/2026-08-08-scripts-declare-the-projects-python-floor.md)
@@ -90,7 +96,8 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `src/sentinel/devin/client.py` — [Use the Devin v3 API exclusively](../../docs/adr/2026-08-07-devin-v3-only.md), [Enterprise degradation is a returned value, not an exception](../../docs/adr/2026-08-08-enterprise-degradation-is-a-returned-value.md), [The Devin client composes the create-session body itself](../../docs/adr/2026-08-08-the-client-composes-the-session-request.md)
 - `src/sentinel/devin/playbooks.py` — [Give Devin the objective and constraints, not the steps](../../docs/adr/2026-08-07-delegate-task-not-steps.md), [Accept DEVIN_PLAYBOOK_IDS keyed by issue class or by playbook name](../../docs/adr/2026-08-08-playbook-ids-keyed-by-class-or-name.md), [Tell the session which fix cycle it is on and how many remain](../../docs/adr/2026-08-08-resume-messages-state-the-cycle-budget.md)
 - `src/sentinel/devin/schemas.py` — [Enterprise degradation is a returned value, not an exception](../../docs/adr/2026-08-08-enterprise-degradation-is-a-returned-value.md), [The Devin client composes the create-session body itself](../../docs/adr/2026-08-08-the-client-composes-the-session-request.md)
-- `src/sentinel/github/client.py` — [A GitHub rate-limit wait is bounded, and the remainder is handed back to the queue](../../docs/adr/2026-08-08-github-waits-are-bounded-and-handed-back-to-the-queue.md), [The CI excerpt comes from the earliest failing job of the latest failing run](../../docs/adr/2026-08-08-the-ci-excerpt-comes-from-the-earliest-failing-job.md)
+- `src/sentinel/github/client.py` — [A GitHub rate-limit wait is bounded, and the remainder is handed back to the queue](../../docs/adr/2026-08-08-github-waits-are-bounded-and-handed-back-to-the-queue.md), [The bootstrap script talks to GitHub itself rather than through the pipeline's client](../../docs/adr/2026-08-08-the-bootstrap-script-does-not-borrow-the-pipelines-github-client.md), [The CI excerpt comes from the earliest failing job of the latest failing run](../../docs/adr/2026-08-08-the-ci-excerpt-comes-from-the-earliest-failing-job.md)
+- `src/sentinel/github/events.py` — [Cancelling a remediation is recorded as FAILED with a cancellation reason](../../docs/adr/2026-08-08-cancellation-is-recorded-as-failed.md), [The mapping decides whether a delivery has a trigger to apply, not the caller](../../docs/adr/2026-08-08-the-mapping-decides-what-there-is-to-apply.md), [The poller links the pull request; pull_request.opened is recorded and dropped](../../docs/adr/2026-08-08-the-poller-links-the-pull-request.md)
 - `src/sentinel/models.py` — [Record every state transition as an append-only event](../../docs/adr/2026-08-07-transitions-are-append-only-events.md), [Build the test schema by running the migrations, and test for drift](../../docs/adr/2026-08-08-migrations-are-the-schema-tests-run-against.md)
 - `src/sentinel/observability/logging.py` — [Scrub credentials out of log values, not only out of fields named like credentials](../../docs/adr/2026-08-08-log-redaction-scrubs-values-not-only-keys.md)
 - `src/sentinel/observability/prom.py` — [Keep Prometheus metrics process-local and publish cross-process figures as snapshots](../../docs/adr/2026-08-08-metrics-are-process-local.md)
@@ -101,6 +108,7 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `src/sentinel/policy/budget.py` — [The budget guard spends against the highest figure any source reports](../../docs/adr/2026-08-08-the-budget-guard-spends-against-the-highest-figure-any-source-reports.md)
 - `src/sentinel/policy/dedup.py` — [Deduplicate at both the delivery and the remediation layer](../../docs/adr/2026-08-07-two-layer-deduplication.md)
 - `src/sentinel/queue.py` — [Use Postgres as the job queue instead of adding Redis](../../docs/adr/2026-08-07-postgres-as-job-queue.md), [Retry jitter takes away at most half the delay, so the ten-minute cap stays a ceiling](../../docs/adr/2026-08-08-equal-jitter-keeps-the-backoff-cap-a-ceiling.md), [One statement claims, un-defers and reclaims, and the lease it grants fences the release](../../docs/adr/2026-08-08-one-claim-statement-and-a-fenced-lease.md)
+- `src/sentinel/scanner/audit.py` — [The sweep resolves both ecosystems against OSV, from inside Sentinel](../../docs/adr/2026-08-08-both-ecosystems-are-resolved-against-osv.md), [The filed issue is the sweep's memory, and a closed one is a decision](../../docs/adr/2026-08-08-the-filed-issue-is-the-sweeps-memory.md), [The sweep files only advisories whose fix forces a decision, at most three a night](../../docs/adr/2026-08-08-the-sweep-files-only-what-forces-a-decision.md)
 - `src/sentinel/security/hmac.py` — [Return a reason from signature verification instead of a boolean or an exception](../../docs/adr/2026-08-08-signature-verification-returns-a-reason.md)
 - `tests/conftest.py` — [Build the test schema by running the migrations, and test for drift](../../docs/adr/2026-08-08-migrations-are-the-schema-tests-run-against.md), [Isolate tests by truncating between them, in the harness rather than in each test](../../docs/adr/2026-08-08-tests-are-isolated-by-the-harness.md)
 - `tests/factories.py` — [Isolate tests by truncating between them, in the harness rather than in each test](../../docs/adr/2026-08-08-tests-are-isolated-by-the-harness.md)
