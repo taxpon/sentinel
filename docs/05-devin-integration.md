@@ -36,7 +36,7 @@ as an enhancement, not a dependency — see [Degradation](#degradation) and
 | `title` | `[sentinel] #<issue> <issue title>` |
 | `tags` | The tag set below |
 | `repos` | `["taxpon/superset"]` |
-| `playbook_id` | `PLAYBOOK_IDS[issue_class]` |
+| `playbook_id` | `PLAYBOOK_IDS[issue_class]`, falling back to `PLAYBOOK_IDS[playbook_name]` — four playbooks serve eight classes, so either key resolves ([ADR](./adr/2026-08-08-playbook-ids-keyed-by-class-or-name.md)) |
 | `knowledge_ids` | The bootstrap note ids |
 | `structured_output_schema` | The schema below |
 | `structured_output_required` | `true` |
@@ -150,7 +150,8 @@ Constraints
     with a specific blocked_reason instead of forcing a change.
 ```
 
-Resume messages follow the same principle — state the new fact, restate the goal:
+Resume messages follow the same principle — state the new fact, restate the goal. CI failure, the
+first loop edge:
 
 ```
 CI failed on {sha}. Failing job: {job_name}.
@@ -159,6 +160,34 @@ CI failed on {sha}. Failing job: {job_name}.
 
 Diagnose the failure and push a fix to the same branch.
 ```
+
+A reviewer requesting changes is the second loop edge ([04](./04-state-machine.md)) and takes the
+same shape. Inline comments are forwarded along with the review body, because a review can request
+changes with an empty body and say everything on the diff:
+
+```
+A reviewer requested changes on {pr_url}.
+
+{review body, then inline comments}
+
+Address the review and push a fix to the same branch.
+```
+
+Both end with the same notice. The cycle is the one fact the session cannot observe for itself —
+Sentinel counts the cycles and enforces `MAX_FIX_CYCLES` outside Devin — and knowing the budget is
+what makes reporting `blocked` a real alternative to spending the last cycle on a guess
+([ADR](./adr/2026-08-08-resume-messages-state-the-cycle-budget.md)):
+
+```
+This is fix cycle {cycle} of {max_cycles}. If the goal cannot be reached within the
+remaining cycles, report outcome "blocked" with a specific blocked_reason rather
+than continuing.
+```
+
+Where a substitution would be empty, a parenthetical stands in rather than leaving a blank gap where
+the evidence belongs: `(No log output was captured for the failing job.)` for a job that failed
+before producing output, `(The reviewer left no written feedback.)` for a review with nothing
+written anywhere, and `(The issue has no description.)` for an issue filed with a title alone.
 
 ## Knowledge notes
 

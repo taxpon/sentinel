@@ -41,7 +41,7 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `src/sentinel/api/webhooks.py` — [Acknowledge webhooks with 202 before making any external call](../../docs/adr/2026-08-07-respond-202-before-external-calls.md)
 - `src/sentinel/config.py` — [Hold credentials as SecretStr and rewrite configuration errors before raising them](../../docs/adr/2026-08-08-credentials-are-secretstr-and-config-errors-are-rewritten.md)
 - `src/sentinel/devin/client.py` — [Use the Devin v3 API exclusively](../../docs/adr/2026-08-07-devin-v3-only.md)
-- `src/sentinel/devin/playbooks.py` — [Give Devin the objective and constraints, not the steps](../../docs/adr/2026-08-07-delegate-task-not-steps.md)
+- `src/sentinel/devin/playbooks.py` — [Give Devin the objective and constraints, not the steps](../../docs/adr/2026-08-07-delegate-task-not-steps.md), [Accept DEVIN_PLAYBOOK_IDS keyed by issue class or by playbook name](../../docs/adr/2026-08-08-playbook-ids-keyed-by-class-or-name.md), [Tell the session which fix cycle it is on and how many remain](../../docs/adr/2026-08-08-resume-messages-state-the-cycle-budget.md)
 - `src/sentinel/models.py` — [Record every state transition as an append-only event](../../docs/adr/2026-08-07-transitions-are-append-only-events.md)
 - `src/sentinel/observability/logging.py` — [Scrub credentials out of log values, not only out of fields named like credentials](../../docs/adr/2026-08-08-log-redaction-scrubs-values-not-only-keys.md)
 - `src/sentinel/observability/prom.py` — [Keep Prometheus metrics process-local and publish cross-process figures as snapshots](../../docs/adr/2026-08-08-metrics-are-process-local.md)

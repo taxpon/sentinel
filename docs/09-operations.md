@@ -23,7 +23,7 @@ canonical list.
 | `DEVIN_API_TOKEN` | ✓ | | Service-user token (`cog_` prefix) |
 | `DEVIN_ORG_ID` | ✓ | | `org-…` |
 | `DEVIN_ENTERPRISE_ID` | | | Enables the enterprise metrics panel; omit to use the fallback |
-| `DEVIN_PLAYBOOK_IDS` | ✓ | | JSON map of issue class → playbook id |
+| `DEVIN_PLAYBOOK_IDS` | ✓ | | JSON map of issue class → playbook id; a playbook name is also accepted as the key, so four entries suffice for the eight classes ([ADR](./adr/2026-08-08-playbook-ids-keyed-by-class-or-name.md)) |
 | `DEVIN_KNOWLEDGE_IDS` | | | JSON array, written by the bootstrap script |
 | `GITHUB_TOKEN` | ✓ | | Fine-grained PAT |
 | `GITHUB_WEBHOOK_SECRET` | ✓ | | Shared secret for HMAC verification |
