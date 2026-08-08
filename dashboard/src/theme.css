@@ -6,13 +6,14 @@
   --accent: #2f6feb;
   --accent-soft: #e8f0fe;
 
-  /* Ordinal, for stacked series only. Read through seriesColor() in api.ts. */
-  --series-1: #3b6fd4;
+  /* Ordinal, for stacked series only. Read through seriesColor() in api.ts. None of these is a
+     blue, so no class in a stacked bar can be mistaken for the one accent colour. */
+  --series-1: #2a9d8f;
   --series-2: #d98324;
-  --series-3: #3f8f68;
-  --series-4: #8a5cb8;
+  --series-3: #7b5ea7;
+  --series-4: #3f8f68;
   --series-5: #c25f5f;
-  --series-6: #3f8ba6;
+  --series-6: #5b6b7c;
 
   --bg: #f6f7f9;
   --surface: #ffffff;
@@ -107,10 +108,11 @@ h2 {
   gap: var(--gap);
 }
 
-/* The four KPI tiles sit on one row so they are above the fold at 1440x900. */
+/* The region, which holds one panel per module like every other slot. The KPI panel is a single
+   module owned by T31, so the four-across grid belongs inside it — see .kpi-tiles below. */
 .kpi-row {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--gap);
 }
 
@@ -141,10 +143,40 @@ h2 {
   margin-bottom: 6px;
 }
 
-/* The constraint the spec fixes: no chart taller than 240px. Panels size their chart to this. */
+/* The four KPI tiles, on one row so they are above the fold at 1440x900. Used by T31 inside the
+   KPI panel; here because the row is a layout constraint from the spec, not a panel detail. */
+.kpi-tiles {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--gap);
+}
+
+.kpi-tile {
+  min-width: 0;
+}
+
+/* The constraint the spec fixes: no chart taller than 240px. `overflow: hidden` makes it hold: a
+   chart asked to draw itself taller is clipped visibly rather than pushing the page down. */
 .chart-grid .panel__body {
   height: var(--chart-max-height);
   max-height: var(--chart-max-height);
+  overflow: hidden;
+}
+
+.panel__failed {
+  margin: 0;
+  color: var(--danger);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .slot-empty {
@@ -156,7 +188,7 @@ h2 {
 }
 
 @media (max-width: 1100px) {
-  .kpi-row {
+  .kpi-tiles {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 

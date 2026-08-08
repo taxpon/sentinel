@@ -1,6 +1,6 @@
 import { act, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import App, { type PanelRegistry } from './App'
+import App, { DISCOVERED_PANELS, isPanelModule, type PanelRegistry } from './App'
 import {
   POLL_INTERVAL_MS,
   type PanelModule,
@@ -14,6 +14,7 @@ const GENERATED_AT = Date.parse(summaryFixture.generated_at)
 
 afterEach(() => {
   vi.useRealTimers()
+  vi.restoreAllMocks()
 })
 
 /** Renders with the clock pinned to `generated_at`, so "updated Ns ago" is deterministic. */
@@ -39,6 +40,59 @@ function panel(title: string, slot: PanelSlot, order?: number): PanelModule {
     order,
   }
 }
+
+describe('panel discovery', () => {
+  it('accepts a well-formed module and rejects the ways one is malformed', () => {
+    const Component = () => null
+
+    expect(isPanelModule({ default: Component, slot: 'kpi', title: 'KPI' })).toBe(true)
+    expect(isPanelModule({ default: Component, slot: 'kpi', title: 'KPI', order: 2 })).toBe(true)
+
+    // The two shapes that type-check clean and then silently fail to appear: no `slot` export at
+    // all, and a `slot` that is a plain string the union would have rejected if it were annotated.
+    expect(isPanelModule({ default: Component, title: 'KPI' })).toBe(false)
+    expect(isPanelModule({ default: Component, slot: 'charts', title: 'KPI' })).toBe(false)
+
+    expect(isPanelModule({ slot: 'kpi', title: 'KPI' })).toBe(false)
+    expect(isPanelModule({ default: Component, slot: 'kpi' })).toBe(false)
+    expect(isPanelModule(undefined)).toBe(false)
+    expect(isPanelModule('./panels/Kpi.tsx')).toBe(false)
+  })
+
+  it('discovers only well-formed panel modules, and no test files', () => {
+    // Walks what the glob actually resolved. Vacuous until T31-T33 add files, and a failing guard
+    // for each of them from the moment they do.
+    for (const [path, module] of Object.entries(DISCOVERED_PANELS)) {
+      expect(path, `${path} is a test file and must not be mounted as a panel`).not.toMatch(
+        /\.test\.tsx$/,
+      )
+      expect(isPanelModule(module), `${path} does not export a component, a title and a slot`).toBe(
+        true,
+      )
+    }
+  })
+
+  it('names a module it cannot mount instead of dropping it', async () => {
+    await renderApp({
+      fetcher: resolving(),
+      panels: {
+        './panels/Kpi.tsx': panel('KPI', 'kpi'),
+        './panels/Broken.tsx': { default: () => null, title: 'Broken' } as unknown as PanelModule,
+        './panels/Typo.tsx': {
+          default: () => null,
+          slot: 'charts',
+          title: 'Typo',
+        } as unknown as PanelModule,
+      },
+    })
+
+    const alert = screen.getByText(/panels could not be mounted/)
+    expect(alert).toHaveTextContent('./panels/Broken.tsx')
+    expect(alert).toHaveTextContent('./panels/Typo.tsx')
+    // The working panel is unaffected.
+    expect(screen.getByLabelText('Key metrics')).toHaveTextContent('KPI sees ready')
+  })
+})
 
 describe('the shell', () => {
   it('renders the three regions panels mount into', async () => {
@@ -77,6 +131,35 @@ describe('the shell', () => {
     expect(screen.getByLabelText('Live remediations')).toHaveTextContent(
       'No table panels are mounted yet.',
     )
+  })
+
+  it('contains a panel that throws, and keeps the rest of the dashboard up', async () => {
+    // React logs the caught error; the test asserts the containment, not the console.
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const exploding: PanelModule = {
+      default: () => {
+        throw new Error('cannot read acus_per_merged_fix of undefined')
+      },
+      slot: 'chart',
+      title: 'Cost',
+    }
+
+    await renderApp({
+      fetcher: resolving(),
+      panels: {
+        './panels/Cost.tsx': exploding,
+        './panels/Funnel.tsx': panel('Funnel', 'chart'),
+        './panels/Kpi.tsx': panel('KPI', 'kpi'),
+      },
+    })
+
+    expect(screen.getByText('Cost panel failed.')).toBeInTheDocument()
+    // Everything the reader needs to tell whether the pipeline is running is still there.
+    expect(screen.getByRole('heading', { level: 1, name: 'Sentinel' })).toBeInTheDocument()
+    expect(document.querySelector('.freshness')).toHaveTextContent('updated 0s ago')
+    expect(screen.getByLabelText('Charts')).toHaveTextContent('Funnel sees ready')
+    expect(screen.getByLabelText('Key metrics')).toHaveTextContent('KPI sees ready')
   })
 
   it('passes the loading, empty and error state through to the panels', async () => {
@@ -174,6 +257,46 @@ describe('the freshness indicator', () => {
     expect(indicator()).toHaveTextContent('updated 31s ago')
     expect(indicator()).toHaveAttribute('data-stale', 'true')
     expect(indicator()).toHaveClass('freshness--stale')
+  })
+
+  it('announces staleness once, rather than announcing every tick of the clock', async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(summaryFixture)
+      .mockRejectedValue(new Error('offline'))
+    await renderApp({ fetcher })
+
+    // The visible label changes every second, so it must not be a live region itself.
+    expect(indicator()).not.toHaveAttribute('role', 'status')
+    const live = screen.getByRole('status')
+    expect(live).toBeEmptyDOMElement()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(31_000)
+    })
+    expect(live).toHaveTextContent('Analytics data is out of date.')
+
+    // Still one message a second later, not a new one per tick.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000)
+    })
+    expect(live).toHaveTextContent('Analytics data is out of date.')
+  })
+
+  it('goes amber on the local clock when the API timestamp is in the future', async () => {
+    // A payload stamped five minutes ahead, and then the poller dies.
+    const skewed = { ...summaryFixture, generated_at: new Date(GENERATED_AT + 300_000).toISOString() }
+    const fetcher = vi.fn().mockResolvedValueOnce(skewed).mockRejectedValue(new Error('offline'))
+    await renderApp({ fetcher })
+
+    expect(indicator()).toHaveTextContent('updated 0s ago')
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(45_000)
+    })
+
+    expect(indicator()).toHaveTextContent('updated 45s ago')
+    expect(indicator()).toHaveAttribute('data-stale', 'true')
   })
 
   it('says so, in amber, when no payload has ever arrived', async () => {

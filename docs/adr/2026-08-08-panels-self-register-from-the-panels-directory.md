@@ -36,9 +36,21 @@ Panels are placed in one of three slots — `kpi`, `chart`, `table` — matching
 spec fixes, and are ordered within a slot by `order`, ties broken by module path so the result does
 not depend on filesystem order.
 
-Every panel receives the whole `SummaryState` — `status`, `data` and `error` — not just the payload.
-When a poll fails the shell keeps the previous payload and reports `status: 'error'`, so a single
-failed request annotates a working dashboard rather than blanking it.
+Every panel receives the whole `SummaryState` — `status`, `data`, `error` and `receivedAt` — not
+just the payload. When a poll fails the shell keeps the previous payload and reports
+`status: 'error'`, so a single failed request annotates a working dashboard rather than blanking it.
+Panels decide what to draw with `showData(state)` instead of branching on `status`, so that all nine
+inherit one answer to "there is an error, and also usable data".
+
+Two guards come with the arrangement, because neither is free:
+
+- **The shape of a discovered module is checked at runtime**, by `isPanelModule` in the shell. A
+  module that fails is named on screen rather than vanishing.
+- **Each panel renders inside an error boundary.** The shell mounts components written by three
+  tasks it cannot see, so a render that throws costs that panel and nothing else.
+
+`useRemediations` runs the live table's `/api/remediations` rows on the same polling primitive, so
+the second endpoint the spec names does not become a second design.
 
 `App` also accepts the registry and the fetcher as props. That is how the component tests drive it,
 and it is the same seam `main.tsx` leaves at its defaults.
@@ -55,11 +67,17 @@ and it is the same seam `main.tsx` leaves at its defaults.
 ## Consequences
 
 The three panel tasks are genuinely independent: each adds files under `dashboard/src/panels/` and
-nothing else. The cost is one Vite-specific feature in the shell — the glob is resolved at build
-time, so a panel file that exports the wrong shape fails to compile rather than failing to appear,
-which is the right way round.
+nothing else.
 
-**What would tell us this was wrong:** a panel that needs data the summary endpoint does not carry —
-the live table's `/api/remediations` rows are already a second source. If more than one panel needs
-its own request, the shell should own that fetch too and widen the props, not push fetching back
-into the panels.
+The cost is that **the compiler does not enforce the contract**. `import.meta.glob<PanelModule>` is
+an assertion about what the glob returns; nothing connects `PanelModule` to any file in
+`src/panels/`. A module that exports no `slot`, or an unannotated `slot = 'charts'`, passes
+`tsc --noEmit` and then simply does not appear. That is why the check is a runtime one, and why a
+rejected module is announced rather than dropped — the failure it has to survive is a task adding a
+file that nobody else can see, and a panel silently missing from a dashboard is the one failure
+mode this design could otherwise hide.
+
+**What would tell us this was wrong:** a panel arriving in review that the shell rejected, and the
+author not having noticed. The on-screen notice is aimed at exactly that, and it is checked by a
+test that walks the real registry; if it still happens, the answer is a build-time check over
+`src/panels/`, not a return to a hand-maintained registry.
