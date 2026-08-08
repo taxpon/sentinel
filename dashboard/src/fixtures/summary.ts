@@ -227,5 +227,39 @@ export const unmergedSummaryFixture: AnalyticsSummary = {
     { reason: 'max_fix_cycles_exceeded', count: 1, issues: [41] },
   ],
   impact: { hours_saved: 0, assumption: 'baseline hours per issue class; see docs/05' },
+ * A busier window (T31). Added because one payload cannot show a formatting or an ordering defect:
+ * this one has durations that cross into days, a cost figure the API says is `derived`, and a
+ * `throughput` series whose days arrive out of order and whose issue classes differ from day to
+ * day. Every figure is internally consistent — `rates` match `funnel`, and the throughput counts
+ * sum to `funnel.merged` — so a panel can be asserted against the formulas in
+ * docs/07-observability.md rather than against itself.
+ */
+export const busyWindowSummaryFixture: AnalyticsSummary = {
+  window: { from: '2026-08-01T00:00:00Z', to: '2026-08-08T00:00:00Z' },
+  funnel: { labelled: 20, session_created: 19, pr_opened: 14, ci_green: 12, merged: 9 },
+  rates: { success: 0.45, merge: 0.643, autonomy: 0.444 },
+  durations_seconds: {
+    to_pr: { p50: 900, p90: 5400 },
+    to_merge: { p50: 93600, p90: 172800 },
+    review_latency: { p50: 45, p90: 3600 },
+  },
+  cost: {
+    acus_total: 240.5,
+    acus_per_merged_fix: 26.7,
+    usd_per_fix: 60.08,
+    unit_cost_usd: 2.25,
+    source: 'derived',
+  },
+  cycles: { mean: 1.4, distribution: { '0': 4, '1': 3, '2': 2 } },
+  throughput: [
+    { day: '2026-08-05', by_class: { 'flaky-test': 1, dependency: 3 } },
+    { day: '2026-08-03', by_class: { security: 2, 'flaky-test': 1 } },
+    { day: '2026-08-04', by_class: { security: 2 } },
+  ],
+  failures: [
+    { reason: 'requires_upstream_decision', count: 2, issues: [37, 44] },
+    { reason: 'ci_unfixable', count: 1, issues: [51] },
+  ],
+  impact: { hours_saved: 54.5, assumption: 'baseline hours per issue class; see docs/05' },
   generated_at: '2026-08-08T04:12:03Z',
 }
