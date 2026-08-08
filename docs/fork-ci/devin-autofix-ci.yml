@@ -1,0 +1,548 @@
+# ---------------------------------------------------------------------------
+# THIS WORKFLOW IS A DELIBERATE NARROWING OF THE CI SIGNAL.
+#
+# It is not, and does not claim to be, a full-suite validation of Superset. It
+# exists because CI is the feedback channel inside Sentinel's automated
+# review-fix loop: a check suite that takes tens of minutes makes the loop
+# undemonstrable, so the signal is traded down for latency on purpose.
+#
+# What it checks:   pre-commit on the changed files, pytest on the unit-test
+#                   paths mirroring the changed Python modules, and jest on the
+#                   frontend packages the diff touches.
+# What it does NOT: integration tests, e2e, Playwright, Storybook, Helm, Docker
+#                   builds, the frontend type-check, cross-Python-version runs,
+#                   and any test outside the packages the diff touches.
+#
+# A green run here means "nothing in the neighbourhood of this diff broke".
+# It does not mean "Superset is green". Never report it as the latter.
+# See docs/08-testing.md and docs/adr/2026-08-07-scoped-ci-on-the-fork.md in
+# the Sentinel repository.
+# ---------------------------------------------------------------------------
+name: Devin autofix CI
+
+on:
+  # Pull requests only. This workflow is a PR gate, not a branch guard; the
+  # inherited Superset workflows remain the record of master's health.
+  #
+  # No `paths:` filter, on purpose. Sentinel's state machine advances on
+  # `check_suite` events, and a workflow filtered out by path produces no check
+  # run at all — the remediation would sit in PR_OPENED with nothing to move it.
+  # Every pull request must produce a conclusion.
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+# A new push from Devin supersedes the run for the previous head SHA. The
+# superseded check suite belongs to the old SHA, which Sentinel is no longer
+# tracking, so cancelling it does not strand a remediation.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Resolve, once, what the diff makes worth running. Everything downstream is
+  # gated on this job's outputs so the expensive setup steps are only paid for
+  # when there is something for them to check.
+  # ---------------------------------------------------------------------------
+  scope:
+    name: Resolve scope from the diff
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    outputs:
+      changed_files: ${{ steps.diff.outputs.files }}
+      run_precommit: ${{ steps.diff.outputs.any_files }}
+      pytest_paths: ${{ steps.map.outputs.pytest_paths }}
+      jest_patterns: ${{ steps.map.outputs.jest_patterns }}
+      frontend: ${{ steps.map.outputs.frontend }}
+      helm: ${{ steps.map.outputs.helm }}
+      unscoped: ${{ steps.map.outputs.unscoped }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Full commit graph is needed to resolve the diff base, but blobs are
+          # fetched lazily — a name-only diff reads trees, not file contents,
+          # so a blobless clone is both correct here and far cheaper than a
+          # full history fetch of a repository this size.
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Determine changed files
+        id: diff
+        run: |
+          set -euo pipefail
+
+          # HEAD is the PR merge commit, so its first parent is the current tip
+          # of the base branch. github.event.pull_request.base.sha is NOT that:
+          # GitHub freezes it at PR creation, so on a long-lived branch the
+          # diff picks up every unrelated change the base has taken since.
+          base="$(git rev-parse HEAD^1 2>/dev/null || true)"
+
+          # Fail loud rather than quietly checking nothing: a workflow that
+          # reports success because it could not work out what changed is worse
+          # than one that fails.
+          if [ -z "${base}" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            echo "::error::Could not resolve the diff base (HEAD^1)."
+            exit 1
+          fi
+          echo "Diff base: ${base}"
+
+          # Deletions are dropped: nothing can be linted or imported from a path
+          # that no longer exists in the head tree.
+          git diff --name-only --diff-filter=ACMRT "${base}...HEAD" > changed_files.txt
+          echo "Changed files:"
+          cat changed_files.txt
+
+          if [ -s changed_files.txt ]; then
+            echo "any_files=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "any_files=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          {
+            echo "files<<__SENTINEL_EOF__"
+            cat changed_files.txt
+            echo "__SENTINEL_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      # The mapping is inline rather than a checked-in script so that this file
+      # is the whole of what has to be copied into the fork.
+      - name: Map changed files to test targets
+        id: map
+        run: |
+          set -euo pipefail
+          python3 <<'SCOPE_PY'
+          import os
+          import re
+          from pathlib import Path
+
+          UNIT = Path("tests/unit_tests")
+          FRONTEND = "superset-frontend/"
+
+          # A change to build or dependency metadata can break anything, so the
+          # narrowest honest answer is the whole unit suite. The security-dep
+          # remediation class lands here, which is exactly when it matters.
+          BROAD_PYTHON = {"pyproject.toml", "setup.py", "pytest.ini", "tests/conftest.py"}
+
+          changed = [
+              line.strip()
+              for line in Path("changed_files.txt").read_text().splitlines()
+              if line.strip()
+          ]
+
+
+          def python_targets(path):
+              """Unit-test paths worth running for a changed Python-side file."""
+              if path in BROAD_PYTHON or re.fullmatch(r"requirements/.+\.txt", path):
+                  return {str(UNIT)}
+              if path.startswith("tests/"):
+                  p = Path(path)
+                  # Integration tests need MySQL/Postgres/Redis containers and are
+                  # excluded from this workflow by design.
+                  if p.parts[:2] != ("tests", "unit_tests"):
+                      return set()
+                  if p.name in ("conftest.py", "__init__.py") or "fixtures" in p.parts:
+                      return {str(p.parent)} if p.parent.is_dir() else set()
+                  return {path} if p.is_file() else set()
+              if not path.startswith("superset/") or not path.endswith(".py"):
+                  return set()
+
+              rel = Path(path).relative_to("superset")
+              stem = rel.stem
+              dirparts = list(rel.parts[:-1])
+
+              # tests/unit_tests mirrors the superset package tree, but the file
+              # naming is not consistent: pytest.ini accepts *_test.py, test_*.py
+              # and *_tests.py, and all three are in use. Try each.
+              mirror = UNIT.joinpath(*dirparts)
+              hits = {
+                  str(mirror / name)
+                  for name in (f"{stem}_test.py", f"test_{stem}.py", f"{stem}_tests.py")
+                  if (mirror / name).is_file()
+              }
+              if hits:
+                  return hits
+
+              # No file-level mirror. Fall back to the nearest existing mirrored
+              # directory, but never as far as tests/unit_tests itself — that
+              # would silently turn a one-line change into a full-suite run.
+              while dirparts:
+                  mirror = UNIT.joinpath(*dirparts)
+                  if mirror.is_dir():
+                      return {str(mirror)}
+                  dirparts.pop()
+              return set()
+
+
+          def jest_pattern(path):
+              """The package root a changed frontend file belongs to, or None."""
+              parts = path[len(FRONTEND):].split("/")
+              if len(parts) < 2:
+                  return None  # superset-frontend/package.json and friends
+              if parts[0] in ("packages", "plugins") and len(parts) >= 3:
+                  return FRONTEND + "/".join(parts[:2]) + "/"
+              if parts[0] in ("src", "spec", "tools"):
+                  if len(parts) >= 3:
+                      return FRONTEND + "/".join(parts[:2]) + "/"
+                  # A module directly under src/: scope to its own name so that
+                  # e.g. src/preamble.ts selects src/preamble.test.ts.
+                  return FRONTEND + parts[0] + "/" + Path(parts[1]).stem
+              return None
+
+
+          def wants_target(path):
+              """Whether a missing test target for this file is worth reporting."""
+              return (
+                  (path.startswith("superset/") and path.endswith(".py"))
+                  or path.startswith(FRONTEND)
+                  or path.startswith("tests/")
+              )
+
+
+          pytest_paths, jest_patterns, unscoped = set(), set(), set()
+          frontend = helm = False
+
+          for path in changed:
+              # Both target lists are passed to a shell as unquoted words, so a
+              # path containing whitespace would split. Superset has none; report
+              # rather than mis-scope if that ever changes.
+              if re.search(r"\s", path):
+                  unscoped.add(path)
+                  continue
+              frontend = frontend or path.startswith(FRONTEND)
+              helm = helm or path.startswith("helm/")
+
+              targets = python_targets(path)
+              pattern = jest_pattern(path) if path.startswith(FRONTEND) else None
+              if pattern:
+                  # jest compiles these with the JavaScript engine. Escape the
+                  # one metacharacter these paths can contain rather than using
+                  # re.escape, whose Python-specific escapes (\-) are not
+                  # portable to a unicode-mode JavaScript RegExp.
+                  jest_patterns.add(pattern.replace(".", "\\."))
+              pytest_paths |= targets
+              if not targets and not pattern and wants_target(path):
+                  unscoped.add(path)
+
+          # A directory target subsumes everything beneath it, files and nested
+          # directories alike; passing both to pytest would collect twice.
+          dirs = {p for p in pytest_paths if Path(p).is_dir()}
+          pytest_paths = {
+              p
+              for p in pytest_paths
+              if not any(p != d and p.startswith(d + "/") for d in dirs)
+          }
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"pytest_paths={' '.join(sorted(pytest_paths))}\n")
+              out.write(f"jest_patterns={' '.join(sorted(jest_patterns))}\n")
+              out.write(f"frontend={str(frontend).lower()}\n")
+              out.write(f"helm={str(helm).lower()}\n")
+              out.write(f"unscoped={' '.join(sorted(unscoped))}\n")
+          SCOPE_PY
+
+      - name: Scope summary
+        env:
+          PYTEST_PATHS: ${{ steps.map.outputs.pytest_paths }}
+          JEST_PATTERNS: ${{ steps.map.outputs.jest_patterns }}
+          UNSCOPED: ${{ steps.map.outputs.unscoped }}
+        run: |
+          {
+            echo "### Resolved scope"
+            echo
+            echo "| Signal | Scope |"
+            echo "|---|---|"
+            echo "| pytest | \`${PYTEST_PATHS:-(nothing)}\` |"
+            echo "| jest | \`${JEST_PATTERNS:-(nothing)}\` |"
+            echo "| unmapped changes | \`${UNSCOPED:-(none)}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # pre-commit on the changed files. This is the broadest of the three signals:
+  # ruff, mypy, pylint, the frontend linters and the YAML/whitespace hooks all
+  # live here, and every hook's own `files:` filter does the scoping for us —
+  # passing a Python-only file list simply never invokes the frontend hooks.
+  # ---------------------------------------------------------------------------
+  pre-commit:
+    name: pre-commit (changed files)
+    needs: scope
+    if: needs.scope.outputs.run_precommit == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+          # The pylint hook diffs against `origin/$GITHUB_BASE_REF`, so the base
+          # branch has to be a real remote-tracking ref here, not just an SHA.
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Fetch the base branch
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          # Without this ref the pylint hook's `git merge-base origin/<base> HEAD`
+          # fails, it falls back to BASE=HEAD, diffs a commit against itself and
+          # reports "No Python files to lint" — green, and completely vacuous.
+          git fetch --no-tags --no-recurse-submodules origin \
+            "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+
+      - name: Setup Python
+        uses: ./.github/actions/setup-backend/
+        with:
+          python-version: current
+
+      # Only paid for when the diff actually contains frontend files: the
+      # oxfmt/oxlint/stylelint/custom-rules hooks shell out to binaries in
+      # superset-frontend/node_modules.
+      - name: Setup Node.js
+        if: needs.scope.outputs.frontend == 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: "superset-frontend/.nvmrc"
+          cache: "npm"
+          cache-dependency-path: "superset-frontend/package-lock.json"
+
+      - name: Install frontend dependencies
+        if: needs.scope.outputs.frontend == 'true'
+        run: npm ci
+        working-directory: superset-frontend
+
+      # Likewise for helm-docs, which is a Go binary and is only reachable by
+      # the `helm-docs` hook when helm/ is in the diff.
+      - name: Setup Go
+        if: needs.scope.outputs.helm == 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+
+      - name: Install helm-docs
+        if: needs.scope.outputs.helm == 'true'
+        run: go install github.com/norwoodj/helm-docs/cmd/helm-docs@v1.14.2
+
+      - name: Cache pre-commit environments
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: devin-autofix-pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: |
+            devin-autofix-pre-commit-${{ runner.os }}-
+
+      - name: pre-commit
+        env:
+          CHANGED_FILES: ${{ needs.scope.outputs.changed_files }}
+          # type-checking-frontend: `require_serial`, whole-project tsc, minutes
+          #   per run — the upstream pre-commit workflow skips it in CI too.
+          # eslint-docs: needs `yarn install` under docs/, which is a multi-minute
+          #   install that only lints documentation JavaScript. Neither is a
+          #   plausible signal about a Superset defect fix.
+          SKIP: type-checking-frontend,eslint-docs
+        run: |
+          # GitHub invokes this block as `bash -e {0}`, so -e has to be turned
+          # off explicitly to inspect the exit status below.
+          set +e
+          # shellcheck disable=SC2086
+          pre-commit run --files ${CHANGED_FILES}
+          pre_commit_status=$?
+
+          # Several hooks (ruff --fix, oxfmt, the feature-flag sync) rewrite files
+          # instead of failing. A dirty tree is therefore also a failure: it means
+          # the branch is missing a change the hooks would have made.
+          if ! git diff --quiet --exit-code; then
+            echo "::error::pre-commit modified files; the branch is missing their output."
+            git diff --name-only
+            exit 1
+          fi
+          exit "${pre_commit_status}"
+
+  # ---------------------------------------------------------------------------
+  # pytest, restricted to the unit-test paths that mirror the changed modules.
+  # Integration tests are excluded outright: they need MySQL, Postgres and Redis
+  # service containers and run for tens of minutes.
+  # ---------------------------------------------------------------------------
+  pytest:
+    name: pytest (scoped)
+    needs: scope
+    if: needs.scope.outputs.pytest_paths != ''
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+      # pytest.ini already locks a set of SQLAlchemy 2.0 deprecations to errors;
+      # this is what makes them actually fire.
+      SQLALCHEMY_WARN_20: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Setup Python
+        uses: ./.github/actions/setup-backend/
+        with:
+          python-version: current
+
+      - name: Run scoped unit tests
+        env:
+          PYTEST_PATHS: ${{ needs.scope.outputs.pytest_paths }}
+          SUPERSET_TESTENV: "true"
+          SUPERSET_SECRET_KEY: not-a-secret
+        run: |
+          echo "Scope: ${PYTEST_PATHS}"
+          # GitHub invokes this block as `bash -e {0}`; -e has to be turned off
+          # explicitly or the exit-code-5 branch below is unreachable.
+          set +e
+          # shellcheck disable=SC2086
+          pytest --durations-min=0.5 --cache-clear --maxfail=25 ${PYTEST_PATHS}
+          status=$?
+          # Exit code 5 is "no tests collected". The paths were resolved by
+          # existence against the mirrored tests/unit_tests tree, so this means
+          # the mirror directory holds no test files — a real gap in the signal,
+          # but not a failure of this change. Surface it instead of hiding it.
+          if [ "${status}" -eq 5 ]; then
+            echo "::warning::No tests were collected from '${PYTEST_PATHS}'; the Python signal for this diff is empty."
+            exit 0
+          fi
+          exit "${status}"
+
+  # ---------------------------------------------------------------------------
+  # jest, restricted to the frontend packages the diff touches. Upstream shards
+  # the full suite across eight runners; running it unsharded here would cost
+  # more wall clock than the whole loop budget.
+  # ---------------------------------------------------------------------------
+  jest:
+    name: jest (scoped)
+    needs: scope
+    if: needs.scope.outputs.jest_patterns != ''
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: "superset-frontend/.nvmrc"
+          cache: "npm"
+          cache-dependency-path: "superset-frontend/package-lock.json"
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: superset-frontend
+
+      - name: Run scoped jest tests
+        working-directory: superset-frontend
+        env:
+          # jest treats positional arguments as regular expressions matched
+          # against the full test path, which is exactly the scoping mechanism
+          # we want; the patterns are package-root prefixes.
+          JEST_PATTERNS: ${{ needs.scope.outputs.jest_patterns }}
+        run: |
+          set -u
+          echo "Scope: ${JEST_PATTERNS}"
+          # --passWithNoTests: a touched package may legitimately ship no tests.
+          # That is a hole in the signal, not a failure of the change; the
+          # aggregate job reports the scope so a reviewer can see it.
+          # shellcheck disable=SC2086
+          npm run test -- --passWithNoTests ${JEST_PATTERNS}
+
+  # ---------------------------------------------------------------------------
+  # The conclusion. This job runs unconditionally so the check suite always
+  # reaches a definite state.
+  #
+  # Sentinel maps `check_suite.completed` conclusions to state transitions:
+  # `success` -> CI_PASSED, `failure`/`timed_out` -> resume the Devin session.
+  # `neutral`, `skipped` and `cancelled` are not mapped to anything, and there
+  # is no timeout state — a remediation that receives one sits in CI_RUNNING
+  # forever. A workflow whose jobs are all skipped concludes as `skipped`, so
+  # without this job an untestable diff would silently hang the loop.
+  #
+  # It therefore reports SUCCESS when the diff turned out to have nothing
+  # testable, and shouts about it in the log and the job summary instead.
+  # See docs/adr/2026-08-08-vacuous-ci-reports-success.md.
+  # ---------------------------------------------------------------------------
+  devin-autofix-ci:
+    name: devin-autofix-ci
+    needs: [scope, pre-commit, pytest, jest]
+    if: always()
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Conclude
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          PRECOMMIT_RESULT: ${{ needs.pre-commit.result }}
+          PYTEST_RESULT: ${{ needs.pytest.result }}
+          JEST_RESULT: ${{ needs.jest.result }}
+          PYTEST_PATHS: ${{ needs.scope.outputs.pytest_paths }}
+          JEST_PATTERNS: ${{ needs.scope.outputs.jest_patterns }}
+          UNSCOPED: ${{ needs.scope.outputs.unscoped }}
+        run: |
+          set -euo pipefail
+
+          failed=0
+          for pair in \
+            "scope:${SCOPE_RESULT}" \
+            "pre-commit:${PRECOMMIT_RESULT}" \
+            "pytest:${PYTEST_RESULT}" \
+            "jest:${JEST_RESULT}"
+          do
+            name="${pair%%:*}"
+            result="${pair#*:}"
+            echo "${name}: ${result}"
+            # `skipped` is the expected result for a signal the diff did not
+            # call for. Anything that is neither success nor skipped — failure,
+            # cancelled — fails the suite.
+            if [ "${result}" != "success" ] && [ "${result}" != "skipped" ]; then
+              echo "::error::${name} did not pass (result: ${result})"
+              failed=1
+            fi
+          done
+
+          {
+            echo "### devin-autofix-ci"
+            echo
+            echo "This is a **scoped** CI signal, not a full-suite Superset run."
+            echo
+            echo "| Signal | Result | Scope |"
+            echo "|---|---|---|"
+            echo "| pre-commit | ${PRECOMMIT_RESULT} | changed files |"
+            echo "| pytest | ${PYTEST_RESULT} | \`${PYTEST_PATHS:-(nothing)}\` |"
+            echo "| jest | ${JEST_RESULT} | \`${JEST_PATTERNS:-(nothing)}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "${UNSCOPED}" ]; then
+            echo "::warning::Changed files that could not be mapped to any test target: ${UNSCOPED}. Run the relevant inherited workflow before merging."
+            {
+              echo
+              echo "> **Unmapped changes:** \`${UNSCOPED}\` — no test target could be"
+              echo "> derived for these. Run the relevant inherited workflow before merging."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ "${failed}" -ne 0 ]; then
+            exit 1
+          fi
+
+          if [ -z "${PYTEST_PATHS}" ] && [ -z "${JEST_PATTERNS}" ]; then
+            echo "::warning::No test target was derived from this diff. This run proves only that pre-commit is clean; it is not evidence that the change works."
+            {
+              echo
+              echo "> **No tests ran.** Nothing in this diff mapped to a test target, so this"
+              echo "> conclusion reflects pre-commit only. It is deliberately reported as"
+              echo "> success so the remediation loop advances rather than stalling on an"
+              echo "> unmapped conclusion — a human reviewer decides whether that is enough."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "devin-autofix-ci: success"

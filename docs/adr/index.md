@@ -12,6 +12,8 @@ question. See [when to write one](../implementation-plan.md#adrs).
 
 | Date | Decision | Type | Status | Areas |
 |---|---|---|---|---|
+| 2026-08-08 | [Report success, not neutral, when the scoped CI finds nothing to run](./2026-08-08-vacuous-ci-reports-success.md) | architecture | accepted | remediation, pipeline |
+| 2026-08-08 | [Disable the inherited Superset workflows so a fork head SHA yields one conclusion](./2026-08-08-one-check-suite-on-the-fork.md) | process | accepted | remediation, github |
 | 2026-08-08 | [Enforce the tests-with-source rule as a CI job that diffs the pull request](./2026-08-08-enforce-tests-with-source-by-diffing-the-pull-request.md) | process | accepted | ops |
 | 2026-08-07 | [Manage dependencies with uv and a committed lock file](./2026-08-07-uv-for-dependencies-and-the-image.md) | process | accepted | ops |
 | 2026-08-07 | [Deduplicate at both the delivery and the remediation layer](./2026-08-07-two-layer-deduplication.md) | architecture | accepted | pipeline, data |
@@ -35,9 +37,10 @@ question. See [when to write one](../implementation-plan.md#adrs).
 - **api** — [Acknowledge webhooks with 202 before making any external call](./2026-08-07-respond-202-before-external-calls.md)
 - **data** — [Use Postgres as the job queue instead of adding Redis](./2026-08-07-postgres-as-job-queue.md), [Record every state transition as an append-only event](./2026-08-07-transitions-are-append-only-events.md), [Deduplicate at both the delivery and the remediation layer](./2026-08-07-two-layer-deduplication.md)
 - **devin** — [Give Devin the objective and constraints, not the steps](./2026-08-07-delegate-task-not-steps.md), [Use the Devin v3 API exclusively](./2026-08-07-devin-v3-only.md), [Resume the existing Devin session on CI failure rather than starting a new one](./2026-08-07-reuse-resumable-sessions.md)
+- **github** — [Disable the inherited Superset workflows so a fork head SHA yields one conclusion](./2026-08-08-one-check-suite-on-the-fork.md)
 - **ops** — [Enforce the pre-PR review step with a hook, not with CLAUDE.md alone](./2026-08-07-enforce-workflow-with-hooks.md), [Write every artifact in English, regardless of the working language](./2026-08-07-english-for-artifacts.md), [Isolate parallel sessions with git worktrees and exclusive file ownership](./2026-08-07-parallel-sessions-via-worktrees.md), [Keep the task graph in one machine-readable file](./2026-08-07-tasks-yaml-single-source.md), [Manage dependencies with uv and a committed lock file](./2026-08-07-uv-for-dependencies-and-the-image.md), [Enforce the tests-with-source rule as a CI job that diffs the pull request](./2026-08-08-enforce-tests-with-source-by-diffing-the-pull-request.md)
-- **pipeline** — [Drive the remediation state machine from a poller, not from Devin callbacks](./2026-08-07-poller-drives-state-machine.md), [Use Postgres as the job queue instead of adding Redis](./2026-08-07-postgres-as-job-queue.md), [Resume the existing Devin session on CI failure rather than starting a new one](./2026-08-07-reuse-resumable-sessions.md), [Deduplicate at both the delivery and the remediation layer](./2026-08-07-two-layer-deduplication.md)
-- **remediation** — [Require human approval for every merge](./2026-08-07-humans-approve-every-merge.md), [Add a narrow CI workflow to the fork instead of running Superset full suite](./2026-08-07-scoped-ci-on-the-fork.md)
+- **pipeline** — [Drive the remediation state machine from a poller, not from Devin callbacks](./2026-08-07-poller-drives-state-machine.md), [Use Postgres as the job queue instead of adding Redis](./2026-08-07-postgres-as-job-queue.md), [Resume the existing Devin session on CI failure rather than starting a new one](./2026-08-07-reuse-resumable-sessions.md), [Deduplicate at both the delivery and the remediation layer](./2026-08-07-two-layer-deduplication.md), [Report success, not neutral, when the scoped CI finds nothing to run](./2026-08-08-vacuous-ci-reports-success.md)
+- **remediation** — [Require human approval for every merge](./2026-08-07-humans-approve-every-merge.md), [Add a narrow CI workflow to the fork instead of running Superset full suite](./2026-08-07-scoped-ci-on-the-fork.md), [Disable the inherited Superset workflows so a fork head SHA yields one conclusion](./2026-08-08-one-check-suite-on-the-fork.md), [Report success, not neutral, when the scoped CI finds nothing to run](./2026-08-08-vacuous-ci-reports-success.md)
 
 ## By task
 
@@ -57,4 +60,5 @@ Look up your task id before starting work.
 | T22 | [Acknowledge webhooks with 202 before making any external call](./2026-08-07-respond-202-before-external-calls.md) |
 | T23 | [Require human approval for every merge](./2026-08-07-humans-approve-every-merge.md), [Resume the existing Devin session on CI failure rather than starting a new one](./2026-08-07-reuse-resumable-sessions.md) |
 | T24 | [Drive the remediation state machine from a poller, not from Devin callbacks](./2026-08-07-poller-drives-state-machine.md) |
-| T42 | [Add a narrow CI workflow to the fork instead of running Superset full suite](./2026-08-07-scoped-ci-on-the-fork.md) |
+| T41 | [Disable the inherited Superset workflows so a fork head SHA yields one conclusion](./2026-08-08-one-check-suite-on-the-fork.md) |
+| T42 | [Add a narrow CI workflow to the fork instead of running Superset full suite](./2026-08-07-scoped-ci-on-the-fork.md), [Disable the inherited Superset workflows so a fork head SHA yields one conclusion](./2026-08-08-one-check-suite-on-the-fork.md), [Report success, not neutral, when the scoped CI finds nothing to run](./2026-08-08-vacuous-ci-reports-success.md) |
