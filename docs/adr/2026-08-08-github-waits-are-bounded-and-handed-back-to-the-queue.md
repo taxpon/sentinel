@@ -30,10 +30,22 @@ The queue already has a retry policy — `2^attempts × 5 s` with jitter, capped
 
 ## Decision
 
-The client waits in-process only while the wait is at most `MAX_WAIT_SECONDS` (60) and there are
-attempts left, which covers the secondary limit and transient `5xx`. Beyond that bound it raises
-`GitHubRateLimited` carrying `retry_after` — the number of seconds GitHub asked for, or `None` when
-it did not say — and the queue schedules the next attempt.
+The client waits in-process while the **total** it has waited in this call stays within
+`MAX_WAIT_SECONDS` (60) and attempts remain, which covers the secondary limit and a transient
+`5xx`. The budget is cumulative rather than per-wait: two waits of 60 seconds are two minutes of
+the lease, which is not what a 60-second bound means.
+
+Past the budget it raises `GitHubRateLimited` carrying `retry_after` — **the seconds GitHub asked
+for, and `None` when it did not say**. This client's own backoff is not substituted: a fabricated
+delay wearing GitHub's authority leaves the queue unable to tell an answer from a guess, and four
+seconds is a poor guess at a limit that resets in an hour.
+
+A rate limit is retried whatever the method, because the request was rejected before it was
+processed and repeating it cannot repeat a side effect. A `5xx` is retried only for an idempotent
+method: GitHub can answer `502` after a write has landed, so retrying a `POST` is how one
+escalation becomes two comments on the issue. A `5xx` on `POST` or `PATCH` is raised as
+`GitHubUnavailable`, still the queue's to retry — under a job attempt that is recorded on the
+remediation rather than invisible inside one call.
 
 Anything else in the `4xx` range raises immediately without a retry, as
 `docs/06-event-pipeline.md#reliability-policy` requires.
@@ -45,6 +57,9 @@ Anything else in the `4xx` range raises immediately without a retry, as
 | Sleep until `x-ratelimit-reset`, however far away | Exceeds the job lease, so the job is reclaimed and the side effect — a comment, a label — happens twice. A worker asleep for an hour is also indistinguishable from a hung one |
 | No waiting at all; every rate limit fails the job | Turns the common case, a secondary limit clearing in ten seconds, into a job attempt spent and a minute of queue backoff. Escalating a remediation because two labels were added in quick succession is a false failure |
 | Retry forever inside the client | Removes the attempt ceiling the queue exists to enforce, and hides the rate limiting from `remediation_event`, where the cost of it should be visible |
+| Bound each wait rather than their sum | Reads as a 60-second bound and is a 120-second one at `RETRY_ATTEMPTS = 3`. It is still inside the lease, but a bound this decision asks to be judged on should be the number it states |
+| Retry `5xx` on every method, as on the rate limits | Contradicts the duplicate-comment argument this record rests on, in the one case where the duplicate is invisible: nothing distinguishes a `502` before the write from a `502` after it |
+| Fill `retry_after` with the local backoff when GitHub named none | Cheaper for the queue, which then always has a number, but the number is invented and indistinguishable from GitHub's. The queue has its own backoff for exactly the case where there is no answer |
 
 ## Consequences
 
@@ -55,7 +70,12 @@ GitHub" is answerable from the data.
 
 The cost is two retry layers, so a genuinely unreachable GitHub is attempted `RETRY_ATTEMPTS ×
 MAX_JOB_ATTEMPTS` times before the remediation fails. That is acceptable because the inner layer is
-bounded in wall-clock time by the same 60 seconds.
+bounded in wall-clock time by 60 seconds in total, whatever the mix of waits that fills it.
+
+A second cost is that a `5xx` on a write reaches the queue immediately rather than being absorbed,
+so a flapping GitHub spends job attempts on writes where reads would have recovered in place. That
+is the intended trade: a spent attempt is visible on the remediation, a duplicated escalation
+comment is not.
 
 **What would tell us this was wrong:** primary-limit rejections appearing at all on a workload of
 tens of remediations a day. The token's budget is 5,000 requests an hour and one remediation costs

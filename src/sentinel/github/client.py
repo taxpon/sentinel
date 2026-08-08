@@ -1,9 +1,10 @@
 """The GitHub REST client — everything the pipeline asks of GitHub, and nothing that merges.
 
 The side effects in `docs/04-state-machine.md` are the whole requirement: read the issue a
-remediation started from, comment on it, label it, read the pull request, read the check runs on a
-head SHA, fetch the log of the job that failed, and request a review. `ROUTES` below is the
-complete list of endpoints this process can reach.
+remediation started from, comment on it, label it, close it, read the pull request, read the check
+runs on a head SHA, fetch the log of the job that failed, read the inline comments of a review that
+requested changes, and request a review. `ROUTES` below is the complete list of endpoints this
+process can reach.
 
 **There is no merge.** `docs/adr/2026-08-07-humans-approve-every-merge.md` is a property of the
 system, not a convention, so it is expressed as one: every path this client can build comes from
@@ -15,9 +16,12 @@ Two behaviours are the client's own rather than the caller's:
 
 - **Rate limiting.** GitHub has two of them, and a bot that comments and labels meets the secondary
   one first. `403` with `x-ratelimit-remaining: 0`, `403` carrying `retry-after`, and `429` are all
-  waited out and retried; so is `5xx`. Everything else in the `4xx` range fails immediately, because
-  retrying a validation error only spends quota
-  (`docs/06-event-pipeline.md#reliability-policy`). The wait is bounded — see
+  waited out and retried, whatever the method: the request was rejected before it was processed, so
+  repeating it cannot repeat a side effect. A `5xx` is retried only for an idempotent method,
+  because GitHub answering `502` *after* creating a comment is exactly how a duplicate escalation
+  appears. Everything else in the `4xx` range fails immediately, because retrying a validation
+  error only spends quota (`docs/06-event-pipeline.md#reliability-policy`). The total wait inside
+  one call is bounded — see
   `docs/adr/2026-08-08-github-waits-are-bounded-and-handed-back-to-the-queue.md`.
 - **Redaction.** The token is never a URL parameter, never logged, and scrubbed out of every
   exception message this module raises, because a `GitHubError` is recorded in
@@ -52,14 +56,19 @@ PAGE_SIZE: Final = 100
 
 RETRY_ATTEMPTS: Final = 3
 BACKOFF_BASE_SECONDS: Final = 1.0
-MAX_BACKOFF_SECONDS: Final = 30.0
 MAX_WAIT_SECONDS: Final = 60.0
-"""The longest this client waits in one call. A primary rate limit resets up to an hour later, and
-a worker that slept through it would lose its job lease (`JOB_LEASE_TIMEOUT`, 15 minutes) and have
-the work reclaimed underneath it. Beyond this bound the wait is handed back as
-`GitHubRateLimited.retry_after` for the queue to schedule."""
+"""The longest this client spends waiting in one call, summed over every retry it makes. A primary
+rate limit resets up to an hour later, and a worker that slept through it would lose its job lease
+(`JOB_LEASE_TIMEOUT`, 15 minutes) and have the work reclaimed underneath it. Once this budget is
+spent the delay GitHub named is handed back as `GitHubRateLimited.retry_after` for the queue to
+schedule."""
 
 REQUEST_TIMEOUT_SECONDS: Final = 30.0
+
+IDEMPOTENT_METHODS: Final[frozenset[str]] = frozenset({"GET", "HEAD", "DELETE", "PUT"})
+"""The methods a `5xx` may be retried on. A `502` can be returned after the write succeeded, so
+repeating a `POST` — a comment, a label, a review request — can duplicate it. `POST` and `PATCH`
+are handed to the queue instead, where the attempt is recorded on the remediation."""
 
 ROUTES: Final[Mapping[str, str]] = {
     "issue": "/repos/{repo}/issues/{number}",
@@ -67,6 +76,7 @@ ROUTES: Final[Mapping[str, str]] = {
     "issue_labels": "/repos/{repo}/issues/{number}/labels",
     "issue_label": "/repos/{repo}/issues/{number}/labels/{label}",
     "pull_request": "/repos/{repo}/pulls/{number}",
+    "review_comments": "/repos/{repo}/pulls/{number}/reviews/{review_id}/comments",
     "requested_reviewers": "/repos/{repo}/pulls/{number}/requested_reviewers",
     "check_runs": "/repos/{repo}/commits/{sha}/check-runs",
     "workflow_runs": "/repos/{repo}/actions/runs",
@@ -76,10 +86,19 @@ ROUTES: Final[Mapping[str, str]] = {
 """Every endpoint this client can address. The single source of the paths, so that what Sentinel is
 able to do to a repository can be read off one table rather than reconstructed from ten methods."""
 
-FAILURE_CONCLUSIONS: Final[frozenset[str]] = frozenset({"failure", "timed_out", "startup_failure"})
-"""The conclusions that mean the change is broken. `docs/04-state-machine.md` names the first two;
-`startup_failure` is a job that never ran, whose log says why. `cancelled`, `neutral` and `skipped`
-are deliberately absent — the spec maps them to no transition."""
+FAILING_CONCLUSIONS: Final[frozenset[str]] = frozenset({"failure", "timed_out", "startup_failure"})
+"""Which workflow runs and jobs `get_failing_job` will select from. `docs/04-state-machine.md`
+names the first two as the conclusions that drive `CI_FAILED`; `startup_failure` is a job that
+never ran, whose log says why, and it is included here because a job that failed to start still has
+a cause worth forwarding. `cancelled`, `neutral` and `skipped` are deliberately absent — the spec
+maps them to no transition.
+
+This is the vocabulary for *choosing a log to fetch*, and it is deliberately wider than the check
+suite conclusions that drive the state machine. Which conclusions cause a transition is decided
+from the webhook by `sentinel.github.events`, not here."""
+
+LOG_EXPIRED: Final[frozenset[int]] = frozenset({404, 410})
+"""GitHub expires Actions logs. Losing the log is not losing the failure — see `get_failing_job`."""
 
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 
@@ -164,7 +183,33 @@ class PullRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class ReviewComment:
+    """One inline comment a reviewer left on a line of the diff.
+
+    The `pull_request_review` webhook carries the review's body and nothing of these, so the
+    `CHANGES_REQUESTED -> RUNNING` edge has to fetch them (`docs/04-state-machine.md`). They are
+    returned as data rather than as text: rendering them into the resume message is the caller's,
+    which is what `changes_requested_message(inline_comments=…)` documents.
+    """
+
+    id: int
+    path: str
+    line: int | None
+    body: str
+    author: str | None
+    html_url: str
+
+
+@dataclass(frozen=True, slots=True)
 class CheckRun:
+    """One check run on a head SHA.
+
+    There is deliberately no `failed` property. Whether a conclusion means the remediation should
+    move to `CI_FAILED` is the state machine's question, answered from the check *suite* by
+    `sentinel.github.events`; a second, wider notion of failure on this object would be read as the
+    same thing and quietly disagree with it.
+    """
+
     id: int
     name: str
     status: str
@@ -173,10 +218,6 @@ class CheckRun:
     started_at: datetime | None
     completed_at: datetime | None
 
-    @property
-    def failed(self) -> bool:
-        return self.conclusion in FAILURE_CONCLUSIONS
-
 
 @dataclass(frozen=True, slots=True)
 class FailingJob:
@@ -184,7 +225,8 @@ class FailingJob:
 
     `log_excerpt` is already the tail — `LOG_EXCERPT_LINES` lines of it — because this is what goes
     into the resume message (`sentinel.devin.playbooks.ci_failure_message`), and a whole Superset CI
-    log is megabytes that would crowd out the instruction following it.
+    log is megabytes that would crowd out the instruction following it. It is empty when the log
+    could not be fetched, which `ci_failure_message` renders as `NO_LOG_OUTPUT`.
     """
 
     id: int
@@ -250,17 +292,45 @@ def _as_check_run(payload: Mapping[str, Any]) -> CheckRun:
     )
 
 
-def _failed(payload: Mapping[str, Any]) -> bool:
-    return payload.get("conclusion") in FAILURE_CONCLUSIONS
-
-
-def _started(payload: Mapping[str, Any]) -> tuple[datetime, int]:
-    """Sort key: when the run or job began, with its id to break ties and to stand in for a
-    `started_at` GitHub has not filled in yet."""
-    return (
-        _time(payload.get("started_at") or payload.get("run_started_at")) or _EPOCH,
-        payload["id"],
+def _as_review_comment(payload: Mapping[str, Any]) -> ReviewComment:
+    return ReviewComment(
+        id=payload["id"],
+        path=payload["path"],
+        # `line` is null on a comment against a line that later changed — the review is still worth
+        # forwarding, so the position is dropped rather than the comment.
+        line=payload.get("line"),
+        body=_text(payload.get("body")),
+        author=_login(payload.get("user")),
+        html_url=payload["html_url"],
     )
+
+
+def _failed(payload: Mapping[str, Any]) -> bool:
+    return payload.get("conclusion") in FAILING_CONCLUSIONS
+
+
+def _earliest_first(job: Mapping[str, Any]) -> tuple[bool, datetime, int]:
+    """Sort key for `min` over jobs: the one that started first, ties broken on id.
+
+    A job GitHub has not stamped with a `started_at` sorts **last**, not first. Sorting it to the
+    epoch would make every unstamped job beat a real failure and become the whole of the evidence
+    the resumed session receives — and `startup_failure`, a job that never ran, is exactly the
+    population likely to carry one.
+    """
+    when = _time(job.get("started_at"))
+    return (when is None, when or _EPOCH, job["id"])
+
+
+def _newest(run: Mapping[str, Any]) -> int:
+    """Sort key for `max` over workflow runs: the newest attempt on this SHA.
+
+    The id, not a timestamp. GitHub allocates run ids in increasing order, so the highest is the
+    most recently created — and unlike `run_started_at` it is never absent, so there is no missing
+    value to rank. A run queued later can also *start* earlier than one ahead of it in the queue,
+    which would have the runner pool decide which attempt counts as current.
+    """
+    identifier: int = run["id"]
+    return identifier
 
 
 def _excerpt(text: str) -> str:
@@ -361,6 +431,10 @@ class GitHubClient:
         removing `devin:autofix` twice — a redelivered webhook, a retried job. It is returned as
         `False` rather than raised so that the caller's retry is idempotent, and returned rather
         than swallowed so that "it was already gone" stays visible.
+
+        An issue that does not exist answers `404` too, and this reports `False` for it as well.
+        Telling them apart means matching on the text of `message`, which is not part of the API
+        contract; a remediation whose issue has been deleted has a larger problem than a label.
         """
         path = self._url("issue_label", number=number, label=quote(label, safe=""))
         try:
@@ -381,6 +455,21 @@ class GitHubClient:
     async def get_pull_request(self, number: int) -> PullRequest:
         response = await self._request("GET", self._url("pull_request", number=number))
         return _as_pull_request(_object(response))
+
+    async def get_review_comments(self, number: int, review_id: int) -> tuple[ReviewComment, ...]:
+        """The inline comments of one review, in the order the reviewer left them.
+
+        Scoped to the review rather than to the pull request: `CHANGES_REQUESTED -> RUNNING` is
+        driven by one `pull_request_review.submitted` delivery, and forwarding every inline comment
+        the pull request has ever collected would re-send the previous lap's, which the session has
+        already acted on.
+
+        The review's own body is not fetched — it arrives on the webhook. These do not.
+        """
+        comments = await self._paginate(
+            self._url("review_comments", number=number, review_id=review_id), key=None
+        )
+        return tuple(_as_review_comment(comment) for comment in comments)
 
     async def request_review(
         self,
@@ -430,21 +519,37 @@ class GitHubClient:
         failed_runs = [run for run in runs if _failed(run)]
         if not failed_runs:
             return None
-        run = max(failed_runs, key=_started)
+        run = max(failed_runs, key=_newest)
 
         jobs = await self._paginate(self._url("workflow_run_jobs", run_id=run["id"]), "jobs")
         failing = [job for job in jobs if _failed(job)]
         if not failing:
             return None
-        job = min(failing, key=_started)
+        job = min(failing, key=_earliest_first)
 
-        response = await self._request("GET", self._url("job_logs", job_id=job["id"]))
         return FailingJob(
             id=job["id"],
             name=job["name"],
             html_url=job["html_url"],
-            log_excerpt=_excerpt(response.text),
+            log_excerpt=await self._job_log(job["id"]),
         )
+
+    async def _job_log(self, job_id: int) -> str:
+        """The tail of one job's log, or nothing if GitHub no longer has it.
+
+        Actions logs expire, and the answer is then `410 Gone` — a `4xx`, so neither this client
+        nor the queue retries it and the `resume_session` job would fail the remediation over a log
+        that was merely too old. The failure itself is not lost: the job's name and URL still
+        describe it, and `ci_failure_message` renders an empty excerpt as `NO_LOG_OUTPUT`.
+        """
+        try:
+            response = await self._request("GET", self._url("job_logs", job_id=job_id))
+        except GitHubError as exc:
+            if exc.status_code not in LOG_EXPIRED:
+                raise
+            log.warning("github.job_log.expired", job_id=job_id, status=exc.status_code)
+            return ""
+        return _excerpt(response.text)
 
     # --- HTTP ---
 
@@ -455,9 +560,12 @@ class GitHubClient:
         return text.replace(self._token, REDACTED)
 
     async def _paginate(
-        self, path: str, key: str, params: Mapping[str, Any] | None = None
+        self, path: str, key: str | None = None, params: Mapping[str, Any] | None = None
     ) -> list[dict[str, Any]]:
         """Every item of a paginated collection, following `Link: rel="next"`.
+
+        `key` names the field holding the items, for the endpoints that wrap them in an envelope
+        alongside `total_count`; the ones that answer with a bare array pass `None`.
 
         Following the header rather than stopping at the first page: one head SHA should produce a
         single check suite on the fork
@@ -469,7 +577,7 @@ class GitHubClient:
         query: Mapping[str, Any] | None = {**(params or {}), "per_page": PAGE_SIZE}
         while url is not None:
             response = await self._request("GET", url, params=query)
-            items += _object(response)[key]
+            items += _array(response) if key is None else _object(response)[key]
             following = response.links.get("next")
             # The next URL carries the cursor and the page size already.
             url, query = (following["url"], None) if following else (None, None)
@@ -483,8 +591,14 @@ class GitHubClient:
         json: Any = None,
         params: Mapping[str, Any] | None = None,
     ) -> httpx.Response:
-        """One GitHub call, with the retry policy applied. Raises `GitHubError` on anything else."""
+        """One GitHub call, with the retry policy applied. Raises `GitHubError` on anything else.
+
+        `waited` is the whole of the waiting budget, not the size of one wait: two waits of 60
+        seconds are two minutes of a 15-minute job lease spent inside a single call, which is not
+        what `MAX_WAIT_SECONDS` claims to bound.
+        """
         attempt = 0
+        waited = 0.0
         while True:
             attempt += 1
             last = attempt == RETRY_ATTEMPTS
@@ -497,11 +611,13 @@ class GitHubClient:
                 log.warning(
                     "github.request.error", method=method, path=url, attempt=attempt, reason=reason
                 )
-                if last:
+                wait = _backoff(attempt)
+                if last or waited + wait > MAX_WAIT_SECONDS:
                     raise GitHubUnavailable(
                         method=method, path=url, status_code=0, message=reason
                     ) from None
-                await self._sleep(_backoff(attempt))
+                waited += wait
+                await self._sleep(wait)
                 continue
 
             if response.is_success:
@@ -516,12 +632,14 @@ class GitHubClient:
                 attempt=attempt,
                 reason=reason,
             )
-            if not _retryable(response):
-                raise self._refused(method, url, response, reason)
+            if not _retryable(response, method):
+                raise self._failure(method, url, response, reason)
 
-            wait = _wait_for(response, attempt)
-            if last or wait > MAX_WAIT_SECONDS:
-                raise self._exhausted(method, url, response, reason, wait)
+            requested = _retry_after(response)
+            wait = _backoff(attempt) if requested is None else requested
+            if last or waited + wait > MAX_WAIT_SECONDS:
+                raise self._exhausted(method, url, response, reason, requested)
+            waited += wait
             await self._sleep(wait)
 
     def _describe(self, response: httpx.Response) -> str:
@@ -533,17 +651,38 @@ class GitHubClient:
         message = payload.get("message") if isinstance(payload, dict) else None
         return self._redact(message if isinstance(message, str) else response.reason_phrase)
 
-    def _refused(
+    def _failure(
         self, method: str, path: str, response: httpx.Response, reason: str
     ) -> GitHubError:
-        """A `4xx` this client will not retry."""
-        kind = GitHubNotFound if response.status_code == httpx.codes.NOT_FOUND else GitHubError
-        return kind(method=method, path=path, status_code=response.status_code, message=reason)
+        """A response this client will not repeat, as the type that says whether the queue should.
+
+        `GitHubUnavailable` means try again later; `GitHubError` and `GitHubNotFound` mean the
+        request was wrong and will stay wrong. A `5xx` on a `POST` reaches here rather than being
+        retried in place, and it is still the queue's to retry — under a job attempt that is
+        recorded, rather than silently inside this call.
+        """
+        status = response.status_code
+        fields: dict[str, Any] = {
+            "method": method,
+            "path": path,
+            "status_code": status,
+            "message": reason,
+        }
+        if status >= httpx.codes.INTERNAL_SERVER_ERROR:
+            return GitHubUnavailable(**fields)
+        if status == httpx.codes.NOT_FOUND:
+            return GitHubNotFound(**fields)
+        return GitHubError(**fields)
 
     def _exhausted(
-        self, method: str, path: str, response: httpx.Response, reason: str, wait: float
+        self, method: str, path: str, response: httpx.Response, reason: str, requested: float | None
     ) -> GitHubUnavailable:
-        """Retryable, but not within this call — the queue schedules the next attempt."""
+        """Retryable, but not within this call — the queue schedules the next attempt.
+
+        `requested` is what GitHub named and nothing else. Passing the backoff this client would
+        have used instead would hand the queue an invented delay wearing GitHub's authority, and
+        leave it unable to tell a real answer from a guess.
+        """
         fields: dict[str, Any] = {
             "method": method,
             "path": path,
@@ -551,17 +690,35 @@ class GitHubClient:
             "message": reason,
         }
         if _rate_limited(response):
-            return GitHubRateLimited(retry_after=wait, **fields)
+            return GitHubRateLimited(retry_after=requested, **fields)
         return GitHubUnavailable(**fields)
 
 
+def _decoded(response: httpx.Response) -> Any:
+    """The JSON body, or a `GitHubError` naming the request that produced something else.
+
+    A `200` carrying HTML is what an interception proxy or a captive portal answers with. Left
+    alone it surfaces as a `JSONDecodeError` from outside this module's exception hierarchy, and
+    the worker records a remediation failure that names neither the endpoint nor the status.
+    """
+    try:
+        return response.json()
+    except ValueError:
+        raise GitHubError(
+            method=response.request.method,
+            path=response.request.url.path,
+            status_code=response.status_code,
+            message=f"expected JSON, got {response.headers.get('content-type', 'no content type')}",
+        ) from None
+
+
 def _object(response: httpx.Response) -> dict[str, Any]:
-    payload: dict[str, Any] = response.json()
+    payload: dict[str, Any] = _decoded(response)
     return payload
 
 
 def _array(response: httpx.Response) -> list[dict[str, Any]]:
-    payload: list[dict[str, Any]] = response.json()
+    payload: list[dict[str, Any]] = _decoded(response)
     return payload
 
 
@@ -580,20 +737,26 @@ def _rate_limited(response: httpx.Response) -> bool:
     return headers.get("x-ratelimit-remaining") == "0" or "retry-after" in headers
 
 
-def _retryable(response: httpx.Response) -> bool:
-    return _rate_limited(response) or response.status_code >= httpx.codes.INTERNAL_SERVER_ERROR
+def _retryable(response: httpx.Response, method: str) -> bool:
+    """Whether repeating this request is both useful and safe.
+
+    A rate limit is safe on any method — the request was rejected before it was processed. A `5xx`
+    is not: GitHub can answer `502` after the write landed, so retrying a `POST` is how one
+    escalation becomes two comments on the issue. The queue retries those instead, where the second
+    attempt is a row on the remediation rather than something invisible inside one call.
+    """
+    if _rate_limited(response):
+        return True
+    return (
+        response.status_code >= httpx.codes.INTERNAL_SERVER_ERROR
+        and method.upper() in IDEMPOTENT_METHODS
+    )
 
 
 def _backoff(attempt: int) -> float:
     """Exponential, and without jitter: these retries are in-process and few, and the queue's own
     backoff — which does jitter — is the outer loop for anything that outlives one call."""
-    return min(BACKOFF_BASE_SECONDS * 2.0 ** (attempt - 1), MAX_BACKOFF_SECONDS)
-
-
-def _wait_for(response: httpx.Response, attempt: int) -> float:
-    """How long to wait: what GitHub asked for, or the backoff schedule when it did not say."""
-    requested = _retry_after(response)
-    return _backoff(attempt) if requested is None else requested
+    return BACKOFF_BASE_SECONDS * 2.0 ** (attempt - 1)
 
 
 def _retry_after(response: httpx.Response) -> float | None:

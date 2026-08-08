@@ -53,9 +53,18 @@ ACTIONS = f"/repos/{REPO}/actions"
 
 RUN_ID = 84410727864
 JOB_ID = 231855142299
+REVIEW_ID = 4882944318
 
 
 # ------------------------------------------------------------------------------------- fixtures
+
+
+WAIT_LIMIT = 10
+"""How many waits the fake `sleep` tolerates before it decides the retry loop is not bounded.
+
+Without it, a client that never stops retrying makes this file hang until the CI job times out —
+a failure that reads as an infrastructure problem rather than as the assertion it is.
+"""
 
 
 @pytest.fixture
@@ -72,6 +81,7 @@ async def github(
 
     async def sleep(seconds: float) -> None:
         waits.append(seconds)
+        assert len(waits) <= WAIT_LIMIT, f"the retry loop is unbounded: {waits}"
 
     async with GitHubClient(settings, sleep=sleep) as client:
         yield client
@@ -98,6 +108,26 @@ def a_workflow_run(**overrides: Any) -> dict[str, Any]:
         "status": "completed",
         "conclusion": "failure",
         "run_started_at": "2026-08-07T15:11:55Z",
+        **overrides,
+    }
+
+
+def a_review_comment(**overrides: Any) -> dict[str, Any]:
+    """One inline comment, shaped as `GET /pulls/{n}/reviews/{id}/comments` returns it.
+
+    Built here rather than added to `tests/fixtures/github/`: that directory is T04's, and it holds
+    webhook deliveries — no webhook carries a review comment, which is the whole reason this
+    endpoint exists.
+    """
+    return {
+        "id": 1,
+        "pull_request_review_id": REVIEW_ID,
+        "path": "superset/connectors/sqla/models.py",
+        "line": 1462,
+        "side": "RIGHT",
+        "body": "This still swallows the DB error.",
+        "user": {"login": "mm"},
+        "html_url": f"https://github.com/{REPO}/pull/{PR_NUMBER}#discussion_r1",
         **overrides,
     }
 
@@ -313,6 +343,60 @@ async def test_request_review_refuses_an_empty_request_without_calling_github(
     assert github_api.requests == []
 
 
+# ------------------------------------------------------------------------------ review comments
+
+
+async def test_get_review_comments_reads_the_inline_comments_of_one_review(
+    github: GitHubClient, github_api: FakeAPI
+) -> None:
+    # `CHANGES_REQUESTED -> RUNNING` forwards "review body and inline comments"
+    # (`docs/04-state-machine.md`). The webhook carries the body; the recorded `review` object has
+    # no inline comments in it at all, so they have to be fetched or the edge cannot be built.
+    github_api.responds(
+        "GET",
+        f"{PULLS}/{PR_NUMBER}/reviews/{REVIEW_ID}/comments",
+        json=[
+            a_review_comment(),
+            a_review_comment(id=2, path="superset/models/helpers.py", line=None, body="and here"),
+        ],
+    )
+
+    comments = await github.get_review_comments(PR_NUMBER, REVIEW_ID)
+
+    sent = github_api.only("GET")
+    # Scoped to the review, not to the pull request: on lap two the pull request still carries lap
+    # one's comments, which the session has already acted on.
+    assert sent.path == f"{PULLS}/{PR_NUMBER}/reviews/{REVIEW_ID}/comments"
+    assert [(c.path, c.line, c.body, c.author) for c in comments] == [
+        ("superset/connectors/sqla/models.py", 1462, "This still swallows the DB error.", "mm"),
+        ("superset/models/helpers.py", None, "and here", "mm"),
+    ]
+
+
+async def test_review_comments_are_returned_as_data_for_the_caller_to_render(
+    github: GitHubClient, github_api: FakeAPI
+) -> None:
+    # `changes_requested_message(inline_comments=…)` documents them as "already rendered by the
+    # caller", so the client must not decide the wording. This pins that division.
+    github_api.responds(
+        "GET", f"{PULLS}/{PR_NUMBER}/reviews/{REVIEW_ID}/comments", json=[a_review_comment()]
+    )
+
+    comment = (await github.get_review_comments(PR_NUMBER, REVIEW_ID))[0]
+
+    assert comment.body == "This still swallows the DB error."
+    assert comment.html_url.endswith("#discussion_r1")
+
+
+async def test_a_review_with_no_inline_comments_is_empty_not_an_error(
+    github: GitHubClient, github_api: FakeAPI
+) -> None:
+    # A reviewer can request changes with a body alone, which is what the recorded fixture does.
+    github_api.responds("GET", f"{PULLS}/{PR_NUMBER}/reviews/{REVIEW_ID}/comments", json=[])
+
+    assert await github.get_review_comments(PR_NUMBER, REVIEW_ID) == ()
+
+
 # ------------------------------------------------------------------------------------- CI
 
 
@@ -336,9 +420,9 @@ async def test_get_check_runs_parses_the_runs_on_a_head_sha(
     sent = github_api.only("GET")
     assert sent.path == f"/repos/{REPO}/commits/{HEAD_SHA}/check-runs"
     assert sent.url.params["per_page"] == "100"
-    assert [(run.name, run.conclusion, run.failed) for run in runs] == [
-        ("pytest", "failure", True),
-        ("jest", "success", False),
+    assert [(run.name, run.conclusion) for run in runs] == [
+        ("pytest", "failure"),
+        ("jest", "success"),
     ]
     assert runs[0].started_at == datetime(2026, 8, 7, 15, 12, 4, tzinfo=UTC)
 
@@ -430,6 +514,114 @@ async def test_get_failing_job_takes_the_latest_run_when_a_sha_was_re_run(
     await github.get_failing_job(HEAD_SHA)
 
     assert github_api.only("GET", f"{ACTIONS}/runs/{RUN_ID}/jobs")
+
+
+async def test_a_job_with_no_start_time_does_not_displace_a_real_failure(
+    github: GitHubClient, github_api: FakeAPI
+) -> None:
+    # Sorting an absent `started_at` to the epoch would make it earliest and hand the session a
+    # log that is not the cause. `startup_failure` — a job that never ran — is the population most
+    # likely to carry one, and it is deliberately inside `FAILING_CONCLUSIONS`.
+    never_started = a_job(id=JOB_ID + 7, name="jest", conclusion="startup_failure", started_at=None)
+    fake_ci(github_api, jobs=[never_started, a_job()])
+
+    job = await github.get_failing_job(HEAD_SHA)
+
+    assert job is not None
+    assert job.name == "pytest"
+
+
+async def test_an_unstamped_job_is_still_chosen_when_it_is_the_only_failure(
+    github: GitHubClient, github_api: FakeAPI
+) -> None:
+    # Ranking it last must not mean discarding it: with no better candidate it is the evidence.
+    never_started = a_job(name="jest", conclusion="startup_failure", started_at=None)
+    fake_ci(github_api, jobs=[never_started])
+
+    job = await github.get_failing_job(HEAD_SHA)
+
+    assert job is not None
+    assert job.name == "jest"
+
+
+async def test_the_newest_run_is_the_highest_id_not_the_one_that_started_first(
+    github: GitHubClient, github_api: FakeAPI
+) -> None:
+    # Deliberately disagreeing signals: the run created later started earlier, which is what a
+    # busy runner pool produces. The id decides, because it is when GitHub accepted the attempt —
+    # and, unlike `run_started_at`, it is never absent, so there is no missing value to rank.
+    started_first = a_workflow_run(id=RUN_ID + 5, run_started_at="2026-08-07T15:00:00Z")
+    started_later = a_workflow_run(id=RUN_ID, run_started_at="2026-08-07T16:00:00Z")
+    fake_ci(github_api, runs=[started_later, started_first], jobs=[a_job()])
+
+    await github.get_failing_job(HEAD_SHA)
+
+    assert github_api.only("GET", f"{ACTIONS}/runs/{RUN_ID + 5}/jobs")
+
+
+async def test_a_run_with_no_start_time_is_still_a_candidate(
+    github: GitHubClient, github_api: FakeAPI
+) -> None:
+    unstamped = a_workflow_run(id=RUN_ID + 5, run_started_at=None)
+    fake_ci(github_api, runs=[a_workflow_run(), unstamped], jobs=[a_job()])
+
+    await github.get_failing_job(HEAD_SHA)
+
+    assert github_api.only("GET", f"{ACTIONS}/runs/{RUN_ID + 5}/jobs")
+
+
+@pytest.mark.parametrize(
+    "conclusion", ["failure", "timed_out", "startup_failure"], ids=lambda value: str(value)
+)
+async def test_every_failing_conclusion_selects_the_job(
+    github: GitHubClient, github_api: FakeAPI, conclusion: str
+) -> None:
+    # `timed_out` is one of the two `docs/04-state-machine.md:59` names for `CI_FAILED`, and was
+    # previously pinned by nothing: dropping it from the set broke no test.
+    fake_ci(
+        github_api,
+        runs=[a_workflow_run(conclusion=conclusion)],
+        jobs=[a_job(conclusion=conclusion)],
+    )
+
+    job = await github.get_failing_job(HEAD_SHA)
+
+    assert job is not None
+    assert job.name == "pytest"
+
+
+@pytest.mark.parametrize(
+    "conclusion", ["cancelled", "neutral", "skipped", "success", None], ids=lambda value: str(value)
+)
+async def test_no_other_conclusion_selects_the_job(
+    github: GitHubClient, github_api: FakeAPI, conclusion: str | None
+) -> None:
+    # The spec maps these to no transition, so there is nothing to resume a session about.
+    fake_ci(github_api, jobs=[a_job(conclusion=conclusion)])
+
+    assert await github.get_failing_job(HEAD_SHA) is None
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [(410, {"message": "Gone"}), (404, {"message": "Not Found"})],
+    ids=["expired", "absent"],
+)
+async def test_a_log_github_no_longer_has_leaves_the_failure_intact(
+    github: GitHubClient, github_api: FakeAPI, status: int, body: dict[str, str]
+) -> None:
+    # Actions logs expire. A `4xx` is retried by neither this client nor the queue, so raising here
+    # would fail the `resume_session` job — and the remediation — over a log that was too old. The
+    # job's name and URL still describe the failure, and an empty excerpt renders as NO_LOG_OUTPUT.
+    fake_ci(github_api, jobs=[a_job()])
+    github_api.responds("GET", f"{ACTIONS}/jobs/{JOB_ID}/logs", status, json=body)
+
+    job = await github.get_failing_job(HEAD_SHA)
+
+    assert job is not None
+    assert job.name == "pytest"
+    assert job.html_url.endswith(f"/job/{JOB_ID}")
+    assert job.log_excerpt == ""
 
 
 @pytest.mark.parametrize(
@@ -566,7 +758,23 @@ async def test_a_rate_limit_header_it_cannot_read_falls_back_to_the_schedule(
     assert waits == [1.0]
 
 
-async def test_a_5xx_is_retried(
+async def test_a_negative_retry_after_is_read_as_no_delay_left(
+    github: GitHubClient, github_api: FakeAPI, waits: list[float]
+) -> None:
+    github_api.route("GET", f"{ISSUES}/{ISSUE_NUMBER}").mock(
+        side_effect=[
+            httpx.Response(429, json={"message": "slow down"}, headers={"retry-after": "-30"}),
+            httpx.Response(200, json=github_payload("issues.labeled")["issue"]),
+        ]
+    )
+
+    await github.get_issue(ISSUE_NUMBER)
+
+    # The window it named has already passed. Clamped to zero rather than sent backwards in time.
+    assert waits == [0.0]
+
+
+async def test_a_5xx_is_retried_on_a_read(
     github: GitHubClient, github_api: FakeAPI, waits: list[float]
 ) -> None:
     github_api.route("GET", f"{ISSUES}/{ISSUE_NUMBER}").mock(
@@ -582,6 +790,40 @@ async def test_a_5xx_is_retried(
     assert waits == [1.0]
 
 
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+async def test_a_5xx_on_a_write_is_not_retried_in_place(
+    github: GitHubClient, github_api: FakeAPI, waits: list[float], status: int
+) -> None:
+    # GitHub can answer `502` after the comment was created, so a retry here is how one escalation
+    # becomes two comments on the issue. It is still the queue's to retry — under a recorded job
+    # attempt — which is what `GitHubUnavailable` rather than `GitHubError` says.
+    github_api.responds("POST", f"{ISSUES}/{ISSUE_NUMBER}/comments", status, json={"message": "no"})
+
+    with pytest.raises(GitHubUnavailable) as raised:
+        await github.comment_on_issue(ISSUE_NUMBER, "escalating")
+
+    assert not isinstance(raised.value, GitHubRateLimited)
+    assert raised.value.status_code == status
+    assert len(github_api.sent("POST")) == 1
+    assert waits == []
+
+
+async def test_a_rate_limit_on_a_write_is_still_retried(
+    github: GitHubClient, github_api: FakeAPI
+) -> None:
+    # The distinction is whether the request could have been processed. A rate limit rejects it
+    # before that, so repeating it cannot repeat the side effect.
+    github_api.route("POST", f"{ISSUES}/{ISSUE_NUMBER}/labels").mock(
+        side_effect=[
+            httpx.Response(429, json={"message": "slow down"}, headers={"retry-after": "1"}),
+            httpx.Response(200, json=[{"name": NEEDS_HUMAN}]),
+        ]
+    )
+
+    assert await github.add_labels(ISSUE_NUMBER, [NEEDS_HUMAN]) == (NEEDS_HUMAN,)
+    assert len(github_api.sent("POST")) == 2
+
+
 @pytest.mark.parametrize("status", [400, 401, 404, 409, 410, 422])
 async def test_a_4xx_fails_immediately(
     github: GitHubClient, github_api: FakeAPI, waits: list[float], status: int
@@ -594,6 +836,9 @@ async def test_a_4xx_fails_immediately(
 
     assert raised.value.status_code == status
     assert raised.value.message == "no"
+    # The rendered text too: this is what reaches `remediation_event.detail` and the dashboard, so
+    # losing the reason from it is a silent loss of the only explanation an operator gets.
+    assert str(raised.value) == f"GET {ISSUES}/{ISSUE_NUMBER} failed with {status}: no"
     assert len(github_api.sent("GET")) == 1
     assert waits == []
 
@@ -617,6 +862,27 @@ async def test_a_403_that_is_not_a_rate_limit_fails_immediately(
     assert not isinstance(raised.value, GitHubRateLimited)
     assert len(github_api.sent("GET")) == 1
     assert waits == []
+
+
+async def test_a_success_that_is_not_json_stays_inside_the_error_hierarchy(
+    github: GitHubClient, github_api: FakeAPI
+) -> None:
+    # What an interception proxy or a captive portal answers with. A `JSONDecodeError` escaping
+    # from here reaches the worker as a failure naming neither the endpoint nor the status.
+    github_api.responds(
+        "GET",
+        f"{ISSUES}/{ISSUE_NUMBER}",
+        200,
+        text="<html>sign in to continue</html>",
+        headers={"content-type": "text/html"},
+    )
+
+    with pytest.raises(GitHubError) as raised:
+        await github.get_issue(ISSUE_NUMBER)
+
+    assert raised.value.path == f"{ISSUES}/{ISSUE_NUMBER}"
+    assert raised.value.status_code == 200
+    assert "text/html" in raised.value.message
 
 
 async def test_a_404_is_raised_as_its_own_type(github: GitHubClient, github_api: FakeAPI) -> None:
@@ -646,6 +912,47 @@ async def test_a_wait_longer_than_the_bound_is_handed_back_to_the_caller(
     assert raised.value.retry_after > MAX_WAIT_SECONDS
     assert waits == []
     assert len(github_api.sent("GET")) == 1
+
+
+async def test_the_waiting_budget_is_the_total_of_the_waits_not_the_size_of_one(
+    github: GitHubClient, github_api: FakeAPI, waits: list[float]
+) -> None:
+    # Two waits of 60 s are two minutes of a 15-minute lease spent inside one call. The bound the
+    # ADR asks to be judged on is the total, so the second wait is refused rather than taken.
+    github_api.responds(
+        "GET",
+        f"{ISSUES}/{ISSUE_NUMBER}",
+        429,
+        json={"message": "slow down"},
+        headers={"retry-after": str(int(MAX_WAIT_SECONDS))},
+    )
+
+    with pytest.raises(GitHubRateLimited):
+        await github.get_issue(ISSUE_NUMBER)
+
+    assert waits == [MAX_WAIT_SECONDS]
+    assert sum(waits) <= MAX_WAIT_SECONDS
+    assert len(github_api.sent("GET")) == 2
+
+
+async def test_a_rate_limit_naming_no_delay_is_handed_back_with_none_rather_than_a_guess(
+    github: GitHubClient, github_api: FakeAPI
+) -> None:
+    # The queue must be able to tell GitHub's answer from this client's backoff schedule. Passing
+    # the schedule would present an invented number as GitHub's own — 4 seconds for a primary
+    # limit that may be an hour away.
+    github_api.responds(
+        "GET",
+        f"{ISSUES}/{ISSUE_NUMBER}",
+        403,
+        json={"message": "API rate limit exceeded"},
+        headers={"x-ratelimit-remaining": "0"},
+    )
+
+    with pytest.raises(GitHubRateLimited) as raised:
+        await github.get_issue(ISSUE_NUMBER)
+
+    assert raised.value.retry_after is None
 
 
 async def test_a_rate_limit_that_outlasts_the_attempts_is_raised_with_what_it_asked_for(
@@ -693,6 +1000,7 @@ EXPECTED_ROUTES = {
     "issue_labels",
     "issue_label",
     "pull_request",
+    "review_comments",
     "requested_reviewers",
     "check_runs",
     "workflow_runs",
@@ -737,6 +1045,7 @@ async def test_no_method_reaches_the_merge_endpoint(
     await github.remove_label(ISSUE_NUMBER, AUTOFIX_LABEL)
     await github.close_issue(ISSUE_NUMBER)
     await github.get_pull_request(PR_NUMBER)
+    await github.get_review_comments(PR_NUMBER, REVIEW_ID)
     await github.request_review(PR_NUMBER, reviewers=["taxpon"])
     await github.get_check_runs(HEAD_SHA)
     await github.get_failing_job(HEAD_SHA)
@@ -747,6 +1056,7 @@ async def test_no_method_reaches_the_merge_endpoint(
         "remove_label",
         "close_issue",
         "get_pull_request",
+        "get_review_comments",
         "request_review",
         "get_check_runs",
         "get_failing_job",
@@ -810,6 +1120,19 @@ async def test_nothing_the_client_logs_carries_the_token(
 
     assert logs.records, "the failure was not logged at all"
     assert GITHUB_TOKEN not in logs.text
+    # The field set, not just the absence of the token: T17's redactor scrubs by value and by
+    # shape, so it would remove a token this client had logged and this test would still pass.
+    # Pinning what is emitted is what makes it a statement about the client.
+    assert set(logs.last) == {
+        "ts",
+        "level",
+        "event",
+        "method",
+        "path",
+        "status",
+        "attempt",
+        "reason",
+    }
     assert logs.last["event"] == "github.request.failed"
     assert logs.last["status"] == 404
 
@@ -866,6 +1189,9 @@ def answer_everything(github_api: FakeAPI) -> None:
         f"{PULLS}/{PR_NUMBER}/requested_reviewers",
         201,
         json={"requested_reviewers": [{"login": "taxpon"}]},
+    )
+    github_api.responds(
+        "GET", f"{PULLS}/{PR_NUMBER}/reviews/{REVIEW_ID}/comments", json=[a_review_comment()]
     )
     github_api.responds(
         "GET",

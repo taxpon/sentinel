@@ -31,14 +31,32 @@ because a run can be re-run by hand.
 ## Decision
 
 Resolve the log through the Actions API rather than through check runs: list the workflow runs for
-the head SHA, take the **latest** one whose conclusion is a failure, list its jobs, and take the
-**earliest** failing job by `started_at` with the job id as the tie-break. Fetch that job's log and
-return its last `LOG_EXCERPT_LINES` lines.
+the head SHA, take the failing one with the **highest id**, list its jobs, and take the **earliest**
+failing job by `started_at` with the job id as the tie-break. Fetch that job's log and return its
+last `LOG_EXCERPT_LINES` lines.
 
-"Latest run" is the state of the branch now; an older run's failure has been superseded. "Earliest
-failing job" is the cause rather than a consequence — jobs that fail because another job failed can
-only start after it, and the aggregate job depends on all three signal jobs, so it is always last.
-No job name appears in the client.
+"Highest id" is the newest attempt — GitHub allocates run ids in order — and an older run's failure
+has been superseded. `run_started_at` is deliberately not used for this: a run queued later can
+start earlier than one ahead of it in the queue, which would let the runner pool decide which
+attempt counts as current, and the field can be absent while the id never is.
+
+"Earliest failing job" is the cause rather than a consequence — a job that fails because another
+job failed can only start after it, and the aggregate job depends on all three signal jobs, so it
+is always last. Here the timestamp is the right signal and the id is not: a run's jobs are all
+created at once, so their ids say nothing about the order they ran in. No job name appears in the
+client.
+
+A job GitHub has not stamped with a `started_at` therefore sorts **last**, not to the epoch, which
+would be first. This is not hypothetical: a job that never ran concludes `startup_failure`, which
+this selection deliberately includes, and it is the population most likely to carry a null start
+time. At the epoch it would beat every real failure and become the whole of the evidence the
+session receives. Ranked last it is still chosen when it is the only failure — the case where it
+*is* the evidence.
+
+If the log itself has expired, the job is returned with an empty excerpt rather than raised: the
+name and URL still describe the failure, and `ci_failure_message` renders the gap as
+`NO_LOG_OUTPUT`. A `410 Gone` is a `4xx`, which neither this client nor the queue retries, so
+raising would fail the remediation over a log that was merely too old.
 
 `get_check_runs` remains for reading the CI state of a SHA. It is not the path to the log.
 
@@ -50,6 +68,8 @@ No job name appears in the client.
 | Take the first failing job the API returns | The order is unspecified. Returning the aggregate job's log would send Devin a message whose evidence section says a signal job failed, and nothing else |
 | Exclude the aggregate job by name | Puts the fork's workflow layout inside Sentinel's client, so renaming a job in another repository silently degrades the excerpt here |
 | Send every failing job's log | Several megabytes of mostly duplicate output, and `LOG_EXCERPT_LINES` exists because the instruction after the excerpt has to survive it |
+| Sort a missing `started_at` to the epoch | Simpler, and wrong in the direction that matters: an unstamped job wins the `min` outright, so the one class of failure with no log to speak of displaces the one with the traceback in it |
+| Order the runs by `run_started_at` as well, for symmetry with the jobs | The two orderings answer different questions. Among attempts, the one GitHub accepted last is current; among the jobs of one attempt, the one that ran first is the cause. Using a timestamp for both looks consistent and puts the runner pool's queueing in charge of which attempt Sentinel reports on |
 
 ## Consequences
 
