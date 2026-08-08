@@ -390,6 +390,9 @@ tasks:
       - dashboard/src/panels/Kpi.tsx
       - dashboard/src/panels/Funnel.tsx
       - dashboard/src/panels/Throughput.tsx
+    shared_append_only:  # see the shared-files table in docs/implementation-plan.md
+      - dashboard/src/fixtures/summary.ts
+      - dashboard/src/setup-tests.ts
     depends_on: [T30]
     adrs: [2026-08-08-no-browser-level-tests]
     ui: true
@@ -404,6 +407,9 @@ tasks:
       - dashboard/src/panels/Cost.tsx
       - dashboard/src/panels/Autonomy.tsx
       - dashboard/src/panels/Failures.tsx
+    shared_append_only:  # see the shared-files table in docs/implementation-plan.md
+      - dashboard/src/fixtures/summary.ts
+      - dashboard/src/setup-tests.ts
     depends_on: [T30]
     adrs: [2026-08-08-no-browser-level-tests]
     ui: true
@@ -417,6 +423,9 @@ tasks:
     owns:
       - dashboard/src/panels/LiveTable.tsx
       - dashboard/src/panels/Timeline.tsx
+    shared_append_only:  # see the shared-files table in docs/implementation-plan.md
+      - dashboard/src/fixtures/summary.ts
+      - dashboard/src/setup-tests.ts
     depends_on: [T30]
     adrs: [2026-08-08-no-browser-level-tests]
     ui: true
