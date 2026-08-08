@@ -19,8 +19,8 @@ jobs:
     name: Lint and type-check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9
         with:
           enable-cache: true
       # uv reads the interpreter version from .python-version and installs it if the runner lacks it.
@@ -49,8 +49,8 @@ jobs:
     env:
       DATABASE_URL: postgresql+asyncpg://sentinel:sentinel@localhost:5432/sentinel
     steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9
         with:
           enable-cache: true
       - run: make install
@@ -62,7 +62,7 @@ jobs:
     name: Dashboard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # T30 creates dashboard/. Until it lands there is nothing to build, and the skip is announced
       # as an annotation so that "dashboard CI never runs" cannot go unnoticed once it does exist.
       - name: Look for the dashboard
@@ -74,7 +74,7 @@ jobs:
             echo "present=false" >> "$GITHUB_OUTPUT"
             echo "::notice title=Dashboard skipped::dashboard/package.json does not exist, so the build and component tests did not run. They start running on their own once T30 adds the directory."
           fi
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         if: steps.probe.outputs.present == 'true'
         with:
           node-version: 20
@@ -97,7 +97,7 @@ jobs:
     name: Compose configuration
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # `env_file: .env` makes Compose refuse to load the project without one. The Makefile seeds it
       # from .env.example, which is what a fresh clone does too.
       - run: make .env
@@ -110,7 +110,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Diff the pull request against its base
