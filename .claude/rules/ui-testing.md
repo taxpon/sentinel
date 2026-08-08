@@ -25,27 +25,24 @@ Vitest + React Testing Library, co-located as `dashboard/src/**/*.test.tsx`. Eve
 
 Use fixture payloads, not live data. Keep them next to the tests.
 
-## Ask before starting — browser-level tests
+## Out of scope — browser-level tests
 
-**Do not begin any of the following without asking on the issue and receiving an answer:**
+**Do not write any of these. Do not propose them either; the question is settled.**
 
 - Playwright, Cypress or any real-browser driver;
 - screenshot or visual-regression comparison;
 - a test that boots the API and the dashboard together.
 
-These are legitimate techniques, but they carry a large token and runtime cost, and whether that
-cost is worth paying is a human decision, not a session-local one.
+The cost is not worth what they would add here
+([ADR](../../docs/adr/2026-08-08-no-browser-level-tests.md)).
 
-To ask:
+This is a decision about the **dashboard only**. It does not touch `tests/test_e2e.py` (T34), which
+drives the whole pipeline in-process with every external faked and is the most important test in
+the repository.
 
-```bash
-gh issue comment <N> -R taxpon/sentinel --body "Proposing a browser-level test for <what>, because <why>. \
-Component tests cover <what they cover> but cannot cover <the gap>. Estimated scope: <n> files. Proceed?"
-```
-
-Then continue with the rest of the task. Do not block on the answer if other work remains, and do
-not silently substitute a browser test with a weaker component test — say which gap is left
-uncovered.
+Where a component test genuinely cannot reach something — real browser layout, cross-panel
+interaction — **say so in the pull request** rather than substituting a weaker test and calling the
+gap covered. A gap that is written down is fine; one that is papered over is not.
 
 ## Layout constraints from the spec
 

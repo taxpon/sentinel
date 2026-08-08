@@ -16,6 +16,7 @@ question. See [when to write one](../implementation-plan.md#adrs).
 | 2026-08-08 | [Index the state machine by trigger, and keep the cycle limit inside it](./2026-08-08-trigger-indexed-state-machine.md) | architecture | accepted | pipeline |
 | 2026-08-08 | [Return a reason from signature verification instead of a boolean or an exception](./2026-08-08-signature-verification-returns-a-reason.md) | architecture | accepted | github, api |
 | 2026-08-08 | [Disable the inherited Superset workflows so a fork head SHA yields one conclusion](./2026-08-08-one-check-suite-on-the-fork.md) | process | accepted | remediation, github |
+| 2026-08-08 | [Test the dashboard with component tests only, never a real browser](./2026-08-08-no-browser-level-tests.md) | process | accepted | dashboard |
 | 2026-08-08 | [Enforce the tests-with-source rule as a CI job that diffs the pull request](./2026-08-08-enforce-tests-with-source-by-diffing-the-pull-request.md) | process | accepted | ops |
 | 2026-08-08 | [Hold credentials as SecretStr and rewrite configuration errors before raising them](./2026-08-08-credentials-are-secretstr-and-config-errors-are-rewritten.md) | architecture | accepted | ops |
 | 2026-08-08 | [Re-enter the CI states from RUNNING so the review-fix loop closes](./2026-08-08-ci-states-re-entered-from-running.md) | architecture | accepted | pipeline, github |
@@ -39,6 +40,7 @@ question. See [when to write one](../implementation-plan.md#adrs).
 
 - **analytics** — [Record every state transition as an append-only event](./2026-08-07-transitions-are-append-only-events.md)
 - **api** — [Acknowledge webhooks with 202 before making any external call](./2026-08-07-respond-202-before-external-calls.md), [Return a reason from signature verification instead of a boolean or an exception](./2026-08-08-signature-verification-returns-a-reason.md)
+- **dashboard** — [Test the dashboard with component tests only, never a real browser](./2026-08-08-no-browser-level-tests.md)
 - **data** — [Use Postgres as the job queue instead of adding Redis](./2026-08-07-postgres-as-job-queue.md), [Record every state transition as an append-only event](./2026-08-07-transitions-are-append-only-events.md), [Deduplicate at both the delivery and the remediation layer](./2026-08-07-two-layer-deduplication.md)
 - **devin** — [Give Devin the objective and constraints, not the steps](./2026-08-07-delegate-task-not-steps.md), [Use the Devin v3 API exclusively](./2026-08-07-devin-v3-only.md), [Resume the existing Devin session on CI failure rather than starting a new one](./2026-08-07-reuse-resumable-sessions.md)
 - **github** — [Re-enter the CI states from RUNNING so the review-fix loop closes](./2026-08-08-ci-states-re-entered-from-running.md), [Disable the inherited Superset workflows so a fork head SHA yields one conclusion](./2026-08-08-one-check-suite-on-the-fork.md), [Return a reason from signature verification instead of a boolean or an exception](./2026-08-08-signature-verification-returns-a-reason.md)
@@ -68,5 +70,9 @@ Look up your task id before starting work.
 | T22 | [Acknowledge webhooks with 202 before making any external call](./2026-08-07-respond-202-before-external-calls.md), [Return a reason from signature verification instead of a boolean or an exception](./2026-08-08-signature-verification-returns-a-reason.md) |
 | T23 | [Require human approval for every merge](./2026-08-07-humans-approve-every-merge.md), [Resume the existing Devin session on CI failure rather than starting a new one](./2026-08-07-reuse-resumable-sessions.md), [Index the state machine by trigger, and keep the cycle limit inside it](./2026-08-08-trigger-indexed-state-machine.md) |
 | T24 | [Drive the remediation state machine from a poller, not from Devin callbacks](./2026-08-07-poller-drives-state-machine.md), [Index the state machine by trigger, and keep the cycle limit inside it](./2026-08-08-trigger-indexed-state-machine.md) |
+| T30 | [Test the dashboard with component tests only, never a real browser](./2026-08-08-no-browser-level-tests.md) |
+| T31 | [Test the dashboard with component tests only, never a real browser](./2026-08-08-no-browser-level-tests.md) |
+| T32 | [Test the dashboard with component tests only, never a real browser](./2026-08-08-no-browser-level-tests.md) |
+| T33 | [Test the dashboard with component tests only, never a real browser](./2026-08-08-no-browser-level-tests.md) |
 | T41 | [Disable the inherited Superset workflows so a fork head SHA yields one conclusion](./2026-08-08-one-check-suite-on-the-fork.md) |
 | T42 | [Add a narrow CI workflow to the fork instead of running Superset full suite](./2026-08-07-scoped-ci-on-the-fork.md), [Disable the inherited Superset workflows so a fork head SHA yields one conclusion](./2026-08-08-one-check-suite-on-the-fork.md), [Report success, not neutral, when the scoped CI finds nothing to run](./2026-08-08-vacuous-ci-reports-success.md) |

@@ -103,8 +103,8 @@ Every task. Also mirrored in the issue body and the PR template.
 - [ ] Non-obvious decisions recorded as ADRs; `make adr-index` re-run
 
 UI tasks (T30–T33) additionally require component tests. See
-[`.claude/rules/ui-testing.md`](../.claude/rules/ui-testing.md) — browser-level end-to-end tests are
-not started without asking first.
+[`.claude/rules/ui-testing.md`](../.claude/rules/ui-testing.md) — browser-level tests are out of
+scope, and `tests/test_e2e.py` (T34) is unaffected by that.
 
 ## ADRs
 

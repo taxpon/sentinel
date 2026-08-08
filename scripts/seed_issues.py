@@ -41,7 +41,8 @@ DOD = """## Definition of Done
 - [ ] Non-obvious decisions recorded in `docs/adr/`; `make adr-index` re-run"""
 
 UI_DOD = """- [ ] Component tests cover rendering, prop branches, empty and error states, and formatting
-- [ ] Any browser-level test was proposed on this issue and answered before being started"""
+- [ ] No browser-level test was written — they are out of scope; any gap a component test could not
+      reach is named in the pull request"""
 
 
 def gh(*args: str, check: bool = True) -> str:
