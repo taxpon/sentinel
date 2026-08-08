@@ -28,7 +28,16 @@ from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
-from sqlalchemy import Connection, delete, inspect, select, text
+from sqlalchemy import (
+    Connection,
+    DefaultClause,
+    MetaData,
+    Text,
+    delete,
+    inspect,
+    select,
+    text,
+)
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
@@ -36,6 +45,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 from sentinel import db
 from sentinel.config import Settings
 from sentinel.models import (
+    NAMING_CONVENTION,
     AcuLedger,
     Base,
     Job,
@@ -193,23 +203,71 @@ async def test_downgrade_leaves_the_database_empty(
     assert await table_names(migrated) - {"alembic_version"} == set()
 
 
+async def differences(engine: AsyncEngine, metadata: MetaData) -> list[Any]:
+    """What autogenerate would write to turn the database into `metadata`.
+
+    The two comparisons Alembic leaves off are the two this schema most needs — a changed column
+    type, and a changed server default — and they have to be set here as well as in
+    `alembic/env.py`, which this context does not go through. That they are set is not something to
+    take on trust: `test_the_comparison_sees_*` below assert the comparison can actually fail.
+
+    `compare_metadata` groups per table, so its result is a list of operations and lists of
+    operations. Flattening it makes both the assertion and the failure message read plainly.
+    """
+
+    def compare(connection: Connection) -> list[Any]:
+        context = MigrationContext.configure(
+            connection, opts={"compare_type": True, "compare_server_default": True}
+        )
+        return compare_metadata(context, metadata)
+
+    async with engine.connect() as connection:
+        found = await connection.run_sync(compare)
+    return [
+        operation
+        for group in found
+        for operation in (group if isinstance(group, list) else [group])
+    ]
+
+
+def a_copy_of_the_models() -> MetaData:
+    """`Base.metadata` copied, so that a test can drift one column without touching the real one."""
+    copy = MetaData(naming_convention=NAMING_CONVENTION)
+    for table in Base.metadata.tables.values():
+        table.to_metadata(copy)
+    return copy
+
+
 async def test_the_migrated_schema_matches_the_models(migrated: AsyncEngine) -> None:
     """The test that catches a model changed without a migration.
 
     Autogenerate compares the live schema against `Base.metadata`; anything it would write into a
-    new revision is a difference between the two. The two comparisons Alembic leaves off are the two
-    this schema most needs — a changed column type, and a changed server default — and the options
-    have to match `alembic/env.py`, which this context does not go through.
+    new revision is a difference between the two.
     """
+    assert await differences(migrated, Base.metadata) == []
 
-    def diff(connection: Connection) -> list[Any]:
-        context = MigrationContext.configure(
-            connection, opts={"compare_type": True, "compare_server_default": True}
-        )
-        return compare_metadata(context, Base.metadata)
 
-    async with migrated.connect() as connection:
-        assert await connection.run_sync(diff) == []
+async def test_the_comparison_sees_a_changed_server_default(migrated: AsyncEngine) -> None:
+    """Proof that the test above can fail — `compare_server_default` is off in Alembic by default.
+
+    With it off the comparison returns *no differences at all* for a changed default, so the drift
+    test passes on a model whose `server_default` no longer matches its migration. That is not a
+    hypothetical: `job.run_after DEFAULT now()` is what makes an un-backed-off job claimable.
+    """
+    drifted = a_copy_of_the_models()
+    drifted.tables["remediation"].c.cycle.server_default = DefaultClause(text("7"))
+
+    assert [operation[0] for operation in await differences(migrated, drifted)] == [
+        "modify_default"
+    ]
+
+
+async def test_the_comparison_sees_a_changed_column_type(migrated: AsyncEngine) -> None:
+    """The same for `compare_type`, the other comparison Alembic leaves off."""
+    drifted = a_copy_of_the_models()
+    drifted.tables["remediation"].c.issue_number.type = Text()
+
+    assert [operation[0] for operation in await differences(migrated, drifted)] == ["modify_type"]
 
 
 async def test_a_redelivered_webhook_is_refused_by_the_database(session: AsyncSession) -> None:
