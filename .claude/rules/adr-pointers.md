@@ -14,7 +14,10 @@ paths:
   - "dashboard/src/panels/Cost.tsx"
   - "dashboard/src/panels/Durations.tsx"
   - "dashboard/src/panels/Failures.tsx"
+  - "dashboard/src/panels/Funnel.tsx"
+  - "dashboard/src/panels/Kpi.tsx"
   - "dashboard/src/panels/LiveTable.tsx"
+  - "dashboard/src/panels/Throughput.tsx"
   - "dashboard/src/panels/Timeline.tsx"
   - "docs/adr/template.md"
   - "docs/tasks.yaml"
@@ -66,7 +69,10 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `dashboard/src/panels/Cost.tsx` — [Blank a dashboard figure whose denominator is empty rather than drawing the zero the API sent](../../docs/adr/2026-08-08-blank-a-figure-whose-denominator-is-empty.md), [The cost panel labels the provenance of its ACUs and of its dollars separately](../../docs/adr/2026-08-08-cost-panel-labels-acu-and-dollar-provenance-separately.md)
 - `dashboard/src/panels/Durations.tsx` — [Blank a dashboard figure whose denominator is empty rather than drawing the zero the API sent](../../docs/adr/2026-08-08-blank-a-figure-whose-denominator-is-empty.md)
 - `dashboard/src/panels/Failures.tsx` — [Blank a dashboard figure whose denominator is empty rather than drawing the zero the API sent](../../docs/adr/2026-08-08-blank-a-figure-whose-denominator-is-empty.md)
+- `dashboard/src/panels/Funnel.tsx` — [Panels render the figure the API computed, and the funnel decides whether it exists](../../docs/adr/2026-08-08-an-undefined-figure-is-an-em-dash.md)
+- `dashboard/src/panels/Kpi.tsx` — [Panels render the figure the API computed, and the funnel decides whether it exists](../../docs/adr/2026-08-08-an-undefined-figure-is-an-em-dash.md)
 - `dashboard/src/panels/LiveTable.tsx` — [The live panels impose their own total order, tie-broken on id](../../docs/adr/2026-08-08-live-panels-sort-client-side-with-an-id-tiebreak.md)
+- `dashboard/src/panels/Throughput.tsx` — [Panels render the figure the API computed, and the funnel decides whether it exists](../../docs/adr/2026-08-08-an-undefined-figure-is-an-em-dash.md)
 - `dashboard/src/panels/Timeline.tsx` — [The live panels impose their own total order, tie-broken on id](../../docs/adr/2026-08-08-live-panels-sort-client-side-with-an-id-tiebreak.md), [The timeline panel selects its own remediation](../../docs/adr/2026-08-08-timeline-panel-selects-its-own-remediation.md)
 - `docs/adr/template.md` — [Validate ADR front matter at generation time and refuse to write a partial index](../../docs/adr/2026-08-08-validate-adr-front-matter-at-generation.md)
 - `docs/tasks.yaml` — [Keep the task graph in one machine-readable file](../../docs/adr/2026-08-07-tasks-yaml-single-source.md)
