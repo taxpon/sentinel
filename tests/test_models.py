@@ -2,8 +2,9 @@
 
 What is asserted here is what the rest of the system is entitled to assume: that the two
 deduplication constraints are refused by the database rather than by a caller remembering to check,
-that the append-only event log cannot be tidied away, that the documented server defaults and metric
-timestamps behave as `docs/03-data-model.md` and `docs/07-observability.md` describe, and that the
+that a remediation cannot be deleted out from under its event log, that the documented server
+defaults and metric timestamps behave as `docs/03-data-model.md` and `docs/07-observability.md`
+describe, that the queue's claiming statement holds up between two connections, and that the
 migration and the models agree.
 
 Every test starts from an empty schema and runs the migration, so what is exercised is the schema
@@ -30,7 +31,7 @@ from alembic.runtime.migration import MigrationContext
 from sqlalchemy import Connection, delete, inspect, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
 from sentinel import db
 from sentinel.config import Settings
@@ -196,11 +197,15 @@ async def test_the_migrated_schema_matches_the_models(migrated: AsyncEngine) -> 
     """The test that catches a model changed without a migration.
 
     Autogenerate compares the live schema against `Base.metadata`; anything it would write into a
-    new revision is a difference between the two.
+    new revision is a difference between the two. The two comparisons Alembic leaves off are the two
+    this schema most needs — a changed column type, and a changed server default — and the options
+    have to match `alembic/env.py`, which this context does not go through.
     """
 
     def diff(connection: Connection) -> list[Any]:
-        context = MigrationContext.configure(connection, opts={"compare_type": True})
+        context = MigrationContext.configure(
+            connection, opts={"compare_type": True, "compare_server_default": True}
+        )
         return compare_metadata(context, Base.metadata)
 
     async with migrated.connect() as connection:
@@ -316,35 +321,50 @@ async def test_the_metric_timestamps_subtract_to_the_documented_durations(
     assert durations == (hour, 2 * hour, 3 * hour, 5 * hour, 2 * hour, None)
 
 
-async def test_the_event_log_stamps_its_own_created_at(session: AsyncSession) -> None:
-    """Ordering within the log is Postgres's clock, not that of whichever process wrote the row."""
+async def test_events_written_in_one_transaction_share_a_created_at(
+    session: AsyncSession,
+) -> None:
+    """`now()` is `transaction_timestamp()`, so `created_at` does not order a transaction.
+
+    `docs/06-event-pipeline.md` writes the transition, the event and the job together, so several
+    events per transaction is the normal case, and every one of them carries the timestamp of the
+    transaction rather than of the insert. A consumer ordering the log — the timeline in
+    `docs/07-observability.md`, the analytics cycle count — must tiebreak on `id`.
+    """
     remediation = a_remediation()
     session.add(remediation)
     await session.flush()
 
-    events = [
-        RemediationEvent(
-            remediation_id=remediation.id, from_state=None, to_state="QUEUED", kind="transition"
-        ),
-        RemediationEvent(
-            remediation_id=remediation.id,
-            from_state="QUEUED",
-            to_state="SESSION_CREATED",
-            kind="transition",
-            detail={"session_id": "devin-1"},
-        ),
-    ]
-    session.add_all(events)
+    first = RemediationEvent(
+        remediation_id=remediation.id, from_state=None, to_state="QUEUED", kind="transition"
+    )
+    session.add(first)
     await session.flush()
-    for event in events:
+
+    second = RemediationEvent(
+        remediation_id=remediation.id,
+        from_state="QUEUED",
+        to_state="SESSION_CREATED",
+        kind="transition",
+        detail={"session_id": "devin-1"},
+    )
+    session.add(second)
+    await session.flush()
+
+    for event in (first, second):
         await session.refresh(event)
+        assert event.created_at.tzinfo is not None
+    # Two separate flushes, one transaction: the timestamps are equal, not merely ordered.
+    assert first.created_at == second.created_at
+    assert first.id < second.id
 
-    assert all(event.created_at.tzinfo is not None for event in events)
-    assert events[0].created_at <= events[1].created_at
 
+async def test_a_remediation_with_events_cannot_be_deleted(session: AsyncSession) -> None:
+    """The foreign key refuses to let a remediation take its history with it.
 
-async def test_the_event_log_cannot_be_tidied_away(session: AsyncSession) -> None:
-    """`remediation_event` is the audit trail: deleting the remediation it belongs to is refused."""
+    Only the parent side is enforced. `DELETE FROM remediation_event` is still legal SQL, and that
+    the log is never written to that way is application discipline, not a constraint.
+    """
     remediation = a_remediation()
     session.add(remediation)
     await session.flush()
@@ -385,7 +405,10 @@ async def test_a_repo_wide_job_needs_no_remediation(session: AsyncSession) -> No
 async def test_the_documented_claim_statement_claims_one_pending_job(
     session: AsyncSession,
 ) -> None:
-    """The queue's claiming SQL against the real schema and a real `FOR UPDATE SKIP LOCKED`."""
+    """The queue's claiming SQL against the real schema: what it selects, and what it writes back.
+
+    One connection, so the row lock is never contended — that is the next test.
+    """
     session.add_all(
         [
             Job(kind="create_session", payload={"issue": 42}, status="pending"),
@@ -407,6 +430,43 @@ async def test_the_documented_claim_statement_claims_one_pending_job(
     assert claimed["locked_at"] is not None
     # The second job is deferred by `run_after`, so nothing is left to claim.
     assert (await session.execute(CLAIM_ONE_JOB, {"worker_id": "worker-2"})).mappings().all() == []
+
+
+async def test_two_workers_claim_disjoint_jobs_without_blocking(
+    migrated: AsyncEngine, session: AsyncSession
+) -> None:
+    """`FOR UPDATE SKIP LOCKED` — the reason these tests need a real Postgres and not SQLite.
+
+    Each claim runs on its own connection with its own transaction left open, so the second worker
+    meets a row the first has locked and not yet committed. That is the only arrangement in which
+    `SKIP LOCKED` does anything: on one connection the `status = 'pending'` predicate alone hides
+    the claimed row, and the statement passes with the locking clause deleted.
+
+    `lock_timeout` is what makes the failure visible. Without `SKIP LOCKED` the second worker waits
+    for the first worker's transaction, which this test never commits, so the assertion would hang
+    forever instead of failing; with it, the wait becomes an error after a second.
+    """
+    session.add_all(
+        [
+            Job(kind="create_session", payload={"issue": 42}, status="pending"),
+            Job(kind="create_session", payload={"issue": 43}, status="pending"),
+        ]
+    )
+    await session.commit()
+
+    async def claim(connection: AsyncConnection, worker_id: str) -> int:
+        await connection.execute(text("SET LOCAL lock_timeout = '1s'"))
+        return (
+            (await connection.execute(CLAIM_ONE_JOB, {"worker_id": worker_id}))
+            .mappings()
+            .one()["id"]
+        )
+
+    async with migrated.connect() as first, migrated.connect() as second:
+        # Neither transaction is committed: both locks are still held when the other worker claims.
+        claimed = [await claim(first, "worker-1"), await claim(second, "worker-2")]
+
+    assert len(set(claimed)) == 2
 
 
 async def test_the_ledger_holds_one_row_per_day(session: AsyncSession) -> None:

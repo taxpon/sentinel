@@ -134,8 +134,11 @@ class RemediationEvent(Base):
     to_state: Mapped[str] = mapped_column(Text)
     kind: Mapped[str] = mapped_column(Text)
     detail: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    # Written by Postgres so that ordering within a transaction is the database's clock and not one
-    # of three processes' idea of the time.
+    # Postgres's clock, rather than that of whichever of the three processes wrote the row. Note
+    # what `now()` is: `transaction_timestamp()`. The pipeline writes the transition, the event and
+    # the enqueued job in one transaction, and every row of that transaction carries the same value
+    # to the microsecond — so `created_at` orders the log *between* transactions and not within
+    # one. Anything reading the log in order tiebreaks on `id`.
     created_at: Mapped[datetime.datetime] = mapped_column(TIMESTAMPTZ, server_default=func.now())
 
 

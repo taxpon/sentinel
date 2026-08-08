@@ -54,9 +54,15 @@ def do_run_migrations(connection: Connection) -> None:
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
-        # Off by default, which means a column whose type changed reads as no change at all. The
-        # drift test in tests/test_models.py is only worth having if it sees that.
+        # Both are off by default, and each one off is a whole class of change that `alembic check`
+        # and `--autogenerate` read as no change at all: a column whose type changed, and a column
+        # whose server default changed. `job.run_after DEFAULT now()` is the difference between a
+        # job that is immediately claimable and one that is never claimed, so it has to be seen.
+        #
+        # The drift test in tests/test_models.py configures its own context and must pass the same
+        # two options; it does not reach this function.
         compare_type=True,
+        compare_server_default=True,
     )
     with context.begin_transaction():
         context.run_migrations()

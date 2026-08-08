@@ -30,9 +30,13 @@ Tests build the schema with `alembic upgrade head` against an empty database, ne
 test runs the migration on the connection and event loop it already has.
 
 One test then asserts that autogenerate finds no difference between the migrated database and
-`Base.metadata`. To make that comparison meaningful, `Base.metadata` carries a naming convention —
-otherwise Postgres names the constraints and Alembic cannot reproduce those names — and the
-comparison runs with `compare_type` enabled.
+`Base.metadata`. Three things make that comparison mean what it appears to mean. `Base.metadata`
+carries a naming convention, because otherwise Postgres names the constraints itself and Alembic
+cannot reproduce those names. And both comparisons Alembic leaves off are turned on: without
+`compare_type` a changed column type reads as no change at all, and without `compare_server_default`
+so does a changed default — `job.run_after DEFAULT now()` is the difference between a job that is
+immediately claimable and one that is never claimed. Both options are set in `alembic/env.py` and
+again in the test, which configures its own migration context and does not go through `env.py`.
 
 ## Alternatives considered
 
