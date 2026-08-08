@@ -12,6 +12,8 @@ paths:
   - "src/sentinel/devin/client.py"
   - "src/sentinel/devin/playbooks.py"
   - "src/sentinel/models.py"
+  - "src/sentinel/observability/logging.py"
+  - "src/sentinel/observability/prom.py"
   - "src/sentinel/pipeline/handlers.py"
   - "src/sentinel/pipeline/poller.py"
   - "src/sentinel/pipeline/state.py"
@@ -41,6 +43,8 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `src/sentinel/devin/client.py` — [Use the Devin v3 API exclusively](../../docs/adr/2026-08-07-devin-v3-only.md)
 - `src/sentinel/devin/playbooks.py` — [Give Devin the objective and constraints, not the steps](../../docs/adr/2026-08-07-delegate-task-not-steps.md)
 - `src/sentinel/models.py` — [Record every state transition as an append-only event](../../docs/adr/2026-08-07-transitions-are-append-only-events.md)
+- `src/sentinel/observability/logging.py` — [Scrub credentials out of log values, not only out of fields named like credentials](../../docs/adr/2026-08-08-log-redaction-scrubs-values-not-only-keys.md)
+- `src/sentinel/observability/prom.py` — [Keep Prometheus metrics process-local and publish cross-process figures as snapshots](../../docs/adr/2026-08-08-metrics-are-process-local.md)
 - `src/sentinel/pipeline/handlers.py` — [Resume the existing Devin session on CI failure rather than starting a new one](../../docs/adr/2026-08-07-reuse-resumable-sessions.md)
 - `src/sentinel/pipeline/poller.py` — [Drive the remediation state machine from a poller, not from Devin callbacks](../../docs/adr/2026-08-07-poller-drives-state-machine.md)
 - `src/sentinel/pipeline/state.py` — [Re-enter the CI states from RUNNING so the review-fix loop closes](../../docs/adr/2026-08-08-ci-states-re-entered-from-running.md), [Index the state machine by trigger, and keep the cycle limit inside it](../../docs/adr/2026-08-08-trigger-indexed-state-machine.md)
