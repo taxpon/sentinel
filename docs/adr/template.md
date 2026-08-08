@@ -1,14 +1,16 @@
 ---
 title: <The decision, in one line, in the imperative>
 status: accepted          # accepted | superseded | deprecated
-date: YYYY-MM-DD
-type: architecture        # architecture | process
-areas: []                 # vocabulary from docs/tasks.yaml -> areas
-tasks: []                 # e.g. [T13, T23]
+date: YYYY-MM-DD          # must match the date in the filename
+type: architecture        # architecture | process; an architecture one also gets a row in docs/02-architecture.md
+areas: []                 # required; vocabulary from docs/tasks.yaml -> areas
+tasks: []                 # e.g. [T13, T23]; ids from docs/tasks.yaml
 files: []                 # source files this decision constrains
 specs: []                 # e.g. [docs/06-event-pipeline.md]
-supersedes:               # slug of the record this replaces, if any
+supersedes:               # slug of the record this replaces; set that record's status to superseded
 ---
+
+<!-- `make adr-index` validates these fields and refuses to write the index if any record fails. -->
 
 # <The decision, in one line>
 

@@ -4,8 +4,10 @@ paths:
   - ".claude/settings.json"
   - ".github/workflows/ci.yml"
   - "Dockerfile"
+  - "docs/adr/template.md"
   - "docs/tasks.yaml"
   - "pyproject.toml"
+  - "scripts/gen_adr_index.py"
   - "src/sentinel/analytics/metrics.py"
   - "src/sentinel/api/webhooks.py"
   - "src/sentinel/config.py"
@@ -35,8 +37,10 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `.claude/settings.json` — [Enforce the pre-PR review step with a hook, not with CLAUDE.md alone](../../docs/adr/2026-08-07-enforce-workflow-with-hooks.md)
 - `.github/workflows/ci.yml` — [Enforce the tests-with-source rule as a CI job that diffs the pull request](../../docs/adr/2026-08-08-enforce-tests-with-source-by-diffing-the-pull-request.md)
 - `Dockerfile` — [Manage dependencies with uv and a committed lock file](../../docs/adr/2026-08-07-uv-for-dependencies-and-the-image.md)
+- `docs/adr/template.md` — [Validate ADR front matter at generation time and refuse to write a partial index](../../docs/adr/2026-08-08-validate-adr-front-matter-at-generation.md)
 - `docs/tasks.yaml` — [Keep the task graph in one machine-readable file](../../docs/adr/2026-08-07-tasks-yaml-single-source.md)
 - `pyproject.toml` — [Manage dependencies with uv and a committed lock file](../../docs/adr/2026-08-07-uv-for-dependencies-and-the-image.md)
+- `scripts/gen_adr_index.py` — [Validate ADR front matter at generation time and refuse to write a partial index](../../docs/adr/2026-08-08-validate-adr-front-matter-at-generation.md)
 - `src/sentinel/analytics/metrics.py` — [Record every state transition as an append-only event](../../docs/adr/2026-08-07-transitions-are-append-only-events.md)
 - `src/sentinel/api/webhooks.py` — [Acknowledge webhooks with 202 before making any external call](../../docs/adr/2026-08-07-respond-202-before-external-calls.md)
 - `src/sentinel/config.py` — [Hold credentials as SecretStr and rewrite configuration errors before raising them](../../docs/adr/2026-08-08-credentials-are-secretstr-and-config-errors-are-rewritten.md)
