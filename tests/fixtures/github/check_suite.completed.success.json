@@ -1,0 +1,101 @@
+{
+  "action": "completed",
+  "check_suite": {
+    "id": 84640096783,
+    "node_id": "CS_kwDOAlosUs8AAAATtPFiDw",
+    "head_branch": "fix-adhoc-column-error-mislabel",
+    "head_sha": "349a7f639dfb353669c001187706d7fd0112ed2f",
+    "status": "completed",
+    "conclusion": "success",
+    "url": "https://api.github.com/repos/taxpon/superset/check-suites/84640096783",
+    "before": "0000000000000000000000000000000000000000",
+    "after": "349a7f639dfb353669c001187706d7fd0112ed2f",
+    "latest_check_runs_count": 4,
+    "check_runs_url": "https://api.github.com/repos/taxpon/superset/check-suites/84640096783/check-runs",
+    "created_at": "2026-08-07T15:11:52Z",
+    "updated_at": "2026-08-07T15:26:37Z",
+    "pull_requests": [
+      {
+        "url": "https://api.github.com/repos/taxpon/superset/pulls/42889",
+        "id": 4229521718,
+        "number": 42889,
+        "head": {
+          "ref": "fix-adhoc-column-error-mislabel",
+          "sha": "349a7f639dfb353669c001187706d7fd0112ed2f",
+          "repo": {
+            "id": 39464018,
+            "url": "https://api.github.com/repos/taxpon/superset",
+            "name": "superset"
+          }
+        },
+        "base": {
+          "ref": "master",
+          "sha": "fe06ebe796f67d32c0b0ee42703b3cf2266cc080",
+          "repo": {
+            "id": 39464018,
+            "url": "https://api.github.com/repos/taxpon/superset",
+            "name": "superset"
+          }
+        }
+      }
+    ],
+    "app": {
+      "id": 15368,
+      "slug": "github-actions",
+      "node_id": "MDM6QXBwMTUzNjg=",
+      "name": "GitHub Actions"
+    },
+    "head_commit": {
+      "id": "349a7f639dfb353669c001187706d7fd0112ed2f",
+      "tree_id": "e13b55481bc9edc27566679b056b04374d10ce83",
+      "message": "fix(sqla): don't mislabel DB errors as ColumnNotFoundException in adhoc_column_to_sqla (SC-116904)\n\nThe type-probe in SqlaTable.adhoc_column_to_sqla wrapped the whole probe in\na try/except SupersetGenericDBErrorException that relabeled every such error\nas ColumnNotFoundException. Because get_columns_description wraps any\nexecution failure (SSL EOF, timeouts, dropped connections) as a\nSupersetGenericDBErrorException, real transient DB errors were mislabeled as\n\"column not found\". where_clause's adhoc-filter handling then silently dropped\nthe filter instead of surfacing the DB error.\n\nOnly the genuine empty-result case now raises ColumnNotFoundException; a real\nDB/connectivity failure from get_columns_description propagates unchanged.\n\nFixes SUPERSET-PYTHON-WE6\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>",
+      "timestamp": "2026-08-07T15:11:13Z",
+      "author": {
+        "name": "Elizabeth Thompson",
+        "email": "eschutho@gmail.com"
+      },
+      "committer": {
+        "name": "Elizabeth Thompson",
+        "email": "eschutho@gmail.com"
+      }
+    }
+  },
+  "repository": {
+    "id": 1324552374,
+    "node_id": "R_kgDOTvMQtg",
+    "name": "superset",
+    "full_name": "taxpon/superset",
+    "private": false,
+    "html_url": "https://github.com/taxpon/superset",
+    "description": "Apache Superset is a Data Visualization and Data Exploration Platform",
+    "fork": true,
+    "url": "https://api.github.com/repos/taxpon/superset",
+    "created_at": "2026-08-05T23:15:21Z",
+    "updated_at": "2026-08-08T07:06:34Z",
+    "pushed_at": "2026-08-05T22:40:43Z",
+    "default_branch": "master",
+    "visibility": "public",
+    "archived": false,
+    "disabled": false,
+    "has_issues": true,
+    "open_issues_count": 0,
+    "owner": {
+      "login": "taxpon",
+      "id": 1885971,
+      "node_id": "MDQ6VXNlcjE4ODU5NzE=",
+      "avatar_url": "https://avatars.githubusercontent.com/u/1885971?v=4",
+      "html_url": "https://github.com/taxpon",
+      "type": "User",
+      "site_admin": false
+    }
+  },
+  "sender": {
+    "login": "eschutho",
+    "id": 5186919,
+    "node_id": "MDQ6VXNlcjUxODY5MTk=",
+    "avatar_url": "https://avatars.githubusercontent.com/u/5186919?v=4",
+    "html_url": "https://github.com/eschutho",
+    "type": "User",
+    "site_admin": false
+  }
+}
