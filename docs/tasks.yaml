@@ -453,11 +453,18 @@ tasks:
     spec: docs/08-testing.md#ci-on-the-fork
     owns:
       - "taxpon/superset:.github/workflows/devin-autofix-ci.yml"
+      - docs/fork-ci/devin-autofix-ci.yml
+      - docs/fork-ci/README.md
     depends_on: []
-    adrs: [2026-08-07-scoped-ci-on-the-fork]
+    adrs:
+      - 2026-08-07-scoped-ci-on-the-fork
+      - 2026-08-08-vacuous-ci-reports-success
+      - 2026-08-08-one-check-suite-on-the-fork
     notes: >-
-      Lives in the fork, not this repository. Also opens one throwaway PR to
-      register the fork's workflows (B2).
+      Lives in the fork, not this repository; the reviewable copy is kept under
+      docs/fork-ci/. Also opens one throwaway PR to register the fork's
+      workflows (B2), and disables the inherited workflows so a head SHA yields
+      one conclusion.
 
   - id: T43
     title: Vulnerability scanner that files issues
