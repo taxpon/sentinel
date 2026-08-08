@@ -42,8 +42,16 @@ class Settings(BaseSettings):
         # verbatim. Without this, a blank line would configure an empty token rather than leaving
         # the variable unset, and the required-variable check would never fire.
         env_ignore_empty=True,
+        # `env_ignore_empty` only catches the exactly-empty value, and a secret pasted into `.env`
+        # tends to arrive with a stray space attached. Stripping first means a whitespace-only value
+        # fails the `min_length` below rather than configuring a blank credential.
+        str_strip_whitespace=True,
         # The same `.env` feeds Compose, which reads variables of its own (POSTGRES_PORT, API_PORT).
         extra="ignore",
+        # Nothing writes to the settings, and `get_settings()` hands the same object to the api, the
+        # worker and the poller, so one assignment anywhere would reconfigure the whole process —
+        # past every validator here, and past SecretStr, since the assigned value is a plain str.
+        frozen=True,
     )
 
     # --- Devin ---
@@ -107,8 +115,11 @@ class Settings(BaseSettings):
 
 
 def _describe(error: ValidationError) -> str:
+    """Render the failures as variable names and messages, never the values they rejected."""
     lines: list[str] = []
     for item in error.errors(include_url=False):
+        # The tail of `loc` is kept: for DEVIN_PLAYBOOK_IDS it is the offending issue class, which
+        # the operator needs in order to find the bad entry. It is a key, never a value.
         parts = [str(part) for part in item["loc"]]
         variable = ".".join([parts[0].upper(), *parts[1:]])
         lines.append(f"  {variable}: {item['msg']}")
@@ -129,6 +140,10 @@ def get_settings() -> Settings:
     try:
         return Settings()
     except ValidationError as exc:
-        # `from None` drops the ValidationError: it carries the rejected input, which for
-        # DEVIN_API_TOKEN or DATABASE_URL is a credential that must not reach a traceback.
-        raise ConfigurationError(_describe(exc)) from None
+        # The ValidationError carries the input it rejected, and for a variable reported as missing
+        # that input is the raw environment — every credential at once, before SecretStr wraps any
+        # of them. So only the message escapes: it is built here and raised below, because
+        # `from None` clears `__cause__` but leaves `__context__` pointing at the ValidationError.
+        # Outside the handler there is no exception left for Python to attach.
+        message = _describe(exc)
+    raise ConfigurationError(message) from None

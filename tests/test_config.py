@@ -1,16 +1,20 @@
 """The configuration table in `docs/09-operations.md#configuration` is the contract; these tests
-restate it independently and check the model against it. `tests/test_env_example.py` does the same
-for `.env.example`, so the file, the table and the model cannot drift apart in any pair."""
+check the model against it. Names, required-ness and the defaults are read back out of the table
+itself, via the parser `tests/test_env_example.py` already uses to hold `.env.example` to it — so
+the file, the table and the model cannot drift apart in any pair. The expected *values* below are
+transcribed by hand, because a test that derives them from the model would agree with any model."""
 
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from sentinel.config import ConfigurationError, Settings, get_settings
+from test_env_example import documented_variables
 
 # The required column of the table, with a value that satisfies each one.
 REQUIRED = {
@@ -44,15 +48,19 @@ Load = Callable[..., Settings]
 
 
 @pytest.fixture(autouse=True)
-def isolated_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def isolated_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
     """No test may read the developer's environment, or the `.env` in their working tree.
 
     `env_file` is resolved against the working directory, so the tests run from an empty one.
+    Clearing on the way out matters as much as on the way in: the cache outlives this module, and a
+    later test calling `get_settings()` would otherwise be handed the fake environment built here.
     """
     for field in Settings.model_fields:
         monkeypatch.delenv(field.upper(), raising=False)
         monkeypatch.delenv(field, raising=False)
     monkeypatch.chdir(tmp_path)
+    get_settings.cache_clear()
+    yield
     get_settings.cache_clear()
 
 
@@ -77,7 +85,32 @@ def load(monkeypatch: pytest.MonkeyPatch) -> Load:
 
 def test_the_model_covers_the_documented_table_and_nothing_else() -> None:
     # Without this, a variable dropped from the model would simply stop being tested below.
-    assert {field.upper() for field in Settings.model_fields} == set(REQUIRED) | set(DEFAULTS)
+    documented = set(documented_variables())
+
+    assert {field.upper() for field in Settings.model_fields} == documented
+    assert set(REQUIRED) | set(DEFAULTS) == documented  # the transcription above is complete
+
+
+def test_the_model_requires_exactly_the_variables_the_table_marks_required() -> None:
+    documented = {name for name, spec in documented_variables().items() if spec.required}
+    required = {
+        name.upper() for name, field in Settings.model_fields.items() if field.is_required()
+    }
+
+    assert required == documented
+    assert set(REQUIRED) == documented
+
+
+@pytest.mark.parametrize("variable", sorted(DEFAULTS))
+def test_the_model_default_is_the_value_the_table_documents(load: Load, variable: str) -> None:
+    # The hand-transcribed DEFAULTS above pin the type; this pins them to the document itself, by
+    # comparing the unset variable against the same variable set to its documented default.
+    documented = documented_variables()[variable].default
+    attribute = variable.lower()
+
+    assert getattr(load(**{variable: None}), attribute) == getattr(
+        load(**{variable: documented}), attribute
+    )
 
 
 @pytest.mark.parametrize(("variable", "expected"), sorted(DEFAULTS.items()))
@@ -99,13 +132,21 @@ def test_a_missing_required_variable_is_named_in_the_error(load: Load, variable:
 
 
 @pytest.mark.parametrize("variable", sorted(REQUIRED))
-def test_a_blank_required_variable_is_rejected(load: Load, variable: str) -> None:
+@pytest.mark.parametrize("blank", ["", "   ", "\t"], ids=["empty", "spaces", "tab"])
+def test_a_blank_required_variable_is_rejected(load: Load, variable: str, blank: str) -> None:
     # `cp .env.example .env` leaves exactly these blank, so blank must mean "not filled in yet"
-    # rather than "configured as the empty string".
+    # rather than "configured as the empty string" — and a line left as whitespace is still blank.
     with pytest.raises(ConfigurationError) as raised:
-        load(**{variable: ""})
+        load(**{variable: blank})
 
     assert variable in str(raised.value)
+
+
+def test_whitespace_around_a_pasted_value_is_discarded(load: Load) -> None:
+    settings = load(DEVIN_ORG_ID="  org-pasted  ", DEVIN_API_TOKEN="  cog_pasted\t")
+
+    assert settings.devin_org_id == "org-pasted"
+    assert settings.devin_api_token.get_secret_value() == "cog_pasted"
 
 
 def test_missing_required_variables_are_reported_together(load: Load) -> None:
@@ -243,7 +284,7 @@ def test_secrets_are_masked_wherever_the_settings_are_rendered(load: Load) -> No
 
 def test_a_rejected_secret_is_not_quoted_back_in_the_error(load: Load) -> None:
     # pydantic's own ValidationError repeats the input it rejected, which for these variables is a
-    # credential. Whatever `get_settings` raises must not carry it, directly or as a cause.
+    # credential. Whatever `get_settings` raises must not carry it, by any route.
     with pytest.raises(ConfigurationError) as raised:
         load(
             DATABASE_URL="mysql://sentinel:dbpassword@localhost:3306/sentinel",
@@ -254,6 +295,34 @@ def test_a_rejected_secret_is_not_quoted_back_in_the_error(load: Load) -> None:
     assert "dbpassword" not in str(raised.value)
     assert raised.value.__cause__ is None
     assert raised.value.__suppress_context__
+    # __context__ is the one that bites: `from None` does not clear it, and anything walking the
+    # chain structurally rather than formatting it would find the whole rejected environment there.
+    assert raised.value.__context__ is None
+
+
+def test_a_missing_variable_does_not_expose_the_environment_that_was_read(load: Load) -> None:
+    # pydantic reports a missing field with the entire input mapping — here, every other
+    # credential — as the rejected value.
+    with pytest.raises(ConfigurationError) as raised:
+        load(GITHUB_WEBHOOK_SECRET=None)
+
+    reachable = str(raised.value) + repr(raised.value.__context__) + repr(raised.value.__cause__)
+    for secret in (REQUIRED["DEVIN_API_TOKEN"], REQUIRED["GITHUB_TOKEN"], "dbpassword"):
+        assert secret not in reachable
+
+
+def test_the_settings_cannot_be_reconfigured_after_loading(load: Load) -> None:
+    # The same object is shared by the api, the worker and the poller, and assignment would run no
+    # validator: an invalid driver, or a credential silently downgraded from SecretStr to str.
+    settings = load()
+
+    with pytest.raises(ValidationError):
+        settings.database_url = "mysql://oops"  # type: ignore[assignment]  # the point of the test
+    with pytest.raises(ValidationError):
+        settings.max_concurrent_sessions = -5
+
+    assert settings.database_url.get_secret_value() == REQUIRED["DATABASE_URL"]
+    assert settings.max_concurrent_sessions == 3
 
 
 def test_the_dotenv_file_is_read_and_the_environment_wins(
