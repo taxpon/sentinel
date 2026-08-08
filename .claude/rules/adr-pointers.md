@@ -1,6 +1,7 @@
 ---
 paths:
   - ".claude/settings.json"
+  - ".github/workflows/ci.yml"
   - "Dockerfile"
   - "docs/tasks.yaml"
   - "pyproject.toml"
@@ -25,6 +26,7 @@ changing the behaviour it describes. If you are deliberately overturning it, sup
 ADR in the same pull request rather than leaving it contradicted by the code.
 
 - `.claude/settings.json` — [Enforce the pre-PR review step with a hook, not with CLAUDE.md alone](../../docs/adr/2026-08-07-enforce-workflow-with-hooks.md)
+- `.github/workflows/ci.yml` — [Enforce the tests-with-source rule as a CI job that diffs the pull request](../../docs/adr/2026-08-08-enforce-tests-with-source-by-diffing-the-pull-request.md)
 - `Dockerfile` — [Manage dependencies with uv and a committed lock file](../../docs/adr/2026-08-07-uv-for-dependencies-and-the-image.md)
 - `docs/tasks.yaml` — [Keep the task graph in one machine-readable file](../../docs/adr/2026-08-07-tasks-yaml-single-source.md)
 - `pyproject.toml` — [Manage dependencies with uv and a committed lock file](../../docs/adr/2026-08-07-uv-for-dependencies-and-the-image.md)
