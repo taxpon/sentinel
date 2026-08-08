@@ -17,9 +17,13 @@ dashboard, so a test that only checked a call happened would cover none of it.
 **The review-fix loop resumes the same session.** Both edges are driven end to end — the cycle
 number, the log excerpt, the review body *and* its inline comments, and the `cycle:N` tag.
 
-**Escalation reads the reason before it acts.** A remediation that reached `FAILED` because a
-maintainer removed the label or closed the issue is not commented on and not labelled
-(`docs/adr/2026-08-08-cancellation-is-recorded-as-failed.md`).
+**Escalation reads the reason before it acts, and reads it from the column.** A remediation that
+reached `FAILED` because a maintainer removed the label or closed the issue is not commented on and
+not labelled (`docs/adr/2026-08-08-cancellation-is-recorded-as-failed.md`); one whose pull request
+was closed unmerged still is, because the issue is still open
+(`docs/adr/2026-08-09-an-abandoned-pull-request-still-escalates.md`). Which of the two happens is
+decided from `remediation.blocked_reason`, so the tests below disagree the column with the payload
+on purpose.
 """
 
 from __future__ import annotations
@@ -88,6 +92,10 @@ REVIEW_COMMENTS = f"{PULLS}/{PR_NUMBER}/reviews/{REVIEW_ID}/comments"
 
 WORKER = "worker-a"
 OTHER_WORKER = "worker-b"
+
+ABANDONED = "pull_request_closed_unmerged"
+"""`sentinel.github.events.Reason` for `pull_request.closed` with `merged: false` — the third
+human-caused `FAILED`, and the one that is *not* suppressed."""
 
 
 # ------------------------------------------------------------------------------------- fixtures
@@ -982,8 +990,13 @@ async def test_escalate_labels_before_it_comments(
 
 def test_the_suppressed_reasons_are_the_two_the_cancellation_record_names() -> None:
     """Written out rather than read from the constant: a test parametrised over the set it is
-    checking would pass by having nothing to run if the set were ever emptied."""
+    checking would pass by having nothing to run if the set were ever emptied.
+
+    The strings are `sentinel.github.events.Reason`'s, which this module cannot import until T20
+    merges. Pinning them here is what keeps the two spellings from drifting in the meantime.
+    """
     assert sorted(CANCELLED_BY_A_HUMAN) == ["autofix_label_removed", "issue_closed"]
+    assert ABANDONED not in CANCELLED_BY_A_HUMAN
 
 
 @pytest.mark.parametrize("reason", ["autofix_label_removed", "issue_closed"])
@@ -1008,12 +1021,52 @@ async def test_escalation_is_suppressed_when_a_maintainer_called_the_work_off(
     assert job.status == JobStatus.DONE
 
 
-async def test_escalate_falls_back_to_the_stored_reason(
+async def test_an_abandoned_pull_request_is_escalated_rather_than_suppressed(
+    context: Context,
+    seed: Seed,
+    enqueue: Enqueue,
+    claim: Claim,
+    github_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`docs/adr/2026-08-09-an-abandoned-pull-request-still-escalates.md`.
+
+    A maintainer closing Devin's pull request is as deliberate as closing the issue, and it is the
+    one of the three that leaves the issue open and still carrying `devin:autofix` — so it is the
+    one the escalation is for.
+    """
+    await an_escalate_job(seed, enqueue, reason=ABANDONED)
+    fake_escalation_targets(github_api)
+
+    await handlers.escalate(context, await claim())
+
+    assert github_api.only("POST", f"{ISSUE}/labels").json == {"labels": [NEEDS_HUMAN_LABEL]}
+    assert ABANDONED in github_api.only("POST", f"{ISSUE}/comments").json["body"]
+    [job] = await job_rows(session_factory)
+    assert job.status == JobStatus.DONE
+
+
+async def test_escalate_reads_the_reason_from_the_column_not_the_payload(
     context: Context, seed: Seed, enqueue: Enqueue, claim: Claim, github_api: FakeAPI
 ) -> None:
-    """A payload without a reason still escalates on what the transition recorded."""
-    remediation_id = await seed(state=State.FAILED.value, blocked_reason="session_error")
-    await enqueue(JobKind.ESCALATE, {}, remediation_id)
+    """`remediation.blocked_reason` is the one place the ingress is obliged to write the reason, and
+    what the failure breakdown groups on. The `escalate` payload is specified by no record, so it
+    must not be what decides whether a human is told."""
+    remediation_id = await seed(state=State.FAILED.value, blocked_reason="issue_closed")
+    await enqueue(JobKind.ESCALATE, {"reason": "session_error"}, remediation_id)
+    fake_escalation_targets(github_api)
+
+    await handlers.escalate(context, await claim())
+
+    assert github_api.requests == []
+
+
+async def test_escalate_falls_back_to_the_payload_when_the_column_is_empty(
+    context: Context, seed: Seed, enqueue: Enqueue, claim: Claim, github_api: FakeAPI
+) -> None:
+    """A producer that filled only the payload still escalates on something legible."""
+    remediation_id = await seed(state=State.FAILED.value)
+    await enqueue(JobKind.ESCALATE, {"reason": "session_error"}, remediation_id)
     fake_escalation_targets(github_api)
 
     await handlers.escalate(context, await claim())

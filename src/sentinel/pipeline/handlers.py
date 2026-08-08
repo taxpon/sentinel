@@ -119,12 +119,21 @@ failure the reliability policy does not retry. The error itself goes in the even
 the stable identifier the failure-breakdown panel groups on."""
 
 CANCELLED_BY_A_HUMAN: Final[frozenset[str]] = frozenset({"autofix_label_removed", "issue_closed"})
-"""The two `FAILED` reasons that must not be escalated.
+"""The two `FAILED` reasons that must not be escalated: the maintainer called the work off at its
+source, by removing the label or closing the issue.
 
-Spelled here rather than imported from `sentinel.github.events`, which owns the vocabulary: that
-module is another task's, the ingress that produces these reasons is a third's, and a handler that
-could not be read without them would be coupled to both. The obligation is recorded in
-`docs/adr/2026-08-08-cancellation-is-recorded-as-failed.md`, which names this task."""
+**`pull_request_closed_unmerged` is deliberately not in this set.** It is also usually a human
+closing something on purpose, and it is still escalated, because it leaves the *issue* open and
+still labelled — see `docs/adr/2026-08-09-an-abandoned-pull-request-still-escalates.md`.
+
+Spelled out here rather than imported from `sentinel.github.events`, which owns the vocabulary:
+that module is unmerged and belongs to another task, and the ingress that writes these reasons to
+`remediation.blocked_reason` belongs to a third. **Once T20 lands this should become
+`frozenset({Reason.AUTOFIX_LABEL_REMOVED, Reason.ISSUE_CLOSED})`** — `Reason` is a `StrEnum` whose
+module imports only `sentinel.config` and `sentinel.pipeline.state`, so it costs the worker nothing
+and removes the drift this literal set carries. `tests/test_worker.py` pins the strings meanwhile.
+The obligation is recorded in `docs/adr/2026-08-08-cancellation-is-recorded-as-failed.md`, which
+names this task."""
 
 NO_FAILING_JOB: Final = "(GitHub reported no failing job for this commit)"
 """Stands in for the job name when nothing on the head SHA failed in Actions — a check suite whose
@@ -503,13 +512,24 @@ async def escalate(context: Context, job: ClaimedJob) -> None:
     escalation on the same issue. A retry after the comment failed therefore re-labels and comments
     once; the only way to comment twice is the lease window every handler shares.
 
-    Suppressed for the two reasons that mean a maintainer called the work off — see the module
-    docstring and `docs/adr/2026-08-08-cancellation-is-recorded-as-failed.md`.
+    **The reason is read from `remediation.blocked_reason`**, and falls back to the payload only
+    when the column is empty. The column is the one place the reason is contractually obliged to be:
+    `docs/adr/2026-08-08-cancellation-is-recorded-as-failed.md` requires the ingress to write it
+    there, and the failure breakdown in `docs/07-observability.md` groups on it — so a reason
+    missing from the column is already a hole in the dashboard, and reading it from anywhere else
+    would hide that. The `escalate` payload is specified by no record, and preferring it would make
+    the suppression decision depend on a third copy of a string nobody is obliged to fill. The
+    payload is read for the *figures* behind the reason, which exist nowhere else.
+
+    Suppressed for the reasons that mean a maintainer called the work off — see the module
+    docstring, `CANCELLED_BY_A_HUMAN`, and
+    `docs/adr/2026-08-09-an-abandoned-pull-request-still-escalates.md` for the neighbouring case
+    that deliberately does not.
     """
     async with context.session_factory() as db:
         remediation = await load_remediation(db, job)
         issue_number = remediation.issue_number
-        reason = _text(job.payload.get("reason")) or _text(remediation.blocked_reason)
+        reason = _text(remediation.blocked_reason) or _text(job.payload.get("reason"))
         state = remediation.state
         session_url = remediation.devin_session_url
 
