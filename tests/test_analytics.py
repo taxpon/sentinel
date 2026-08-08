@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -296,7 +297,12 @@ async def test_summary_matches_the_hand_computed_window(
             {"reason": "cycle_limit_exhausted", "count": 1, "issues": [108]},
             {"reason": "requires_upstream_decision", "count": 1, "issues": [107]},
         ],
-        "impact": {"hours_saved": 14.0, "assumption": IMPACT_ASSUMPTION},
+        # The caption is written out rather than compared against the constant it came from:
+        # asserting a module's string against itself would let it drift from the spec unnoticed.
+        "impact": {
+            "hours_saved": 14.0,
+            "assumption": "baseline hours per issue class; see docs/05",
+        },
         "generated_at": "2026-08-08T04:12:03Z",
     }
 
@@ -386,7 +392,10 @@ async def test_an_empty_window_is_a_complete_payload_of_zeros(
         "cycles": {"mean": 0.0, "distribution": {}},
         "throughput": [],
         "failures": [],
-        "impact": {"hours_saved": 0.0, "assumption": IMPACT_ASSUMPTION},
+        "impact": {
+            "hours_saved": 0.0,
+            "assumption": "baseline hours per issue class; see docs/05",
+        },
         "generated_at": "2026-08-08T04:12:03Z",
     }
 
@@ -607,6 +616,30 @@ async def test_fix_cycles_are_averaged_over_every_remediation_not_only_the_merge
     }
 
 
+async def test_the_cycle_distribution_is_keyed_in_numeric_order(
+    session: AsyncSession, settings: Settings
+) -> None:
+    """Ten cycles sorts after two, not between zero and two.
+
+    The keys are strings because JSON object keys are, and sorting them as strings would put "10"
+    second. Cosmetic — the autonomy panel re-sorts numerically — but the payload is read by people
+    as well, and a bar chart built straight from the key order would be wrong.
+    """
+    await seed(
+        session,
+        (
+            {"issue_number": 511, "labeled_at": at(3, 9)},
+            {"issue_number": 512, "labeled_at": at(3, 10)},
+            {"issue_number": 513, "labeled_at": at(3, 11)},
+        ),
+        ((512, "CI_FAILED", "RUNNING"),) * 2 + ((513, "CI_FAILED", "RUNNING"),) * 10,
+    )
+
+    distribution = (await summarise(session, settings))["cycles"]["distribution"]
+    assert list(distribution) == ["0", "2", "10"]
+    assert distribution == {"0": 1, "2": 1, "10": 1}
+
+
 # --- Cost ----------------------------------------------------------------------------------------
 
 
@@ -701,6 +734,28 @@ async def test_the_ledger_day_after_the_window_does_not_cover_it(
     assert (await summarise(seeded, settings))["cost"]["source"] == "derived"
 
 
+async def test_a_window_that_touches_no_day_is_never_vouched_for(
+    seeded: AsyncSession, settings: Settings
+) -> None:
+    """A zero-length window covers no day, so a fully synced ledger still does not cover it.
+
+    "Every day of the window is synced" is vacuously true of a window with no days — which would put
+    Devin's name on figures backed by nothing. `parse_window` cannot build such a window, but
+    `Window` is a public dataclass and the API constructs one, so the emptiness is asserted here
+    rather than assumed.
+    """
+    seeded.add_all(
+        an_acu_ledger_entry(day=datetime.date(2026, 8, day), acus=Decimal("5.000"))
+        for day in range(1, 9)
+    )
+    await seeded.commit()
+
+    instant = Window(start=WINDOW.start, end=WINDOW.start)
+    payload = await summarise(seeded, settings, window=instant)
+    assert payload["funnel"]["labelled"] == 0
+    assert payload["cost"]["source"] == "derived"
+
+
 # --- Failures ------------------------------------------------------------------------------------
 
 
@@ -766,6 +821,36 @@ async def test_a_failure_with_no_reason_is_shown_not_dropped(
     ]
 
 
+async def test_a_blocked_remediation_with_an_unrecognised_class_summarises(
+    session: AsyncSession, settings: Settings
+) -> None:
+    """The one row shape that could take out the whole payload rather than one panel.
+
+    `issue_class` is free `text`, and `baseline_hours_for` raises `UnknownIssueClass` rather than
+    defaulting — so a merged remediation of an unknown class would raise out of `summary()` and
+    blank all nine panels at once. The state machine makes that unreachable by routing an
+    unrecognised class `QUEUED -> BLOCKED`, and this asserts the reachable half: such a row appears
+    in the failure breakdown, contributes no hours, and does not stop the summary being computed.
+    """
+    await seed(
+        session,
+        (
+            {
+                "issue_number": 802,
+                "issue_class": "not-a-known-class",
+                "state": "BLOCKED",
+                "labeled_at": at(3, 9),
+                "blocked_reason": "unknown_issue_class",
+            },
+        ),
+    )
+
+    payload = await summarise(session, settings)
+    assert payload["failures"] == [{"reason": "unknown_issue_class", "count": 1, "issues": [802]}]
+    assert payload["impact"]["hours_saved"] == 0.0
+    assert payload["throughput"] == []
+
+
 # --- Throughput ----------------------------------------------------------------------------------
 
 
@@ -792,18 +877,44 @@ async def test_throughput_is_keyed_by_the_day_a_fix_merged(
                 "issue_class": "security",
                 "state": "MERGED",
                 "labeled_at": at(7, 22),
-                # 23:30 in a +09:00 offset is 14:30 UTC on the same day.
-                "merged_at": datetime.datetime(
-                    2026, 8, 7, 23, 30, tzinfo=datetime.timezone(datetime.timedelta(hours=9))
-                ),
+                # Late on the 7th, so a series keyed on `labeled_at` would agree by accident on
+                # this row and disagree on 901 above. Which UTC day a merge falls on cannot be
+                # tested through the database: asyncpg normalises every `timestamptz` to UTC before
+                # this module sees it, whatever offset the value was written with.
+                "merged_at": at(7, 23, 30),
+            },
+            {
+                "issue_number": 903,
+                "issue_class": "flaky-test",
+                "state": "MERGED",
+                "labeled_at": at(7, 21),
+                "merged_at": at(9, 2),
             },
         ),
     )
 
-    assert (await summarise(session, settings))["throughput"] == [
+    throughput = (await summarise(session, settings))["throughput"]
+    assert throughput == [
         {"day": "2026-08-07", "by_class": {"security": 1}},
-        {"day": "2026-08-09", "by_class": {"security": 1}},
+        {"day": "2026-08-09", "by_class": {"flaky-test": 1, "security": 1}},
     ]
+    # Days ascending and classes alphabetical, both independent of the order the rows arrived in.
+    assert [day["day"] for day in throughput] == ["2026-08-07", "2026-08-09"]
+    assert list(throughput[1]["by_class"]) == ["flaky-test", "security"]
+
+
+# --- The spec ------------------------------------------------------------------------------------
+
+
+def test_the_impact_assumption_is_the_one_the_spec_publishes() -> None:
+    """The caption is copied from `docs/07-observability.md`, so it is checked against it.
+
+    The impact panel renders this sentence next to a number of hours; it is the label that stops
+    that number being read as a measurement. Nothing else in the payload is prose, and prose is
+    exactly what drifts from a document without any arithmetic noticing.
+    """
+    spec = (Path(__file__).resolve().parents[1] / "docs" / "07-observability.md").read_text()
+    assert f'"assumption": "{IMPACT_ASSUMPTION}"' in spec
 
 
 # --- The window parameter ------------------------------------------------------------------------
@@ -832,8 +943,40 @@ def test_parse_window_reads_days_and_hours(spec: str, length: datetime.timedelta
     )
 
 
-@pytest.mark.parametrize("spec", ["", "7", "d", "7w", "-7d", "7 d", "7days", "0d", "0h"])
+@pytest.mark.parametrize(
+    "spec",
+    [
+        "",
+        "7",
+        "d",
+        "7w",
+        "-7d",
+        "7 d",
+        "7days",
+        "0d",
+        "0h",
+        # Over the ceiling but still a `timedelta`.
+        "366d",
+        "8761h",
+        # Past what `datetime` can represent at all. The count in a window spec is unbounded digits
+        # arriving from a query string, and these raise `OverflowError` — not a `ValueError` — from
+        # inside `datetime` unless the ceiling is checked first. An API handler written to this
+        # function's contract would let that through as a 500 on `?window=1000000d`.
+        "99999d",
+        "1000000d",
+        "999999999999d",
+        "999999999999999999999999h",
+    ],
+)
 def test_parse_window_rejects_anything_else(spec: str) -> None:
     """A malformed parameter is an error the API can turn into a 4xx, not a silent default."""
     with pytest.raises(ValueError, match="window"):
         parse_window(spec, now=GENERATED_AT)
+
+
+def test_parse_window_accepts_the_longest_window_it_documents() -> None:
+    """The ceiling is inclusive, and it is the same length however it is spelled."""
+    assert parse_window("365d", now=GENERATED_AT) == parse_window("8760h", now=GENERATED_AT)
+    assert parse_window("365d", now=GENERATED_AT).start == GENERATED_AT - datetime.timedelta(
+        days=365
+    )

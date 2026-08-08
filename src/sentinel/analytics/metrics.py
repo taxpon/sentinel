@@ -4,7 +4,7 @@
 nesting and types as the schema in that document, which the dashboard is already typed against
 (`dashboard/src/api.ts`). The API layer serves the dictionary; it computes nothing.
 
-Three properties of the numbers, because a metrics module is only useful if a reader knows what a
+Four properties of the numbers, because a metrics module is only useful if a reader knows what a
 figure is a figure *of*:
 
 - **The window selects remediations by `labeled_at`**, half-open `[start, end)`, and every figure is
@@ -17,6 +17,14 @@ figure is a figure *of*:
   therefore never read as a measurement.
 - **A percentile is an observed duration,** the value at nearest rank, never interpolated
   (`docs/adr/2026-08-08-percentiles-are-nearest-rank-observations.md`).
+- **Every figure is independent of the order the rows arrive in.** Each is a count, a sum, a
+  `Counter` or a percentile over an internally sorted sample, and each list in the payload sorts
+  itself before it is returned. That is worth stating rather than leaving to be re-derived: the
+  usual reason to care about ordering here is that `remediation_event.created_at` is
+  `transaction_timestamp()`, so rows written in one transaction are indistinguishable by time
+  (`docs/06-event-pipeline.md`) — and the risk that creates for this module is a tied row being
+  *collapsed*, never one being read out of order. Neither query orders its rows, because no
+  reduction below would notice if it did.
 
 Durations come from the denormalised timestamps on `remediation`, and fix cycles from the
 append-only `remediation_event` log, exactly as
@@ -134,6 +142,16 @@ WINDOW_UNITS: Final[dict[str, datetime.timedelta]] = {
     "h": datetime.timedelta(hours=1),
 }
 
+MAX_WINDOW: Final = datetime.timedelta(days=365)
+"""The longest window that can be asked for.
+
+A ceiling is needed at all because the count in a window spec is unbounded digits arriving straight
+from a query string, and `datetime` raises `OverflowError` — not `ValueError` — somewhere past
+`2739726d`, which the API would surface as a 500 rather than as the client error a malformed
+parameter deserves. A year is where it is set because that is the range the dashboard's daily series
+can plot and rather more than the retention anyone has asked for.
+"""
+
 # The two edges of the review-fix loop in `docs/04-state-machine.md`. A fix cycle is one traversal
 # of either, which the log records as an entry into RUNNING from the state that triggered it.
 LOOP_FROM_STATES: Final = (State.CI_FAILED.value, State.CHANGES_REQUESTED.value)
@@ -177,19 +195,23 @@ class Window:
 def parse_window(spec: str = DEFAULT_WINDOW, *, now: datetime.datetime | None = None) -> Window:
     """`"7d"` or `"12h"` into the window ending now that it names.
 
-    Raises `ValueError` for anything else, so the API answers a malformed query parameter with a
-    client error rather than with a window nobody asked for.
+    Raises `ValueError` — and only `ValueError` — for anything else, so the API answers a malformed
+    query parameter with a client error rather than with a window nobody asked for. That includes
+    the counts too large to be a `timedelta` at all, which is why the ceiling below is compared in
+    units rather than by building the interval and looking at it.
     """
     match = WINDOW_SPEC.fullmatch(spec)
     if match is None:
         raise ValueError(
             f"window must be a count of days or hours, such as {DEFAULT_WINDOW!r}, got {spec!r}"
         )
-    length = int(match[1]) * WINDOW_UNITS[match[2]]
-    if not length:
+    count, unit = int(match[1]), WINDOW_UNITS[match[2]]
+    if not count:
         raise ValueError(f"window must cover more than no time at all, got {spec!r}")
+    if count > MAX_WINDOW // unit:
+        raise ValueError(f"window must be at most {MAX_WINDOW.days} days, got {spec!r}")
     end = _now(now)
-    return Window(start=end - length, end=end)
+    return Window(start=end - count * unit, end=end)
 
 
 # --- Percentiles ---------------------------------------------------------------------------------
@@ -222,7 +244,7 @@ async def summary(
     """The whole `GET /api/analytics/summary` body for `window`."""
     remediations = await _remediations_in(session, window)
     fix_cycles = await _fix_cycle_counts(session, [row.id for row in remediations])
-    ledger_days = await _synced_ledger_days(session, window)
+    ledger_days = await _ledger_days(session, window)
 
     # Paired with the timestamp that selected it, so that the merged-only figures below are typed as
     # having one rather than re-testing for null at every use.
@@ -254,12 +276,16 @@ async def summary(
 
 
 async def _remediations_in(session: AsyncSession, window: Window) -> Sequence[Remediation]:
-    """Every remediation labelled in the window, oldest first."""
+    """Every remediation labelled in the window, in no particular order.
+
+    Unordered deliberately: every reduction below is a count, a sum or a sort of its own, so an
+    `ORDER BY` here would be a cost with no observable effect — see the module docstring.
+    """
     return (
         await session.scalars(
-            select(Remediation)
-            .where(Remediation.labeled_at >= window.start, Remediation.labeled_at < window.end)
-            .order_by(Remediation.labeled_at, Remediation.id)
+            select(Remediation).where(
+                Remediation.labeled_at >= window.start, Remediation.labeled_at < window.end
+            )
         )
     ).all()
 
@@ -267,26 +293,34 @@ async def _remediations_in(session: AsyncSession, window: Window) -> Sequence[Re
 async def _fix_cycle_counts(session: AsyncSession, ids: Sequence[int]) -> Counter[int]:
     """How many fix cycles each remediation needed, keyed by remediation id.
 
-    Every row of the log is counted, including rows sharing a `created_at` to the microsecond:
+    **Every** row of the log is counted, including rows sharing a `created_at` to the microsecond:
     `remediation_event.created_at` is `transaction_timestamp()` and `docs/06-event-pipeline.md`
-    writes the transition, the event and the job together, so ties are routine rather than
-    exceptional. The order is fixed on `(created_at, id)` for the same reason — timestamps alone do
-    not order rows written in one transaction.
+    writes the transition, the event and the job together, so two laps of the loop recorded in one
+    transaction are indistinguishable by time. Counting rows rather than reading the log in order is
+    what makes that harmless — a tie can only hurt a reader that deduplicates or orders on the
+    timestamp, and this one does neither.
+
+    `remediation.cycle` is not consulted. The column is the state machine's own counter and the
+    metric is defined over the log, so a disagreement between the two shows up here rather than
+    being papered over.
     """
     events = await session.scalars(
-        select(RemediationEvent)
-        .where(
+        select(RemediationEvent).where(
             RemediationEvent.remediation_id.in_(ids),
             RemediationEvent.to_state == State.RUNNING.value,
             RemediationEvent.from_state.in_(LOOP_FROM_STATES),
         )
-        .order_by(RemediationEvent.created_at, RemediationEvent.id)
     )
     return Counter(event.remediation_id for event in events)
 
 
-async def _synced_ledger_days(session: AsyncSession, window: Window) -> set[datetime.date]:
-    """The days of the window for which `acu_ledger` holds Devin's consumption figures."""
+async def _ledger_days(session: AsyncSession, window: Window) -> set[datetime.date]:
+    """Which days of the window `acu_ledger` holds a row for.
+
+    Existence, not freshness: `synced_at` is deliberately not read here. How stale the ledger is is
+    the budget guard's and `/healthz`'s question, and answering it here would put a second, quieter
+    definition of "current enough" behind a cost figure.
+    """
     days = _window_days(window)
     if not days:
         return set()
@@ -316,6 +350,13 @@ def _durations(remediations: Sequence[Remediation]) -> DurationsJson:
 
     A remediation contributes to a duration only where both of its timestamps exist, so a window in
     which nothing merged has no MTTR rather than an MTTR built from the ones that did not.
+
+    Note what that makes review latency's population: merged **and** green, which is not one of the
+    funnel counts, while the dashboard's duration panel uses `funnel.merged` to decide whether the
+    figure exists. The two agree because `MERGED` is reachable only through `IN_REVIEW`, which is
+    entered only from `CI_PASSED` — a merge without a `ci_green_at` cannot be produced by the state
+    machine in `docs/04-state-machine.md`. If one ever were, this returns `0` for its window and the
+    panel would render that zero as a measured review latency.
     """
     return {
         "to_pr": _percentiles(
@@ -370,6 +411,11 @@ def _cost_source(window: Window, ledger_days: set[datetime.date]) -> CostSource:
 
     A ledger missing a day cannot vouch for the window, so the totals are labelled as Sentinel's own
     — which is what `docs/05-devin-integration.md#degradation` asks the dashboard to say.
+
+    A window that touches no day at all is `derived` too, and the emptiness has to be tested for
+    rather than left to the subset: `set() <= anything` is vacuously true, which would put Devin's
+    name on a window backed by no ledger rows whatever. `parse_window` cannot produce such a window,
+    but `Window` is a public dataclass and the API constructs one.
     """
     days = _window_days(window)
     return "devin_consumption_api" if days and set(days) <= ledger_days else "derived"
@@ -390,7 +436,13 @@ def _cycles(remediations: Sequence[Remediation], fix_cycles: Counter[int]) -> Cy
 
 
 def _throughput(merged: MergedRemediations) -> list[ThroughputDayJson]:
-    """Merges per UTC day, split by issue class. Days with no merge do not appear."""
+    """Merges per UTC day, split by issue class. Days with no merge do not appear.
+
+    `astimezone` is belt-and-braces rather than a conversion this path exercises: asyncpg returns
+    every `timestamptz` already normalised to UTC, so through the database the call cannot change a
+    date. It stays because the offset is what decides which day a merge falls on, and that should
+    not depend on a driver's choice of representation.
+    """
     by_day: defaultdict[datetime.date, Counter[str]] = defaultdict(Counter)
     for row, merged_at in merged:
         by_day[merged_at.astimezone(datetime.UTC).date()][row.issue_class] += 1
@@ -415,7 +467,14 @@ def _failures(remediations: Sequence[Remediation]) -> list[FailureBucketJson]:
 
 
 def _impact(merged: MergedRemediations) -> ImpactJson:
-    """`sum(baseline_hours[class] * merged_in_class)`, from the playbook table in `docs/05`."""
+    """`sum(baseline_hours[class] * merged_in_class)`, from the playbook table in `docs/05`.
+
+    `baseline_hours_for` raises `UnknownIssueClass` rather than defaulting, so this line rests on an
+    invariant: a class with no playbook never merges. `docs/04-state-machine.md` routes an
+    unrecognised class `QUEUED -> BLOCKED` at session creation, which is a terminal state, and only
+    merged remediations are summed here. The invariant is worth naming because the blast radius is
+    the whole payload — one unmergeable row would take out all nine panels, not the impact one.
+    """
     hours = sum(baseline_hours_for(row.issue_class) for row, _ in merged)
     return {"hours_saved": round(hours, DISPLAY_DIGITS), "assumption": IMPACT_ASSUMPTION}
 
