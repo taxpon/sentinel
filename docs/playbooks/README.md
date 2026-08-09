@@ -28,6 +28,49 @@ The names, caps and class mappings are specified in
 [`src/sentinel/devin/playbooks.py`](../../src/sentinel/devin/playbooks.py); a test compares the two.
 This directory adds the one thing neither of them holds — the text.
 
+## The four sections
+
+The body is not free prose. Devin's playbook editor expects a fixed structure, supplied by the
+repository owner from the Devin UI, and every one of the four texts uses exactly these four headings
+in this order:
+
+```
+## Overview
+
+Playbook description.
+
+## Procedure
+
+1. **step 1**: explanation
+
+2. **step 2**: explanation
+
+## Advice & Pointers
+
+Helpful facts here
+
+## Forbidden actions
+
+Anything you don't want Devin to do
+```
+
+- **Overview** — one paragraph naming the class of defect and what makes it different from the
+  other three. Not the objective; the prompt carries that.
+- **Procedure** — the ordered things that must be **established** before the work can be finished,
+  four to six of them. This is where the format meets the rule that we delegate the task and
+  [not the steps](../adr/2026-08-07-delegate-task-not-steps.md), and the resolution is that a
+  procedure for a *class* of work states what has to be true before moving on, never what to type.
+  "Determine whether the test is intermittent or was never able to
+  pass, before changing anything" is a step. "Run `pytest -x tests/foo.py`" is a script, and belongs
+  in neither the playbook nor the prompt. A step that would read the same in all four playbooks is
+  not class-level standing context and does not belong here.
+- **Advice & Pointers** — the facts. Where this kind of defect hides in Superset, what the scoped
+  CI will and will not tell you, what `root_cause` has to say for this class, and the ACU budget
+  with what it is meant to be spent on.
+- **Forbidden actions** — the specific wrong moves this class invites, in the imperative-free form
+  of a list of things not to do. Each entry earns its place by being a mistake somebody would
+  plausibly make *on this class*; the section is not a place to restate the prompt's constraints.
+
 ## What belongs in a playbook
 
 Devin receives three things, and each carries a different kind of fact
