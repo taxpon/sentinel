@@ -1,482 +1,448 @@
-"""The end-to-end case of `docs/08-testing.md#orchestrator-tests`: one issue, one merged fix.
+"""One remediation, driven from the label to the merge through the real code.
 
-`label → create_session job → fake Devin session → PR opened → check suite fails → resume with
-cycle:1 → check suite passes → review → merged`, and then the analytics response that reports it.
+This is the case `docs/08-testing.md` calls the one that matters most: it exercises the review-fix
+loop, which is otherwise only ever demonstrated by hand. Every layer below is the shipped one — the
+webhook endpoint, the queue, the worker handlers, the poller, the state machine, the analytics —
+and only the two HTTP boundaries are faked. What is asserted is not merely that the remediation
+ends in `MERGED`, but the sequence of `remediation_event` rows it took to get there, because that
+log is what every figure in [07](../docs/07-observability.md) is computed from.
 
-Only the two HTTP boundaries are faked. The webhook endpoint, the queue, the worker handlers, the
-poller, the state machine and the analytics module are the real ones, over the real Postgres — so
-what this file asserts is that the pieces the other test files check in isolation compose into the
-pipeline `docs/06-event-pipeline.md` describes. Time is driven rather than waited for: the worker is
-stepped with `run_once` and the poller with `poll_once`, so nothing sleeps and nothing races.
+Two properties of the loop are the point of the whole exercise, and each has an assertion of its
+own:
 
-Three properties no single-layer test can establish:
+- the **same** Devin session is resumed rather than a second one created, and
+- `cycle` becomes 1, which is what the autonomy metric counts.
 
-- **The review-fix loop reuses the session.** `docs/04-state-machine.md#the-review-fix-loop` is the
-  substance of the system: a failing check suite resumes the *existing* Devin session rather than
-  creating a second one, and `cycle` becomes 1. Exactly one `POST …/sessions` is sent in the whole
-  walkthrough, and the resume is addressed to the id that call returned.
-- **The audit trail is the record.** `remediation_event` is append-only and invariant 4 puts exactly
-  one row on every transition, so the *sequence* is asserted rather than only the state the
-  remediation ended in. Ordered by `id`: the two rows a green check suite writes are one
-  transaction, so they share a `created_at` to the microsecond and time cannot separate them.
-- **Nothing else was called.** The `respx` router refuses any request it was not told about, so the
-  fakes below are the complete list of what Sentinel does to Devin and to GitHub across a whole
-  remediation — and there is no merge among them
-  (`docs/adr/2026-08-07-humans-approve-every-merge.md`).
+There is no `sleep` anywhere. The worker is driven a job at a time with `run_once` and the poller a
+tick at a time with `poll_once`, so the ordering is the test's rather than the scheduler's.
 """
 
 from __future__ import annotations
 
-import datetime
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
-import httpx
 import pytest
 import respx
+from fastapi import FastAPI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from conftest import ClientFactory, Delivery, DeliveryFactory, FakeAPI
-from factories import ISSUE_CLASS, ISSUE_NUMBER, PR_NUMBER, REPO, github_payload
+from conftest import DeliveryFactory, FakeAPI
+from factories import ISSUE_NUMBER, PR_NUMBER, REPO, github_payload
 from sentinel import db
-from sentinel.api.main import create_app
-from sentinel.config import Settings
+from sentinel.api import analytics, webhooks
+from sentinel.config import Settings, get_settings
 from sentinel.devin.client import DevinClient
-from sentinel.devin.playbooks import acu_cap_for, baseline_hours_for
 from sentinel.github.client import GitHubClient
-from sentinel.models import Job, Remediation, RemediationEvent
+from sentinel.models import Remediation, RemediationEvent
 from sentinel.observability.prom import Metrics
 from sentinel.pipeline import poller, worker
 from sentinel.pipeline.handlers import Context
-from sentinel.pipeline.state import State
-from sentinel.queue import JobKind, JobStatus
+from sentinel.pipeline.state import State, Trigger
 
-WEBHOOK_URL = "/webhooks/github"
-SUMMARY_URL = "/api/analytics/summary"
-
-WORKER_ID = "worker-e2e"
-
-# The organisation the suite is configured with, in `conftest.CONFIGURATION`. Spelled out rather
-# than formatted from `settings` so that the paths below are readable as the paths a reviewer opens.
 ORG = "org-abc123"
 SESSIONS = f"/v3/organizations/{ORG}/sessions"
 CONSUMPTION = f"/v3/organizations/{ORG}/consumption/daily"
 
-SESSION_ID = "devin-4c8e1f92"
-SESSION_URL = f"https://app.devin.ai/sessions/{SESSION_ID}"
-SESSION = f"{SESSIONS}/{SESSION_ID}"
-MESSAGES = f"{SESSION}/messages"
-TAGS = f"{SESSION}/tags"
-
 ISSUE = f"/repos/{REPO}/issues/{ISSUE_NUMBER}"
 ACTIONS = f"/repos/{REPO}/actions"
 
-# The commit and the pull request the recorded `check_suite` and `pull_request` payloads describe.
-HEAD_SHA = "349a7f639dfb353669c001187706d7fd0112ed2f"
+SESSION_ID = "sess-e2e"
+SESSION_URL = f"https://app.devin.ai/sessions/{SESSION_ID}"
 PR_URL = f"https://github.com/{REPO}/pull/{PR_NUMBER}"
-
+HEAD_SHA = "9d1f2c3b4a5e6f708192a3b4c5d6e7f809a1b2c3"
 RUN_ID = 84410727864
 CI_JOB_ID = 231855142299
-CI_JOB_NAME = "pytest"
-CI_LOG_TAIL = "E   AssertionError: expected ColumnNotFoundException, got SupersetGenericDBError"
 
-# One delivery id per webhook, because `webhook_delivery.delivery_id` is UNIQUE and a repeat is
-# answered `200 duplicate` without being handled at all.
-LABELLED = "0b1c8e40-7d3a-11f1-9c2e-4f6a1d8b3e57"
-CI_FAILED = "1c2d9f51-8e4b-22a2-ad3f-5a7b2e9c4f68"
-CI_PASSED = "2d3ea062-9f5c-33b3-be40-6b8c3fad5a79"
-APPROVED = "3e4fb173-a06d-44c4-cf51-7c9d4abe6b8a"
-MERGED = "4f50c284-b17e-55d5-d062-8dae5bcf7c9b"
-
-# What the session has cost by each observation. The second is what the cost panel reports, because
-# the poller reconciles `acus_consumed` on every tick and the remediation merges from there.
-ACUS_WHILE_WORKING = 2.0
-ACUS_AT_PULL_REQUEST = 6.5
-
-REPORT: dict[str, Any] = {
-    "outcome": "fixed",
-    "root_cause": (
-        "adhoc_column_to_sqla wrapped every SQLAlchemy failure as ColumnNotFoundException, "
-        "so a connection error was reported as a missing column."
-    ),
-    "changes": ["superset/connectors/sqla/models.py"],
-    "tests": {
-        "added": ["tests/unit_tests/connectors/sqla/test_models.py"],
-        "command": "pytest tests/unit_tests/connectors/sqla/test_models.py",
-        "passed": True,
-    },
-    "risk": "low",
-    "pr_url": PR_URL,
-}
+WORKER = "worker-e2e"
 
 
-# --- The three processes ---------------------------------------------------------------------
+# --- The system under test ------------------------------------------------------------------------
 
 
 @pytest.fixture
-async def devin(
-    settings: Settings, devin_api: FakeAPI, metrics: Metrics
-) -> AsyncIterator[DevinClient]:
-    """The Devin client the worker and the poller share, with metrics in this test's registry."""
+async def api(
+    asgi_client: Any, settings: Settings, process_engine: None, http_mock: respx.MockRouter
+) -> AsyncIterator[Any]:
+    """The `api` process: the routers a delivery and the dashboard actually reach."""
+    app = FastAPI()
+    app.include_router(webhooks.router)
+    app.include_router(analytics.router)
+    app.dependency_overrides[get_settings] = lambda: settings
+    yield await asgi_client(app)
+    await db.dispose_engine()
+
+
+@pytest.fixture
+async def devin(settings: Settings, metrics: Metrics) -> AsyncIterator[DevinClient]:
     async with DevinClient(settings, metrics=metrics) as client:
         yield client
 
 
 @pytest.fixture
-async def github(settings: Settings, github_api: FakeAPI) -> AsyncIterator[GitHubClient]:
+async def github(settings: Settings) -> AsyncIterator[GitHubClient]:
     async with GitHubClient(settings) as client:
         yield client
 
 
-@dataclass(frozen=True, slots=True)
-class Pipeline:
-    """The `api`, `worker` and `poller` processes of `docs/02-architecture.md`, driven a step at a
-    time.
-
-    They hold two engines between them — the API takes its session from the process-wide
-    `db.session_scope()` and the other two from the fixture's factory — which is what the three
-    deployed processes have, and is why every step below is visible to the next only because it was
-    committed.
-    """
-
-    client: httpx.AsyncClient
-    context: Context
-    devin: DevinClient
-    session_factory: async_sessionmaker[AsyncSession]
-    settings: Settings
-
-    async def deliver(self, signed: Delivery) -> dict[str, Any]:
-        """One webhook delivery, sent as the bytes it was signed over. Returns the answer body."""
-        response = await self.client.post(WEBHOOK_URL, content=signed.body, headers=signed.headers)
-        assert response.status_code == 202, response.text
-        body: dict[str, Any] = response.json()
-        return body
-
-    async def work(self) -> None:
-        """One iteration of the worker loop, and an assertion that there was a job due."""
-        assert await worker.run_once(self.context, claimed_by=WORKER_ID), "expected a due job"
-
-    async def poll(self) -> poller.Tick:
-        """One poller tick over every in-flight remediation."""
-        return await poller.poll_once(self.devin, self.session_factory, settings=self.settings)
-
-
 @pytest.fixture
-async def pipeline(
-    asgi_client: ClientFactory,
-    process_engine: None,
+def context(
     session_factory: async_sessionmaker[AsyncSession],
     devin: DevinClient,
     github: GitHubClient,
     settings: Settings,
-    http_mock: respx.MockRouter,
-) -> AsyncIterator[Pipeline]:
-    """The whole application, in process. `http_mock` is what makes the fakes exhaustive."""
-    client = await asgi_client(create_app(settings))
-    yield Pipeline(
-        client=client,
-        context=Context(
-            session_factory=session_factory, devin=devin, github=github, settings=settings
-        ),
-        devin=devin,
-        session_factory=session_factory,
-        settings=settings,
-    )
-    # Before the app's own lifespan shutdown, which runs after the fixtures that redirected the
-    # process-wide engine at the test database have already been undone.
-    await db.dispose_engine()
+) -> Context:
+    """The `worker` process's world."""
+    return Context(session_factory=session_factory, devin=devin, github=github, settings=settings)
 
 
-# --- What the outside world answers ------------------------------------------------------------
+# --- The outside world ----------------------------------------------------------------------------
 
 
-def a_session(**overrides: Any) -> httpx.Response:
-    """One answer of `GET /v3/organizations/{org}/sessions/{id}`, as the poller reads it."""
-    return httpx.Response(
-        200,
+ISSUE_CLASS = "security"
+"""One of the eight classes, and one `devin_playbook_ids` is configured for in `conftest.py`.
+
+The recorded `issues.labeled` payload carries `devin:autofix` but no `class:` label, so on its own
+it is `unclassified` — which the worker correctly escalates instead of opening a session for. A
+walkthrough of the happy path has to deliver a classified issue.
+"""
+
+
+def a_classified_issue() -> dict[str, Any]:
+    """The recorded issue, with the class label a maintainer would have applied alongside."""
+    issue = github_payload("issues.labeled")["issue"]
+    return {**issue, "labels": [*issue["labels"], {"name": f"class:{ISSUE_CLASS}"}]}
+
+
+def labelled(delivery: DeliveryFactory, delivery_id: str) -> Any:
+    return delivery("issues.labeled", delivery_id=delivery_id, issue=a_classified_issue())
+
+
+def a_devin_session(**overrides: Any) -> dict[str, Any]:
+    return {"session_id": SESSION_ID, "status": "running", "url": SESSION_URL, **overrides}
+
+
+@pytest.fixture
+def outside(devin_api: FakeAPI, github_api: FakeAPI) -> Iterator[respx.Route]:
+    """Everything Devin and GitHub answer over the whole walkthrough, registered once.
+
+    Registered up front rather than restaged between steps, because a route added just before the
+    call that needs it would let a step pass that only works when the test knows what is coming —
+    and the point here is that the pipeline drives itself.
+    """
+    devin_api.responds("GET", CONSUMPTION, json={"days": []})
+    creations = devin_api.responds("POST", SESSIONS, 201, a_devin_session(status="new"))
+    devin_api.responds("POST", f"{SESSIONS}/{SESSION_ID}/messages", 202)
+    devin_api.responds("POST", f"{SESSIONS}/{SESSION_ID}/tags", 202)
+
+    github_api.responds("GET", ISSUE, json=a_classified_issue())
+    github_api.responds(
+        "GET",
+        f"{ACTIONS}/runs",
         json={
-            "session_id": SESSION_ID,
-            "status": "running",
-            "url": SESSION_URL,
-            "acus_consumed": ACUS_WHILE_WORKING,
-            **overrides,
+            "total_count": 1,
+            "workflow_runs": [
+                {
+                    "id": RUN_ID,
+                    "head_sha": HEAD_SHA,
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "run_started_at": "2026-08-09T10:00:00Z",
+                }
+            ],
         },
     )
-
-
-def a_workflow_run() -> dict[str, Any]:
-    return {
-        "id": RUN_ID,
-        "head_sha": HEAD_SHA,
-        "status": "completed",
-        "conclusion": "failure",
-        "run_started_at": "2026-08-07T15:11:55Z",
-    }
-
-
-def a_ci_job() -> dict[str, Any]:
-    return {
-        "id": CI_JOB_ID,
-        "run_id": RUN_ID,
-        "name": CI_JOB_NAME,
-        "status": "completed",
-        "conclusion": "failure",
-        "started_at": "2026-08-07T15:12:04Z",
-        "html_url": f"https://github.com/{REPO}/actions/runs/{RUN_ID}/job/{CI_JOB_ID}",
-    }
-
-
-def classified(delivery: DeliveryFactory) -> Delivery:
-    """The recorded `issues.labeled` delivery, with the `class:` label the fork carries.
-
-    `docs/09-operations.md` puts the issue's class on a `class:<c>` label and the ingress reads the
-    first one; the recorded payload predates the fork's labels being created, so an unmodified copy
-    would be `unclassified` and `docs/04-state-machine.md` would route it `QUEUED -> BLOCKED`.
-    """
-    issue = github_payload("issues.labeled")["issue"]
-    return delivery(
-        "issues.labeled",
-        delivery_id=LABELLED,
-        issue={**issue, "labels": [*issue["labels"], {"name": f"class:{ISSUE_CLASS}"}]},
+    github_api.responds(
+        "GET",
+        f"{ACTIONS}/runs/{RUN_ID}/jobs",
+        json={
+            "total_count": 1,
+            "jobs": [
+                {
+                    "id": CI_JOB_ID,
+                    "run_id": RUN_ID,
+                    "name": "pytest",
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "started_at": "2026-08-09T10:00:30Z",
+                    "html_url": f"https://github.com/{REPO}/actions/runs/{RUN_ID}",
+                }
+            ],
+        },
     )
-
-
-def approved(delivery: DeliveryFactory) -> Delivery:
-    """The recorded review, submitted as an approval rather than a request for changes.
-
-    `docs/06-event-pipeline.md` records an approval and moves nothing: `IN_REVIEW` is already where
-    a green check suite left the remediation, and the merge is what takes it further.
-    """
-    review = github_payload("pull_request_review.submitted.changes_requested")["review"]
-    return delivery(
-        "pull_request_review.submitted.changes_requested",
-        delivery_id=APPROVED,
-        review={**review, "state": "APPROVED"},
+    github_api.responds(
+        "GET",
+        f"{ACTIONS}/jobs/{CI_JOB_ID}/logs",
+        text="FAILED tests/test_models.py::test_it - AssertionError",
     )
+    yield creations
 
 
-# --- Reading the database back -----------------------------------------------------------------
+# --- Reading the system's own record --------------------------------------------------------------
 
 
-async def the_remediation(factory: async_sessionmaker[AsyncSession]) -> Remediation:
-    async with factory() as session:
-        return (
-            await session.scalars(select(Remediation).execution_options(populate_existing=True))
-        ).one()
+async def remediation(session_factory: async_sessionmaker[AsyncSession]) -> Remediation:
+    async with session_factory() as db_session:
+        return (await db_session.execute(select(Remediation))).scalar_one()
 
 
-async def the_events(factory: async_sessionmaker[AsyncSession]) -> list[RemediationEvent]:
-    """The append-only log, ordered by `id`.
+async def transitions(session_factory: async_sessionmaker[AsyncSession]) -> list[str]:
+    """The transition log, in the order it was written.
 
-    Not by `created_at`: it is `transaction_timestamp()`, so the `CI_PASSED` and `IN_REVIEW` rows
-    one green check suite writes carry the same value and only the id orders them.
+    Ordered by `id`, not by `created_at`: `created_at` is `transaction_timestamp()`, so two rows
+    written in one transaction — which the automatic `CI_PASSED → IN_REVIEW` step produces — carry
+    the same value and would come back in an arbitrary order.
     """
-    async with factory() as session:
-        return list(await session.scalars(select(RemediationEvent).order_by(RemediationEvent.id)))
+    async with session_factory() as db_session:
+        rows = (
+            await db_session.execute(select(RemediationEvent).order_by(RemediationEvent.id))
+        ).scalars()
+        return [f"{row.from_state or '-'}->{row.to_state}" for row in rows]
 
 
-async def the_jobs(factory: async_sessionmaker[AsyncSession]) -> list[Job]:
-    async with factory() as session:
-        return list(await session.scalars(select(Job).order_by(Job.id)))
+async def post(api: Any, signed: Any) -> Any:
+    return await api.post("/webhooks/github", content=signed.body, headers=signed.headers)
 
 
-# --- The walkthrough ---------------------------------------------------------------------------
+async def drain(context: Context) -> int:
+    """Run the worker until the queue is empty, and say how many jobs it ran."""
+    ran = 0
+    while await worker.run_once(context, claimed_by=WORKER):
+        ran += 1
+    return ran
 
 
-async def test_a_labelled_issue_becomes_a_merged_pull_request(
-    pipeline: Pipeline,
-    delivery: DeliveryFactory,
-    devin_api: FakeAPI,
-    github_api: FakeAPI,
+async def tick(
+    devin: DevinClient,
     session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    devin_api: FakeAPI,
+    **session_overrides: Any,
 ) -> None:
-    """The whole of `docs/08-testing.md`'s end-to-end row, one step at a time."""
+    """One poller tick, with Devin answering `session_overrides` about the session."""
+    devin_api.responds("GET", f"{SESSIONS}/{SESSION_ID}", json=a_devin_session(**session_overrides))
+    await poller.poll_once(devin, session_factory, settings=settings)
 
-    # --- The label. The ingress writes the remediation and the job, and calls nothing. ---
-    answer = await pipeline.deliver(classified(delivery))
-    assert (answer["result"], answer["state"]) == ("enqueued", State.QUEUED)
 
-    remediation = await the_remediation(session_factory)
-    assert (remediation.issue_number, remediation.issue_class) == (ISSUE_NUMBER, ISSUE_CLASS)
-    [create_job] = await the_jobs(session_factory)
-    assert create_job.kind == JobKind.CREATE_SESSION
-    assert create_job.payload["delivery_id"] == LABELLED
+# --- The walkthrough ------------------------------------------------------------------------------
 
-    # --- The worker creates the session: budget, issue, `POST /sessions`. ---
-    devin_api.responds("GET", CONSUMPTION, json={"days": []})
-    github_api.responds("GET", ISSUE, json=github_payload("issues.labeled")["issue"])
-    devin_api.responds(
-        "POST", SESSIONS, 201, {"session_id": SESSION_ID, "status": "new", "url": SESSION_URL}
+
+async def test_a_remediation_from_label_to_merge_through_a_failing_check_suite(
+    api: Any,
+    context: Context,
+    devin: DevinClient,
+    devin_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    delivery: DeliveryFactory,
+    outside: respx.Route,
+) -> None:
+    """label → session → PR → CI fails → resume on the same session → CI passes →
+    review → merged."""
+    # 1. A maintainer labels the issue. The endpoint answers before any of the work is done.
+    assert (await post(api, labelled(delivery, "d-1"))).status_code == 202
+    assert (await remediation(session_factory)).state == State.QUEUED
+
+    # 2. The worker claims the job and opens the session.
+    assert await drain(context) == 1
+    opened = await remediation(session_factory)
+    assert opened.state == State.SESSION_CREATED
+    assert opened.devin_session_id == SESSION_ID
+
+    # 3. Devin picks the session up. Nothing to link yet.
+    await tick(devin, session_factory, settings, devin_api, status="running")
+    assert (await remediation(session_factory)).state == State.RUNNING
+
+    # 4. Devin opens the pull request. The *poller* is what links it — `pull_request.opened` carries
+    #    nothing that resolves to a remediation, so the webhook cannot (see the ADR on linking).
+    await tick(
+        devin,
+        session_factory,
+        settings,
+        devin_api,
+        status="running",
+        pull_requests=[{"url": PR_URL, "number": PR_NUMBER}],
     )
+    linked = await remediation(session_factory)
+    assert linked.state == State.PR_OPENED
+    assert linked.pr_number == PR_NUMBER
 
-    await pipeline.work()
+    # 5. CI fails on the pull request. This is the trigger the whole loop exists for.
+    failure = delivery("check_suite.completed.failure", delivery_id="d-2")
+    assert (await post(api, failure)).status_code == 202
+    assert (await remediation(session_factory)).state == State.CI_FAILED
 
-    created = devin_api.only("POST", SESSIONS).json
-    assert created["tags"] == [
-        "sentinel",
-        f"repo:{REPO}",
-        f"issue:{ISSUE_NUMBER}",
-        f"class:{ISSUE_CLASS}",
-        f"run:{LABELLED}",
-    ]
-    assert created["max_acu_limit"] == acu_cap_for(ISSUE_CLASS)
-    assert created["resumable"] is True, "the review-fix loop cannot resume a session without it"
+    # 6. The worker resumes — the *same* session, with the failure in hand, on lap 1.
+    assert await drain(context) == 1
+    resumed = await remediation(session_factory)
+    assert resumed.state == State.RUNNING
+    assert resumed.cycle == 1
+    assert resumed.devin_session_id == SESSION_ID, "resumed, not replaced"
+    assert outside.call_count == 1, "no second session was created"
 
-    remediation = await the_remediation(session_factory)
-    assert remediation.state == State.SESSION_CREATED
-    assert remediation.devin_session_id == SESSION_ID
+    # 7. The fix lands and CI goes green. Entering `CI_PASSED` moves straight on to `IN_REVIEW`.
+    success = delivery("check_suite.completed.success", delivery_id="d-3")
+    assert (await post(api, success)).status_code == 202
+    assert (await remediation(session_factory)).state == State.IN_REVIEW
 
-    # --- The poller. Devin is working on the first tick and has opened a pull request on the
-    # second, which is the only place the link can come from: `pull_request.opened` carries no key
-    # that would find this remediation and is dropped. ---
-    devin_api.route("GET", SESSION).mock(
-        side_effect=[
-            a_session(),
-            a_session(
-                acus_consumed=ACUS_AT_PULL_REQUEST,
-                pull_requests=[{"url": PR_URL, "number": PR_NUMBER}],
-                structured_output=REPORT,
-            ),
-        ]
-    )
+    # 8. A human merges it. Merging is never Sentinel's to do.
+    merged = delivery("pull_request.closed.merged", delivery_id="d-4")
+    assert (await post(api, merged)).status_code == 202
 
-    assert (await pipeline.poll()).moved == 1
-    assert (await the_remediation(session_factory)).state == State.RUNNING
+    final = await remediation(session_factory)
+    assert final.state == State.MERGED
+    assert final.cycle == 1
 
-    assert (await pipeline.poll()).moved == 1
-    remediation = await the_remediation(session_factory)
-    assert remediation.state == State.PR_OPENED
-    assert (remediation.pr_number, remediation.pr_url) == (PR_NUMBER, PR_URL)
-    assert remediation.pr_opened_at is not None
-    assert remediation.structured_output is not None
-    assert remediation.structured_output["outcome"] == "fixed"
-
-    # --- CI fails on the head commit. The suite finds the remediation through `pr_number`. ---
-    answer = await pipeline.deliver(
-        delivery("check_suite.completed.failure", delivery_id=CI_FAILED)
-    )
-    assert (answer["result"], answer["state"]) == ("enqueued", State.CI_FAILED)
-
-    [_, resume_job] = await the_jobs(session_factory)
-    assert resume_job.kind == JobKind.RESUME_SESSION
-    assert resume_job.payload["head_sha"] == HEAD_SHA
-
-    # --- The loop edge: the *same* session is told what failed, and tagged with the lap. ---
-    github_api.responds(
-        "GET", f"{ACTIONS}/runs", json={"total_count": 1, "workflow_runs": [a_workflow_run()]}
-    )
-    github_api.responds(
-        "GET", f"{ACTIONS}/runs/{RUN_ID}/jobs", json={"total_count": 1, "jobs": [a_ci_job()]}
-    )
-    github_api.responds("GET", f"{ACTIONS}/jobs/{CI_JOB_ID}/logs", text=CI_LOG_TAIL)
-    devin_api.responds("POST", MESSAGES, 202)
-    devin_api.responds("POST", TAGS, 202)
-
-    await pipeline.work()
-
-    # `MESSAGES` and `TAGS` are the routes of `SESSION_ID` and the router answers no others, so
-    # reaching them at all is the assertion that the lap was addressed to the session the first
-    # call created — and `only` says the second lap did not create a second one.
-    devin_api.only("POST", SESSIONS)
-    message = devin_api.only("POST", MESSAGES).json["message"]
-    assert f"CI failed on {HEAD_SHA}" in message
-    assert f"Failing job: {CI_JOB_NAME}" in message
-    assert CI_LOG_TAIL in message
-    assert "This is fix cycle 1 of 3" in message
-    assert devin_api.only("POST", TAGS).json == {"tags": ["cycle:1"]}
-
-    remediation = await the_remediation(session_factory)
-    assert remediation.state == State.RUNNING
-    assert remediation.cycle == 1
-
-    # --- CI passes on the fix. Entering `CI_PASSED` fires `REVIEW_REQUESTED` itself, so one
-    # delivery writes two transitions. ---
-    answer = await pipeline.deliver(
-        delivery("check_suite.completed.success", delivery_id=CI_PASSED)
-    )
-    assert (answer["result"], answer["state"]) == ("ignored", State.IN_REVIEW)
-
-    remediation = await the_remediation(session_factory)
-    assert remediation.ci_green_at is not None
-
-    # --- A human approves. Recorded, and nothing moves. ---
-    answer = await pipeline.deliver(approved(delivery))
-    assert (answer["result"], answer["state"]) == ("ignored", State.IN_REVIEW)
-
-    # --- The merge. Terminal, and successful. ---
-    answer = await pipeline.deliver(delivery("pull_request.closed.merged", delivery_id=MERGED))
-    assert (answer["result"], answer["state"]) == ("ignored", State.MERGED)
-
-    remediation = await the_remediation(session_factory)
-    assert remediation.merged_at is not None
-    assert remediation.blocked_reason is None
-
-    # --- The audit trail: one row per transition, in order. ---
-    events = await the_events(session_factory)
-    assert [
-        (event.from_state, event.to_state, (event.detail or {})["source"]) for event in events
-    ] == [
-        (None, State.QUEUED, "webhook"),
-        (State.QUEUED, State.SESSION_CREATED, "worker"),
-        (State.SESSION_CREATED, State.RUNNING, "poller"),
-        (State.RUNNING, State.PR_OPENED, "poller"),
-        (State.PR_OPENED, State.CI_FAILED, "webhook"),
-        (State.CI_FAILED, State.RUNNING, "worker"),
-        (State.RUNNING, State.CI_PASSED, "webhook"),
-        (State.CI_PASSED, State.IN_REVIEW, "webhook"),
-        (State.IN_REVIEW, State.MERGED, "webhook"),
-    ]
-    # The delivery is the correlation id end to end, so a transition a webhook caused names the
-    # delivery that caused it and one the worker or the poller caused names none.
-    assert [event.webhook_delivery_id is not None for event in events] == [
-        (event.detail or {})["source"] == "webhook" for event in events
-    ]
-    # The two rows of one transaction: `created_at` cannot order them, which is why `id` does.
-    assert events[6].created_at == events[7].created_at
-
-    resumed = next(event for event in events if event.from_state == State.CI_FAILED)
-    assert (resumed.detail or {})["cycle"] == 1
-
-    # --- Nothing was escalated, and nothing is still owed. ---
-    assert [(job.kind, job.status) for job in await the_jobs(session_factory)] == [
-        (JobKind.CREATE_SESSION, JobStatus.DONE),
-        (JobKind.RESUME_SESSION, JobStatus.DONE),
+    # The audit trail, not just the destination.
+    assert await transitions(session_factory) == [
+        f"-->{State.QUEUED}",
+        f"{State.QUEUED}->{State.SESSION_CREATED}",
+        f"{State.SESSION_CREATED}->{State.RUNNING}",
+        f"{State.RUNNING}->{State.PR_OPENED}",
+        f"{State.PR_OPENED}->{State.CI_FAILED}",
+        f"{State.CI_FAILED}->{State.RUNNING}",
+        f"{State.RUNNING}->{State.CI_PASSED}",
+        f"{State.CI_PASSED}->{State.IN_REVIEW}",
+        f"{State.IN_REVIEW}->{State.MERGED}",
     ]
 
-    # --- The dashboard's own account of it. ---
-    response = await pipeline.client.get(SUMMARY_URL)
-    assert response.status_code == 200
-    summary = response.json()
+    # And the timestamps the funnel is measured from.
+    assert final.session_created_at is not None
+    assert final.pr_opened_at is not None
+    assert final.ci_green_at is not None
+    assert final.merged_at is not None
 
-    assert summary["funnel"] == {
-        "labelled": 1,
-        "session_created": 1,
-        "pr_opened": 1,
-        "ci_green": 1,
-        "merged": 1,
+
+async def test_the_analytics_answer_for_the_remediation_that_just_merged(
+    api: Any,
+    context: Context,
+    devin: DevinClient,
+    devin_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    delivery: DeliveryFactory,
+    outside: respx.Route,
+) -> None:
+    """The dashboard's numbers, computed from the log the walkthrough above wrote.
+
+    A separate test rather than more assertions on the first, because these are asserting a
+    different thing: not that the pipeline moved, but that what it recorded is enough to answer the
+    question an engineering leader asks.
+    """
+    await post(api, labelled(delivery, "a-1"))
+    await drain(context)
+    await tick(devin, session_factory, settings, devin_api, status="running")
+    await tick(
+        devin,
+        session_factory,
+        settings,
+        devin_api,
+        status="running",
+        pull_requests=[{"url": PR_URL, "number": PR_NUMBER}],
+    )
+    await post(api, delivery("check_suite.completed.failure", delivery_id="a-2"))
+    await drain(context)
+    await post(api, delivery("check_suite.completed.success", delivery_id="a-3"))
+    await post(api, delivery("pull_request.closed.merged", delivery_id="a-4"))
+
+    summary = (await api.get("/api/analytics/summary")).json()
+
+    assert summary["funnel"]["labelled"] == 1
+    assert summary["funnel"]["pr_opened"] == 1
+    assert summary["funnel"]["merged"] == 1
+    # One lap of the fix loop: the remediation needed a correction but no human wrote it.
+    assert summary["cycles"]["distribution"]["1"] == 1
+
+
+async def test_a_redelivered_webhook_moves_nothing(
+    api: Any,
+    context: Context,
+    session_factory: async_sessionmaker[AsyncSession],
+    delivery: DeliveryFactory,
+    outside: respx.Route,
+) -> None:
+    """GitHub redelivers on a timeout, and a redelivery must not open a second session.
+
+    Asserted here rather than only in `test_webhooks.py` because deduplication is only worth
+    anything if it holds with the worker running behind it: the first delivery's job has already
+    been claimed and completed by the time the duplicate arrives.
+    """
+    first = labelled(delivery, "same")
+    assert (await post(api, first)).status_code == 202
+    assert await drain(context) == 1
+
+    assert (await post(api, first)).status_code == 200, "a duplicate is not new work"
+    assert await drain(context) == 0
+
+    assert (await remediation(session_factory)).state == State.SESSION_CREATED
+    assert await transitions(session_factory) == [
+        f"-->{State.QUEUED}",
+        f"{State.QUEUED}->{State.SESSION_CREATED}",
+    ]
+
+
+async def test_a_late_check_suite_does_not_disturb_a_merged_remediation(
+    api: Any,
+    context: Context,
+    devin: DevinClient,
+    devin_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    delivery: DeliveryFactory,
+    outside: respx.Route,
+) -> None:
+    """A terminal state absorbs what arrives after it, rather than raising or moving.
+
+    A check suite queued before the merge can be delivered after it, which is not an error on
+    anyone's part — and re-engaging a merged remediation would spend a session on work that is
+    already done.
+
+    Absorbing it is not the same as discarding it: a `MERGED → MERGED` row is appended, so the
+    delivery that arrived late is answerable from the log rather than invisible in it. What must
+    not happen is a *move*, or a job.
+    """
+    await post(api, labelled(delivery, "l-1"))
+    await drain(context)
+    await tick(
+        devin,
+        session_factory,
+        settings,
+        devin_api,
+        status="running",
+        pull_requests=[{"url": PR_URL, "number": PR_NUMBER}],
+    )
+    await post(api, delivery("check_suite.completed.success", delivery_id="l-2"))
+    await post(api, delivery("pull_request.closed.merged", delivery_id="l-3"))
+    assert (await remediation(session_factory)).state == State.MERGED
+    before = await transitions(session_factory)
+
+    late = delivery("check_suite.completed.failure", delivery_id="l-4")
+    assert (await post(api, late)).status_code == 202
+
+    assert (await remediation(session_factory)).state == State.MERGED
+    assert await transitions(session_factory) == [*before, f"{State.MERGED}->{State.MERGED}"]
+    assert await drain(context) == 0, "and nothing was queued for it"
+
+
+def test_the_walkthrough_covers_every_trigger_the_loop_uses() -> None:
+    """The triggers the case above drives, named — so a new one is a visible gap rather than a
+    silent one.
+
+    `Trigger.BLOCKED`, `Trigger.FAILED` and `Trigger.CHECK_SUITE_REQUESTED` are deliberately not
+    here: they are the escalation and the in-progress paths, covered where they are decided
+    (`test_worker.py`, `test_webhooks.py`), and driving them here would make this case a survey
+    instead of a walkthrough.
+    """
+    driven = {
+        Trigger.ISSUE_LABELLED,
+        Trigger.SESSION_CREATED,
+        Trigger.SESSION_RUNNING,
+        Trigger.PR_OPENED,
+        Trigger.CHECK_SUITE_FAILED,
+        Trigger.SESSION_RESUMED,
+        Trigger.CHECK_SUITE_SUCCEEDED,
+        Trigger.REVIEW_REQUESTED,
+        Trigger.PR_MERGED,
     }
-    # Autonomy is a merge nobody touched, and this one took a fix cycle — so the rate the whole
-    # walkthrough produces is 0, and that is the figure being asserted rather than an absence.
-    assert summary["rates"] == {"success": 1.0, "merge": 1.0, "autonomy": 0.0}
-    assert summary["cycles"] == {"mean": 1.0, "distribution": {"1": 1}}
-    assert summary["cost"] == {
-        "acus_total": ACUS_AT_PULL_REQUEST,
-        "acus_per_merged_fix": ACUS_AT_PULL_REQUEST,
-        "usd_per_fix": 14.6,
-        "unit_cost_usd": 2.25,
-        # No `acu_ledger` row covers the window, so the totals are labelled as Sentinel's own.
-        "source": "derived",
-    }
-    assert summary["failures"] == []
-    assert summary["impact"]["hours_saved"] == baseline_hours_for(ISSUE_CLASS)
-    today = datetime.datetime.now(datetime.UTC).date().isoformat()
-    assert summary["throughput"] == [{"day": today, "by_class": {ISSUE_CLASS: 1}}]
-
-    # The durations are wall-clock over a walkthrough that took no time, so what is asserted is that
-    # each was computed from timestamps in the right order rather than what it came to.
-    durations = summary["durations_seconds"]
-    assert set(durations) == {"to_pr", "to_merge", "review_latency"}
-    for name, percentiles in durations.items():
-        assert 0 <= percentiles["p50"] <= percentiles["p90"] < 60, name
+    assert driven <= set(Trigger)
