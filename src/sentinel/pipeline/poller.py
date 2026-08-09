@@ -79,6 +79,7 @@ from sentinel.pipeline.state import (
     is_legal,
     transition,
 )
+from sentinel.pipeline.stopping import sleep_or_stop
 from sentinel.queue import JobKind, enqueue
 
 log = get_logger(__name__)
@@ -433,17 +434,21 @@ async def run(
     """
     while stop is None or not stop.is_set():
         await poll_once(devin, session_factory, settings=settings)
-        await sleep(settings.poll_interval_seconds)
+        await sleep_or_stop(settings.poll_interval_seconds, stop=stop, sleep=sleep)
 
 
-async def main(settings: Settings | None = None) -> None:
-    """The `poller` process, as `docs/09-operations.md` runs it."""
+async def main(settings: Settings | None = None, *, stop: asyncio.Event | None = None) -> None:
+    """The `poller` process, as `docs/09-operations.md` runs it.
+
+    `stop` is set by `sentinel.__main__` when the platform asks the process to end; the tick in
+    progress finishes first, so no remediation is left half-reconciled.
+    """
     settings = get_settings() if settings is None else settings
     configure_logging(settings)
     log.info("poller.started", interval_seconds=settings.poll_interval_seconds)
     try:
         async with DevinClient(settings) as devin:
-            await run(devin, get_session_factory(), settings=settings)
+            await run(devin, get_session_factory(), settings=settings, stop=stop)
     finally:
         await dispose_engine()
 

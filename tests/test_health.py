@@ -7,7 +7,10 @@ asserting is that a process started the way `docker-compose.yml` starts it serve
 
 from __future__ import annotations
 
+import asyncio
 import datetime
+import os
+import signal
 from typing import Any
 
 import pytest
@@ -303,7 +306,7 @@ def test_the_two_processes_compose_starts_are_the_ones_it_accepts() -> None:
 def test_the_named_process_is_the_one_run(process: str, monkeypatch: pytest.MonkeyPatch) -> None:
     ran: list[str] = []
 
-    async def record() -> None:
+    async def record(*, stop: asyncio.Event) -> None:
         ran.append(process)
 
     monkeypatch.setitem(entrypoint.PROCESSES, process, record)
@@ -318,11 +321,81 @@ def test_an_unknown_process_is_rejected_rather_than_started() -> None:
 
 
 def test_ctrl_c_is_a_clean_stop(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Compose stops these with a signal and a developer stops them with `Ctrl-C`. Both are how
-    they are meant to end, so neither is an error exit or a stack trace."""
+    """Reachable only where the signal handler could not be installed. Still not a traceback."""
 
-    async def interrupted() -> None:
+    async def interrupted(*, stop: asyncio.Event) -> None:
         raise KeyboardInterrupt
 
     monkeypatch.setitem(entrypoint.PROCESSES, "worker", interrupted)
     assert entrypoint.main(["worker"]) == 0
+
+
+@pytest.mark.parametrize("number", [signal.SIGTERM, signal.SIGINT])
+def test_a_stop_signal_ends_the_loop_instead_of_killing_it(
+    number: signal.Signals, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Compose and Fly both send `SIGTERM` and then, after a grace period, `SIGKILL`.
+
+    Ignoring the first means every stop lands on the second, and a worker killed holding a job keeps
+    its lease until `JOB_LEASE_TIMEOUT_SECONDS` — so a deploy would stall an in-flight remediation
+    for fifteen minutes with nothing to show for it.
+    """
+    laps: list[int] = []
+
+    async def loop(*, stop: asyncio.Event) -> None:
+        os.kill(os.getpid(), number)
+        while not stop.is_set():
+            laps.append(1)
+            await asyncio.sleep(0)
+            assert len(laps) < 100, "the signal never reached the event"
+
+    monkeypatch.setitem(entrypoint.PROCESSES, "worker", loop)
+    assert entrypoint.main(["worker"]) == 0
+    assert laps, "the process should run, not be pre-empted before it starts"
+
+
+def test_the_work_in_hand_finishes_before_the_process_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The point of stopping gracefully. Abandoning the job mid-flight is what the lease exists to
+    recover from, and recovery costs fifteen minutes."""
+    finished = False
+
+    async def loop(*, stop: asyncio.Event) -> None:
+        nonlocal finished
+        os.kill(os.getpid(), signal.SIGTERM)
+        # Waited for rather than assumed: how many loop iterations a signal takes to arrive is the
+        # runtime's business, and a test that guessed would be flaky rather than wrong.
+        await asyncio.wait_for(stop.wait(), timeout=5)
+        # The job in hand, carried out after the stop was requested.
+        await asyncio.sleep(0)
+        finished = True
+
+    monkeypatch.setitem(entrypoint.PROCESSES, "worker", loop)
+    assert entrypoint.main(["worker"]) == 0
+    assert finished
+
+
+def test_the_handlers_do_not_outlive_the_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`serve` installs handlers on the running loop and must take them off again — a test process
+    that ran two of these in one interpreter would otherwise carry the first one's handlers into the
+    second's loop."""
+    installed: list[signal.Signals] = []
+    removed: list[signal.Signals] = []
+
+    async def loop(*, stop: asyncio.Event) -> None:
+        pass
+
+    real_get = asyncio.get_running_loop
+
+    async def spy() -> None:
+        running = real_get()
+        monkeypatch.setattr(
+            running, "add_signal_handler", lambda n, *a: installed.append(n), raising=False
+        )
+        monkeypatch.setattr(running, "remove_signal_handler", lambda n: removed.append(n))
+        await entrypoint.serve(loop)
+
+    asyncio.run(spy())
+    assert installed == list(entrypoint.STOP_SIGNALS)
+    assert removed == list(entrypoint.STOP_SIGNALS)

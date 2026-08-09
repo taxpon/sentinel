@@ -64,6 +64,7 @@ from sentinel.pipeline.handlers import (
     load_remediation,
 )
 from sentinel.pipeline.state import IllegalTransitionError
+from sentinel.pipeline.stopping import sleep_or_stop
 from sentinel.queue import ClaimedJob, JobStatus, LeaseLost
 
 log = get_logger(__name__)
@@ -150,11 +151,17 @@ async def run(
     claimed_by = worker_id() if claimed_by is None else claimed_by
     while stop is None or not stop.is_set():
         if not await run_once(context, claimed_by=claimed_by):
-            await sleep(IDLE_DELAY_SECONDS)
+            await sleep_or_stop(IDLE_DELAY_SECONDS, stop=stop, sleep=sleep)
 
 
-async def main(settings: Settings | None = None) -> None:
-    """The `worker` process, as `docs/09-operations.md` runs it."""
+async def main(settings: Settings | None = None, *, stop: asyncio.Event | None = None) -> None:
+    """The `worker` process, as `docs/09-operations.md` runs it.
+
+    `stop` is set by `sentinel.__main__` when the platform asks the process to end. The loop stops
+    claiming, the job already in hand finishes and releases its lease, and the pool is disposed —
+    rather than the job being abandoned mid-flight for another worker to reclaim fifteen minutes
+    later, which is what an unhandled signal costs.
+    """
     settings = get_settings() if settings is None else settings
     configure_logging(settings)
     claimed_by = worker_id()
@@ -167,7 +174,7 @@ async def main(settings: Settings | None = None) -> None:
                 github=github,
                 settings=settings,
             )
-            await run(context, claimed_by=claimed_by)
+            await run(context, claimed_by=claimed_by, stop=stop)
     finally:
         await dispose_engine()
 
