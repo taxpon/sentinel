@@ -2,9 +2,9 @@
 
 > **Status:** Design · **Answers:** How is each metric defined, and what does the dashboard actually tell an engineering leader?
 
-The question this has to answer is *"if I were an engineering leader, how would I know this is
-working?"* — which a count of sessions does not answer. Every panel below is chosen because a
-leader would act differently depending on its value.
+The question this has to answer is whether the pipeline is working — asked by someone accountable
+for it rather than by someone operating it, and a count of sessions does not answer that. Every
+panel below earns its place by changing what such a reader would do next.
 
 ## Metric definitions
 
