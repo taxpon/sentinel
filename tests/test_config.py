@@ -193,7 +193,7 @@ def test_the_hint_is_not_offered_for_a_value_that_was_read_and_rejected(load: Lo
     """A malformed `DATABASE_URL` is present and non-blank: it failed a validator, not the
     required-ness check, and "set but blank" would be a false explanation of it."""
     with pytest.raises(ConfigurationError) as raised:
-        load(DATABASE_URL="postgresql://a:b@c/d")
+        load(DATABASE_URL="postgresql+psycopg2://a:b@c/d")
 
     assert "blank" not in str(raised.value)
 
@@ -296,13 +296,79 @@ def test_a_bad_entry_is_located_within_its_variable(
     assert located in str(raised.value)
 
 
-def test_the_database_url_must_name_the_asyncpg_driver(load: Load) -> None:
-    # Anything else fails deep inside the engine on the first query instead of at startup.
+@pytest.mark.parametrize("scheme", ["postgres", "postgresql"])
+def test_a_database_url_naming_no_driver_has_the_asyncpg_one_applied(
+    load: Load, scheme: str
+) -> None:
+    # What every managed provider issues, and what `fly postgres attach` writes into the app's
+    # secrets by itself. Rejecting it would make a correct deployment crash-loop all three
+    # processes over a prefix the operator never chose.
+    settings = load(DATABASE_URL=f"{scheme}://sentinel:dbpassword@db.internal:5432/sentinel")
+
+    assert settings.database_url.get_secret_value() == (
+        "postgresql+asyncpg://sentinel:dbpassword@db.internal:5432/sentinel"
+    )
+
+
+def test_applying_the_driver_leaves_the_rest_of_the_url_alone(load: Load) -> None:
+    # The query string carries `sslmode`, which a hosted database needs and which is the part most
+    # easily lost to a naive rewrite.
+    settings = load(DATABASE_URL="postgres://u:p@host:5432/db?sslmode=require&application_name=x")
+
+    assert settings.database_url.get_secret_value() == (
+        "postgresql+asyncpg://u:p@host:5432/db?sslmode=require&application_name=x"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "postgresql+psycopg2://sentinel:dbpassword@localhost:5432/sentinel",
+        "postgresql+psycopg://sentinel:dbpassword@localhost:5432/sentinel",
+        "mysql+aiomysql://sentinel:dbpassword@localhost:3306/sentinel",
+        "sqlite+aiosqlite:///sentinel.db",
+    ],
+)
+def test_a_database_url_naming_another_driver_is_rejected(load: Load, value: str) -> None:
+    # A URL that names a driver is a deliberate choice of one, and the wrong choice fails deep
+    # inside the engine on the first query instead of at startup.
     with pytest.raises(ConfigurationError) as raised:
-        load(DATABASE_URL="postgresql://sentinel:dbpassword@localhost:5432/sentinel")
+        load(DATABASE_URL=value)
 
     assert "DATABASE_URL" in str(raised.value)
     assert "postgresql+asyncpg://" in str(raised.value)
+
+
+@pytest.mark.parametrize("value", ["localhost:5432/sentinel", "sentinel", "postgres:/sentinel"])
+def test_a_database_url_that_is_not_a_url_is_rejected(load: Load, value: str) -> None:
+    with pytest.raises(ConfigurationError) as raised:
+        load(DATABASE_URL=value)
+
+    assert "DATABASE_URL" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "postgres://sentinel:dbpassword@localhost:5432/sentinel",
+        "postgresql+psycopg2://sentinel:dbpassword@localhost:5432/sentinel",
+        "dbpassword",
+    ],
+    ids=["normalised", "rejected-driver", "not-a-url"],
+)
+def test_the_database_url_is_never_echoed_back_whatever_it_was(load: Load, value: str) -> None:
+    # It is a DSN with a password in it, on the path a misconfigured deployment actually takes.
+    # Accepting a URL must not put it in the startup log either, so the accepted one is checked
+    # through the renderings rather than the error.
+    try:
+        settings = load(DATABASE_URL=value)
+    except ConfigurationError as error:
+        assert "dbpassword" not in str(error)
+        assert value not in str(error)
+        return
+
+    for rendering in (repr(settings), str(settings.model_dump()), settings.model_dump_json()):
+        assert "dbpassword" not in rendering
 
 
 def test_the_database_url_survives_validation_intact(load: Load) -> None:

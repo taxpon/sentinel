@@ -26,11 +26,41 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 DATABASE_URL_SCHEME = "postgresql+asyncpg://"
 
+# What a managed provider hands out. Postgres itself has no notion of a driver in a connection
+# URL — naming one is SQLAlchemy's convention — so these say which database to reach, not how.
+PLAIN_POSTGRES_SCHEMES = frozenset({"postgres", "postgresql"})
+
 LogLevel = Literal["debug", "info", "warning", "error", "critical"]
 
 
 class ConfigurationError(RuntimeError):
     """The environment does not describe a usable configuration."""
+
+
+def normalise_database_url(url: str) -> str:
+    """Return `url` with the asyncpg driver named, rejecting one that names a different driver.
+
+    Every managed provider issues `postgres://` or `postgresql://`, and `fly postgres attach` writes
+    one straight into the app's secrets. Demanding the driver made deployment a step where the
+    operator has to know to rewrite a URL a platform command had just written for them, and getting
+    it wrong crash-loops all three processes. The driver is Sentinel's choice rather than theirs, so
+    it is applied instead of demanded.
+
+    What the check still catches is a URL naming a *different* driver — the case it existed for,
+    where "psycopg2 is not installed" surfaces from inside the engine on the first query rather than
+    at startup.
+
+    The DSN embeds the Postgres password, so the message must not echo `url`.
+    """
+    if url.startswith(DATABASE_URL_SCHEME):
+        return url
+    scheme, separator, rest = url.partition("://")
+    if separator and scheme in PLAIN_POSTGRES_SCHEMES:
+        return DATABASE_URL_SCHEME + rest
+    raise ValueError(
+        "DATABASE_URL must be a postgres:// or postgresql:// URL, or already name the "
+        f"{DATABASE_URL_SCHEME} driver"
+    )
 
 
 def _decode_json(value: Any, variable: str) -> Any:
@@ -136,12 +166,9 @@ class Settings(BaseSettings):
 
     @field_validator("database_url")
     @classmethod
-    def _require_asyncpg_driver(cls, value: SecretStr) -> SecretStr:
-        # Checking the driver here turns "psycopg2 is not installed", raised from inside the engine
-        # on the first query, into one legible error at startup. The message must not echo the URL.
-        if not value.get_secret_value().startswith(DATABASE_URL_SCHEME):
-            raise ValueError(f"DATABASE_URL must use the {DATABASE_URL_SCHEME} scheme")
-        return value
+    def _apply_asyncpg_driver(cls, value: SecretStr) -> SecretStr:
+        # Re-wrapped, because the normalised URL carries the same password the given one did.
+        return SecretStr(normalise_database_url(value.get_secret_value()))
 
 
 def _describe(error: ValidationError) -> str:
