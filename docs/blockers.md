@@ -24,7 +24,7 @@ A working register, updated throughout implementation.
 
 | ID | Area | Summary | Blocks | Status |
 |---|---|---|---|---|
-| [B1](#b1) | GitHub fork | Issues are disabled on `taxpon/superset` | Everything — issues are the trigger | Open |
+| [B1](#b1) | GitHub fork | Issues now enabled; label set, webhook and issues still absent | Everything — issues are the trigger | Partly resolved |
 | [B2](#b2) | CI | Fork workflows unregistered; full Superset CI too slow for the loop | Review-fix loop, PR evidence | Open |
 | [B3](#b3) | GitHub fork | Default branch is `master`, not `main` | PR base correctness | Mitigated |
 | [B4](#b4) | Devin API | No outbound webhook for session status | Push-based state updates | Accepted |
@@ -42,16 +42,34 @@ A working register, updated throughout implementation.
 
 ## Details
 
-### B1 — Issues are disabled on the fork {#b1}
+### B1 — The fork is not yet set up to be triggered {#b1}
 
-**Evidence.** `gh api repos/taxpon/superset` returns `has_issues: false`; `gh issue list` reports
-issues are disabled. Forks do not inherit the parent's issue tracker.
+**Original evidence.** `gh api repos/taxpon/superset` returned `has_issues: false`. Forks do not
+inherit the parent's issue tracker.
 
-**Impact.** `issues.labeled` is the primary trigger ([06](./06-event-pipeline.md)). Nothing runs
-until this is fixed.
+**Now.** Issues are enabled. The rest of the setup has not been done — verified 2026-08-09:
 
-**Resolution.** `gh api -X PATCH repos/taxpon/superset -F has_issues=true`, then create the label
-set. Scripted in [09](./09-operations.md).
+| Check | Command | Result |
+|---|---|---|
+| Issues enabled | `gh api repos/taxpon/superset --jq .has_issues` | `true` — resolved |
+| Label set | `gh api repos/taxpon/superset/labels --paginate` | 9 labels, all GitHub's defaults. No `devin:autofix`, no `class:*`, no `needs-human` |
+| Webhook | `gh api repos/taxpon/superset/hooks` | none |
+| Remediation issues | `gh issue list -R taxpon/superset` | none open |
+
+**Impact.** `issues.labeled` carrying `devin:autofix` is the primary trigger
+([06](./06-event-pipeline.md)), and the class label selects the playbook — an issue without one is
+`unclassified` and escalates instead of opening a session. So nothing runs until the labels exist,
+and nothing is delivered until the webhook does.
+
+**Resolution.** Three commands, none of which has been run, and each of which writes to a public
+repository:
+
+```bash
+make bootstrap-github                                  # labels, and the webhook
+uv run scripts/file_remediation_issues.py --apply      # the eight issues (dry run is the default)
+```
+
+plus pushing `docs/fork-ci/devin-autofix-ci.yml` to the fork — see [B2](#b2).
 
 ### B2 — Fork CI: unregistered workflows, and a suite too slow for the loop {#b2}
 
@@ -70,6 +88,11 @@ a remediation touches an area covered by a heavier workflow, run that workflow b
 
 **Honesty note.** This narrows the CI signal. Say so; do not present scoped CI as full-suite
 validation. Specified in [08](./08-testing.md).
+
+**Status, 2026-08-09.** The workflow is written and reviewed — [`fork-ci/devin-autofix-ci.yml`](./fork-ci/devin-autofix-ci.yml) —
+but it is **not on the fork**: `gh api repos/taxpon/superset/contents/.github/workflows` does not
+list it. Putting it there is a commit to a public repository, so it waits with the other three
+writes in [B1](#b1).
 
 ### B3 — Default branch is `master` {#b3}
 
