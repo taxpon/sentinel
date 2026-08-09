@@ -17,6 +17,11 @@ on:
       - "docs/adr/**"
       - "docs/tasks.yaml"
       - "scripts/gen_adr_index.py"
+      # This file too, so that a fix to the regeneration is applied by the fix itself rather than
+      # waiting for the next record to happen along.
+      - ".github/workflows/adr-index.yml"
+  # For repairing an index that went stale while this workflow was failing.
+  workflow_dispatch:
 
 concurrency:
   group: adr-index
@@ -48,4 +53,30 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add docs/adr/index.md .claude/rules/adr-pointers.md
           git commit -m 'Regenerate the ADR index'
-          git push
+
+          # Main can move between the checkout and the push — merging two pull requests in quick
+          # succession is enough, and it rejected this push three times before this loop existed.
+          # `concurrency` serialises the runs but not the merges they race.
+          #
+          # The retry throws its own commit away rather than rebasing it. There is nothing in it
+          # worth keeping a conflict resolution for: the index is a pure function of `docs/adr/`,
+          # so taking whatever main is now and regenerating from that produces the correct file in
+          # one step, with no ours/theirs to get backwards.
+          for attempt in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push rejected (attempt $attempt); regenerating on top of what landed."
+            git fetch origin main
+            git reset --hard origin/main
+            make adr-index
+            if git diff --quiet -- docs/adr/index.md .claude/rules/adr-pointers.md; then
+              echo "The commit that overtook us already carries a current index."
+              exit 0
+            fi
+            git add docs/adr/index.md .claude/rules/adr-pointers.md
+            git commit -m 'Regenerate the ADR index'
+          done
+
+          echo "::error::Could not push the regenerated index after three attempts."
+          exit 1
