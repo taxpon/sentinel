@@ -71,7 +71,7 @@ Supporting endpoints:
 |---|---|
 | `GET /api/remediations` | Live table rows: state, class, cycle, ACUs, elapsed, Devin session URL, PR URL |
 | `GET /api/remediations/{id}` | Full `remediation_event` timeline for one remediation |
-| `GET /metrics` | Prometheus exposition — job queue depth, poller lag, Devin API latency and error rate |
+| `GET /metrics` | Prometheus exposition — job queue depth, poller lag, Devin API latency and error rate. Queue depth and lag are read from the database at scrape time, not from counters the serving process kept ([ADR](./adr/2026-08-08-metrics-are-process-local.md)); `poller_lag_seconds` is the age of `poller_heartbeat.ticked_at` ([03](./03-data-model.md)), and reads `0` before the poller has ever run so that a fresh deployment does not alert |
 | `GET /healthz` | Liveness, plus `acu_ledger.synced_at` age |
 
 `cost.source` is surfaced deliberately: the reader can always tell which numbers came from Devin

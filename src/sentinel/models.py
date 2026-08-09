@@ -171,3 +171,35 @@ class AcuLedger(Base):
     acus: Mapped[Decimal] = mapped_column(ACUS)
     # How stale the budget guard's view is. The dashboard shows its age.
     synced_at: Mapped[datetime.datetime] = mapped_column(TIMESTAMPTZ)
+
+
+class PollerHeartbeat(Base):
+    """When the poller last completed a tick. One row, ever.
+
+    `poller_lag_seconds` in `docs/07-observability.md` had no source: the transition timestamps on
+    `remediation` record what happened to a remediation, not that anybody looked at it, and a
+    healthy poller observing "still `RUNNING`" writes no event at all — so the age of the newest
+    `remediation_event` reports a remediation being polled correctly as hours behind.
+
+    A column on `remediation` would have been the obvious place and is the wrong one: the poller
+    reconciles *every* in-flight remediation on every tick, so a per-row stamp writes N rows every
+    `POLL_INTERVAL_SECONDS` for as long as they are in flight, and `tests/test_poller.py` pins the
+    opposite — a tick that sees nothing new must not rewrite the row. Their staleness is uniform
+    anyway, which is what makes one row able to speak for all of them.
+
+    What this cannot see: a poller that is running and completing ticks while one particular
+    remediation fails to reconcile every time. That is counted as `failed` on the tick and logged as
+    `poller.remediation.failed`; this metric answers "is the poller keeping up", not "is every row
+    healthy".
+    """
+
+    __tablename__ = "poller_heartbeat"
+
+    # A fixed primary key, so the upsert below can have a conflict target and there is no way to
+    # accumulate a second row.
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    ticked_at: Mapped[datetime.datetime] = mapped_column(TIMESTAMPTZ)
+
+
+HEARTBEAT_ID = 1
+"""The primary key of the single `poller_heartbeat` row."""

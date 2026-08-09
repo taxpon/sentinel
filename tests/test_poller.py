@@ -35,7 +35,7 @@ from sentinel.config import Settings
 from sentinel.devin.client import SESSION, DevinClient
 from sentinel.devin.playbooks import acu_cap_for
 from sentinel.devin.schemas import SessionStatus
-from sentinel.models import Job, Remediation, RemediationEvent
+from sentinel.models import HEARTBEAT_ID, Job, PollerHeartbeat, Remediation, RemediationEvent
 from sentinel.observability.prom import Metrics
 from sentinel.pipeline import poller
 from sentinel.pipeline.state import State, Trigger
@@ -886,3 +886,50 @@ async def test_run_polls_every_interval_until_stopped(
     await session.refresh(remediation)
     assert remediation.state == State.RUNNING.value
     assert len(await events(session)) == 1
+
+
+async def test_a_tick_records_that_it_finished(
+    devin: DevinClient,
+    devin_api: FakeAPI,
+    session_path: str,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    seed: Seed,
+) -> None:
+    """`poller_lag_seconds` has no other source: a session that is still `running` produces no
+    transition and no event, so a poller doing its job perfectly leaves no trace without this."""
+    await seed(state=State.RUNNING.value)
+    devin_api.responds("GET", session_path, 200, a_session(status="running"))
+
+    await poller.poll_once(devin, session_factory, settings=settings)
+
+    async with session_factory() as db:
+        beat = await db.get(PollerHeartbeat, HEARTBEAT_ID)
+        assert beat is not None
+
+
+async def test_an_empty_tick_still_records_that_it_finished(
+    devin: DevinClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+) -> None:
+    """With nothing in flight the poller is maximally up to date, not maximally behind. Beating only
+    when there was work would make an idle system indistinguishable from a dead one."""
+    await poller.poll_once(devin, session_factory, settings=settings)
+
+    async with session_factory() as db:
+        assert await db.get(PollerHeartbeat, HEARTBEAT_ID) is not None
+
+
+async def test_the_heartbeat_is_one_row_however_many_ticks(
+    devin: DevinClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+) -> None:
+    """An insert per tick would grow a table for ever at one row every POLL_INTERVAL_SECONDS."""
+    for _ in range(3):
+        await poller.poll_once(devin, session_factory, settings=settings)
+
+    async with session_factory() as db:
+        rows = (await db.execute(select(PollerHeartbeat))).scalars().all()
+        assert len(rows) == 1

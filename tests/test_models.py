@@ -58,7 +58,16 @@ from sentinel.models import (
 # DATABASE_URL; a worktree sharing the machine with another one has to.
 DEFAULT_DATABASE_URL = "postgresql+asyncpg://sentinel:sentinel@localhost:5432/sentinel"
 
-DOCUMENTED_TABLES = {"webhook_delivery", "remediation", "remediation_event", "job", "acu_ledger"}
+# The five tables of `docs/03-data-model.md` that hold the work, and the single-row table that
+# holds the poller's heartbeat — documented in the same file, under its own heading.
+DOCUMENTED_TABLES = {
+    "webhook_delivery",
+    "remediation",
+    "remediation_event",
+    "job",
+    "acu_ledger",
+    "poller_heartbeat",
+}
 
 # `docs/06-event-pipeline.md`, verbatim. A worker claims exactly one job with it, and it is repeated
 # here so that a column renamed out from under it fails a test rather than a deployment.
