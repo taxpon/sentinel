@@ -8,6 +8,7 @@ the documented default and required-ness. `.env.example` is the canonical list o
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping
 from functools import cache
 from types import MappingProxyType
@@ -157,9 +158,33 @@ def _describe(error: ValidationError) -> str:
         # the operator needs in order to find the bad entry. It is a key or an index, never a value.
         for part in location[1:]:
             variable += f"[{part}]" if isinstance(part, int) else f".{part}"
-        lines.append(f"  {variable}: {item['msg']}")
+        lines.append(f"  {variable}: {item['msg']}{_blank_hint(variable, item['type'])}")
     return "\n".join(
         ["invalid configuration — see .env.example and docs/09-operations.md:", *lines]
+    )
+
+
+def _blank_hint(variable: str, error_type: str) -> str:
+    """Whether this "missing" variable is in fact present and blank, and where that comes from.
+
+    `env_ignore_empty` makes a blank value mean "unset", which is what `.env.example` shipping the
+    required variables blank depends on. The cost is that "Field required" cannot distinguish a
+    variable nobody set from one an empty shell variable is quietly overriding — and Compose gives
+    the shell precedence over `env_file`, so a perfectly correct `.env` reads as absent. That is not
+    a hypothetical: a shell with the `gh` CLI configured exports a blank `GITHUB_TOKEN`, and the
+    error then sends the operator to inspect the one file that was already right.
+
+    Safe to report: the value is blank, so naming it discloses nothing. Nothing else about the
+    environment is read or echoed.
+    """
+    if error_type != "missing":
+        return ""
+    value = os.environ.get(variable)
+    if value is None or value.strip():
+        return ""
+    return (
+        " — the variable is set but blank, which counts as unset. A blank shell variable takes"
+        " precedence over the same name in .env; unset it, or give it a value"
     )
 
 
