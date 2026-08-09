@@ -577,9 +577,12 @@ tasks:
     wave: 6
     area: ops
     spec: docs/09-operations.md#before-making-the-repository-public
-    owns: []
+    owns:
+      - scripts/audit_history.py
+      - tests/test_audit_history.py
     depends_on: [T44]
-    adrs: []
+    adrs:
+      - 2026-08-09-the-publication-audit-exempts-test-fixtures-by-path-and-nothing-else
     notes: Resolves B12 and B13. Audit the whole history, not just the working tree.
 
   - id: T61
