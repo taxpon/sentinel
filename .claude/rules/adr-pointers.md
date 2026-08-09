@@ -22,6 +22,7 @@ paths:
   - "docs/adr/template.md"
   - "docs/tasks.yaml"
   - "pyproject.toml"
+  - "scripts/audit_history.py"
   - "scripts/bootstrap_devin.py"
   - "scripts/bootstrap_github.py"
   - "scripts/file_remediation_issues.py"
@@ -52,6 +53,7 @@ paths:
   - "src/sentinel/security/hmac.py"
   - "tests/conftest.py"
   - "tests/factories.py"
+  - "tests/test_audit_history.py"
   - "tests/test_file_remediation_issues.py"
   - "tests/test_models.py"
   - "uv.lock"
@@ -87,6 +89,7 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `docs/adr/template.md` — [Validate ADR front matter at generation time and refuse to write a partial index](../../docs/adr/2026-08-08-validate-adr-front-matter-at-generation.md)
 - `docs/tasks.yaml` — [Keep the task graph in one machine-readable file](../../docs/adr/2026-08-07-tasks-yaml-single-source.md)
 - `pyproject.toml` — [Manage dependencies with uv and a committed lock file](../../docs/adr/2026-08-07-uv-for-dependencies-and-the-image.md)
+- `scripts/audit_history.py` — [The publication audit exempts test fixtures by path and nothing else](../../docs/adr/2026-08-09-the-publication-audit-exempts-test-fixtures-by-path-and-nothing-else.md)
 - `scripts/bootstrap_devin.py` — [The bootstrap capability probe reports a refusal and fails on a fault](../../docs/adr/2026-08-08-a-refusal-is-reported-a-fault-is-not.md), [.env is the bootstrap script's record of what it created in the Devin organisation](../../docs/adr/2026-08-08-env-is-the-bootstrap-scripts-record.md)
 - `scripts/bootstrap_github.py` — [The bootstrap script talks to GitHub itself rather than through the pipeline's client](../../docs/adr/2026-08-08-the-bootstrap-script-does-not-borrow-the-pipelines-github-client.md), [The webhook is updated in place on every run, because its secret cannot be read back](../../docs/adr/2026-08-08-the-bootstrap-writes-the-webhook-secret-it-cannot-read.md), [Among several webhooks, the one already at the target URL is the one kept](../../docs/adr/2026-08-09-the-webhook-already-at-the-target-url-is-the-one-kept.md)
 - `scripts/file_remediation_issues.py` — [The remediation filing script is a dry run until an operator says otherwise](../../docs/adr/2026-08-09-the-remediation-filing-script-is-a-dry-run-until-told-otherwise.md)
@@ -117,6 +120,7 @@ ADR in the same pull request rather than leaving it contradicted by the code.
 - `src/sentinel/security/hmac.py` — [Return a reason from signature verification instead of a boolean or an exception](../../docs/adr/2026-08-08-signature-verification-returns-a-reason.md)
 - `tests/conftest.py` — [Build the test schema by running the migrations, and test for drift](../../docs/adr/2026-08-08-migrations-are-the-schema-tests-run-against.md), [Isolate tests by truncating between them, in the harness rather than in each test](../../docs/adr/2026-08-08-tests-are-isolated-by-the-harness.md)
 - `tests/factories.py` — [Isolate tests by truncating between them, in the harness rather than in each test](../../docs/adr/2026-08-08-tests-are-isolated-by-the-harness.md)
+- `tests/test_audit_history.py` — [The publication audit exempts test fixtures by path and nothing else](../../docs/adr/2026-08-09-the-publication-audit-exempts-test-fixtures-by-path-and-nothing-else.md)
 - `tests/test_file_remediation_issues.py` — [The remediation filing script is a dry run until an operator says otherwise](../../docs/adr/2026-08-09-the-remediation-filing-script-is-a-dry-run-until-told-otherwise.md)
 - `tests/test_models.py` — [Build the test schema by running the migrations, and test for drift](../../docs/adr/2026-08-08-migrations-are-the-schema-tests-run-against.md)
 - `uv.lock` — [Manage dependencies with uv and a committed lock file](../../docs/adr/2026-08-07-uv-for-dependencies-and-the-image.md)
