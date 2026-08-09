@@ -45,6 +45,23 @@ canonical list.
 | `ACU_UNIT_COST_USD` | | `2.25` | **Set from your own contract** — it only scales the cost panel |
 | `LOG_LEVEL` | | `info` | |
 
+`api`, `worker` and `poller` read all of it: one required variable missing and the process refuses
+to start, before it has accepted a delivery or claimed a job.
+
+The scripts do not. Each declares the group of variables it actually reads and is told about only
+those, so the repository can be prepared before Devin or the database exists — and a dry run, which
+writes nothing, needs no more than it takes to read
+([ADR](./adr/2026-08-10-a-script-loads-the-configuration-group-it-reads.md)):
+
+- `make bootstrap-github` — `GITHUB_TOKEN`, `GITHUB_WEBHOOK_SECRET` (the value it gives the hook);
+- `uv run scripts/bootstrap_github.py --dry-run` — `GITHUB_TOKEN`;
+- `uv run scripts/file_remediation_issues.py`, with or without `--apply` — `GITHUB_TOKEN`;
+- `make bootstrap-devin` — `DEVIN_API_TOKEN`, `DEVIN_ORG_ID`, `DEVIN_PLAYBOOK_IDS`.
+
+Nothing else about a script's configuration differs: the optional variables of those groups take
+the defaults documented above, `.env` is read exactly as a service reads it, and a variable of the
+group that is missing produces the same error naming it.
+
 ## Topology
 
 `api`, `worker` and `poller` share one image and differ only by command. `dashboard/` is built at
