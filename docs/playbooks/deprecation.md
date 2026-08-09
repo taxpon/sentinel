@@ -23,41 +23,64 @@ never what, and the pull request's central claim is that nothing else changed.
 
 ## Procedure
 
-1. **Decide where the slice stops before you start editing**: these defects
-   arrive as populations, not instances. A legacy accessor has a handful of live
-   call sites and belongs to a broader legacy idiom with hundreds; a per-item
-   query loop in one data-access object has siblings across the codebase. A
-   bounded set with one mechanical transformation and a clear correctness argument
-   is reviewable; a sweep across two hundred files is not, however correct each
-   edit is. Fix the slice the issue names, and put the rest in the pull request
-   description rather than in the diff.
+1. Decide where the slice stops before you start editing.
+   - These defects arrive as populations, not instances. A legacy accessor has a
+     handful of live call sites and belongs to a broader legacy idiom with
+     hundreds; a per-item query loop in one data-access object has siblings
+     across the codebase.
+   - A bounded set with one mechanical transformation and a clear correctness
+     argument is reviewable; a sweep across two hundred files is not, however
+     correct each edit is.
+   - Fix the slice the issue names, and put the rest in the pull request
+     description rather than in the diff.
 
-2. **Look for the idiom that already exists in the tree before inventing one**:
-   this codebase usually contains the batched or modern form a few lines away from
-   the code that does not use it — a bulk resolver defined in the same module as
-   the loop that calls the single-item lookup per iteration. Using it makes the
-   change reviewable as "this call site was never converted" instead of as a new
-   pattern somebody now has to assess.
+2. Look for the idiom that already exists in the tree before inventing one.
+   - This codebase usually contains the batched or modern form a few lines away
+     from the code that does not use it — a bulk resolver defined in the same
+     module as the loop that calls the single-item lookup per iteration.
+   - Using it makes the change reviewable as "this call site was never
+     converted" instead of as a new pattern somebody now has to assess.
 
-3. **Work out what "identical behaviour" means for the path you are converting,
-   and assert it**: identity-map semantics, ordering, de-duplication. That is the
-   promise the pull request is making, and nothing else in the diff substantiates
-   it.
+3. Work out what "identical behaviour" means for the path you are converting,
+   and assert it.
+   - Identity-map semantics, ordering, de-duplication. That is the promise the
+     pull request is making, and nothing else in the diff substantiates it.
 
-4. **Make the fix stick where the codebase can enforce it**: a deprecation fix
-   that only edits call sites regresses the first time somebody writes the old
-   form again. pytest.ini already promotes a list of SQLAlchemy 2.0 removal
-   warnings to hard errors; extending that list with the pattern you have just
-   eliminated, in the same pull request, is what turns a cleanup into a guarantee.
-   Prefer that to any amount of additional test coverage, because it is the only
-   part of this work that cannot rot.
+4. Extend pytest.ini's list of warnings promoted to errors with the pattern you
+   have just eliminated, in the same pull request.
+   - A deprecation fix that only edits call sites regresses the first time
+     somebody writes the old form again. pytest.ini already promotes a list of
+     SQLAlchemy 2.0 removal warnings to hard errors.
+   - Prefer this to any amount of additional test coverage, because it is the
+     only part of this work that cannot rot.
 
-5. **For a performance fix, build the measurement, because the measurement is the
-   test**: this repository has no assert_num_queries helper to borrow, so a
-   SQLAlchemy before_cursor_execute listener that counts statements while the path
-   under test runs is the instrumentation you need. Assert that the count does not
-   grow with the size of the input rather than asserting one specific number, so
-   an unrelated query added later does not break a test that is about complexity.
+5. Build the measurement for a performance fix, because the measurement is the
+   test.
+   - This repository has no assert_num_queries helper to borrow, so a SQLAlchemy
+     before_cursor_execute listener that counts statements while the path under
+     test runs is the instrumentation you need.
+   - Assert that the count does not grow with the size of the input rather than
+     asserting one specific number, so an unrelated query added later does not
+     break a test that is about complexity.
+
+6. Put the before and after counts in the pull request, for a performance fix.
+   - A performance change without a number is an assertion, not a result.
+
+## Specifications
+
+1. Observable behaviour has not moved: output, ordering and error type are what
+   they were before the change.
+2. The diff stops at the slice the issue names. The rest of the population is
+   described in the pull request, not converted in the same change.
+3. For a deprecation, the converted path is executed with the removal warning
+   promoted to an error: it fails on the old call and passes on the new one, and
+   the promotion lands in pytest.ini in the same pull request.
+4. For a performance fix, the test asserts that the statement count does not
+   grow with the size of the input, and the pull request carries the before and
+   after counts.
+5. root_cause states, for a deprecation, why the old form was still there and
+   what makes the replacement exactly equivalent; for a performance defect, the
+   shape that produces the cost.
 
 ## Advice & Pointers
 
@@ -74,18 +97,9 @@ and the only reason a run touches your module at all may be that the test file
 you edited is itself in the diff. Check the CI job summary, which prints the
 resolved scope, and do not read "no tests collected" as a pass.
 
-For a deprecation, the durable test is the converted path executed with the
-removal warning promoted to an error: it fails on the old call and passes on the
-new one.
-
-For a performance fix, put the before and after counts in the pull request; a
-performance change without a number is an assertion, not a result.
-
-root_cause: for a deprecation, why the old form is still there and what makes the
-replacement exactly equivalent. For a performance defect, the shape that produces
-the cost — "the loop resolves each tag with its own SELECT and then issues a
+root_cause: "the loop resolves each tag with its own SELECT and then issues a
 second SELECT to find any existing link, so the statement count grows as 2N+1 in
-the number of tags" — and not "batched the lookups", which describes the diff
+the number of tags" is a root cause. "Batched the lookups" describes the diff
 rather than the defect.
 
 Budget: 12 ACUs. A wide, shallow change is cheap to make; keeping it wide and
