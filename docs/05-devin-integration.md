@@ -56,14 +56,18 @@ One playbook per issue class, holding the standing instructions for that kind of
 reproduce, what evidence to gather, what the PR must contain). The per-issue prompt then carries
 only what is specific to the issue.
 
-| Playbook | Classes | `max_acu_limit` | Baseline engineer-hours (for impact panel) |
-|---|---|---|---|
-| `security-fix` | `security`, `bug` | 20 | 6.0 |
-| `dep-upgrade` | `security-dep`, `frontend-dep` | 10 | 2.0 |
-| `flaky-test` | `flaky-test`, `typing` | 12 | 3.0 |
-| `deprecation` | `deprecation`, `perf` | 12 | 3.0 |
+| Playbook | Classes | `max_acu_limit` | Baseline engineer-hours (for impact panel) | Text |
+|---|---|---|---|---|
+| `security-fix` | `security`, `bug` | 20 | 6.0 | [`playbooks/security-fix.md`](./playbooks/security-fix.md) |
+| `dep-upgrade` | `security-dep`, `frontend-dep` | 10 | 2.0 | [`playbooks/dep-upgrade.md`](./playbooks/dep-upgrade.md) |
+| `flaky-test` | `flaky-test`, `typing` | 12 | 3.0 | [`playbooks/flaky-test.md`](./playbooks/flaky-test.md) |
+| `deprecation` | `deprecation`, `perf` | 12 | 3.0 | [`playbooks/deprecation.md`](./playbooks/deprecation.md) |
 
 Baselines are stated assumptions, labelled as such on the dashboard — not measured facts.
+
+The playbooks themselves are created by hand in the Devin UI ([B6](./blockers.md#b6)), so the texts
+in [`playbooks/`](./playbooks/README.md) are the only record of what they contain and the source
+they are pasted from.
 
 ## Structured output
 
