@@ -2,7 +2,8 @@
 
 > **Status:** Design · **Answers:** What is persisted, and what guarantees do the constraints provide?
 
-Postgres, accessed through SQLAlchemy 2.0 with Alembic migrations. Five tables.
+Postgres, accessed through SQLAlchemy 2.0 with Alembic migrations. Five tables that hold the
+work, and one single-row table that holds the poller's heartbeat.
 
 ```mermaid
 erDiagram
@@ -165,6 +166,25 @@ panel.
 | `day` | `date` PK | UTC |
 | `acus` | `numeric(10,3) NOT NULL` | |
 | `synced_at` | `timestamptz NOT NULL` | Staleness indicator on the dashboard |
+
+## `poller_heartbeat`
+
+When the poller last completed a tick. One row, upserted on a fixed key.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `integer` PK | Always `1`; the conflict target of the upsert |
+| `ticked_at` | `timestamptz NOT NULL` | End of the last completed tick |
+
+This is the only source for `poller_lag_seconds` ([07](./07-observability.md)). The transition
+timestamps on `remediation` record what happened *to* a remediation, not that anybody looked at it,
+and a healthy poller observing "still `RUNNING`" writes no event at all — so the age of the newest
+`remediation_event` would report a remediation being polled correctly as hours behind.
+
+A column on `remediation` would be the obvious place and is the wrong one. The poller reconciles
+every in-flight remediation on every tick, so a per-row stamp writes N rows every
+`POLL_INTERVAL_SECONDS` for as long as they are in flight — and their staleness is uniform anyway,
+which is what lets one row speak for all of them.
 
 ## Timestamps to metrics
 

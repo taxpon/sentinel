@@ -61,6 +61,7 @@ from decimal import Decimal
 from typing import Any, Final
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sentinel.config import Settings, get_settings
@@ -68,7 +69,7 @@ from sentinel.db import dispose_engine, get_session_factory
 from sentinel.devin.client import DevinClient, DevinError, DevinResponseError, Sleep
 from sentinel.devin.playbooks import acu_cap_for
 from sentinel.devin.schemas import Outcome, PullRequest, Session, SessionStatus
-from sentinel.models import Remediation, RemediationEvent
+from sentinel.models import HEARTBEAT_ID, PollerHeartbeat, Remediation, RemediationEvent
 from sentinel.observability.logging import configure_logging, correlate, get_logger
 from sentinel.pipeline.state import (
     NON_TERMINAL_STATES,
@@ -391,10 +392,30 @@ async def poll_once(
                 continue
             moved += len(transitions)
 
+    await _beat(session_factory)
     log.info(
         "poller.tick", polled=len(pending), moved=moved, unreachable=unreachable, failed=failed
     )
     return Tick(polled=len(pending), moved=moved, unreachable=unreachable, failed=failed)
+
+
+async def _beat(session_factory: async_sessionmaker[AsyncSession]) -> None:
+    """Record that a tick finished, for `poller_lag_seconds`.
+
+    After the reconciliations rather than before: the claim it makes is that everything in flight
+    has been looked at, which is only true once they have been. A tick where some rows failed still
+    beats — the poller is alive and keeping up, and the failures are the `failed` count's business.
+
+    In a transaction of its own, so it cannot be lost with a reconciliation that rolled back, and as
+    an upsert on a fixed key, so there is exactly one row however many times this runs.
+    """
+    async with session_factory() as db:
+        await db.execute(
+            insert(PollerHeartbeat)
+            .values(id=HEARTBEAT_ID, ticked_at=_now())
+            .on_conflict_do_update(index_elements=["id"], set_={"ticked_at": _now()})
+        )
+        await db.commit()
 
 
 async def run(

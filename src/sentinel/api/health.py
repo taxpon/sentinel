@@ -24,7 +24,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sentinel import db
-from sentinel.models import AcuLedger, Job
+from sentinel.models import HEARTBEAT_ID, AcuLedger, Job, PollerHeartbeat
 from sentinel.observability.logging import get_logger
 from sentinel.observability.prom import METRICS, render_exposition
 from sentinel.queue import JobStatus
@@ -103,8 +103,34 @@ async def metrics(session: SessionDep) -> Response:
     can simply take for itself.
     """
     METRICS.publish_job_queue_depth(await _queue_depth(session))
+    METRICS.set_poller_lag(await _poller_lag(session))
     body, content_type = render_exposition()
     return Response(content=body, media_type=content_type)
+
+
+async def _poller_lag(session: AsyncSession) -> float:
+    """Seconds since the poller last completed a tick.
+
+    Every in-flight remediation is reconciled on every tick, so one figure speaks for all of them:
+    the age of the last completed tick is how stale the oldest of them is.
+
+    `0.0` before the poller has ever run is deliberate. The alternative — reporting the age of a
+    heartbeat that does not exist as infinite — makes a fresh deployment page someone before there
+    is anything to poll. A poller that stops *after* running is the failure worth alerting on, and
+    that one this reports honestly, climbing tick by tick.
+
+    Measured by Postgres rather than here, so the answer does not depend on this container's clock
+    agreeing with the one that wrote the row.
+    """
+    ticked_at = (
+        await session.execute(
+            select(PollerHeartbeat.ticked_at).where(PollerHeartbeat.id == HEARTBEAT_ID)
+        )
+    ).scalar_one_or_none()
+    if ticked_at is None:
+        return 0.0
+    now = (await session.execute(select(func.now()))).scalar_one()
+    return (now - ticked_at).total_seconds()
 
 
 async def _queue_depth(session: AsyncSession) -> dict[tuple[str, str], int]:

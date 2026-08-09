@@ -22,6 +22,7 @@ from factories import a_job, an_acu_ledger_entry
 from sentinel import db
 from sentinel.api import health, main
 from sentinel.config import Settings
+from sentinel.models import HEARTBEAT_ID, PollerHeartbeat
 from sentinel.observability.prom import Metrics
 
 # --- The application ------------------------------------------------------------------------------
@@ -228,6 +229,45 @@ async def test_finished_jobs_are_not_depth(
     assert _depth(scraped, "create_session", "done") is None
     assert _depth(scraped, "create_session", "failed") is None
     assert _depth(scraped, "create_session", "running") == 1
+
+
+def _lag(registry: CollectorRegistry) -> float | None:
+    return registry.get_sample_value("sentinel_poller_lag_seconds")
+
+
+async def _beat(session: AsyncSession, ago: datetime.timedelta) -> None:
+    database_now = (await session.execute(text("SELECT now()"))).scalar_one()
+    session.add(PollerHeartbeat(id=HEARTBEAT_ID, ticked_at=database_now - ago))
+    await session.commit()
+
+
+async def test_a_poller_that_has_never_run_reads_as_zero_rather_than_infinite(
+    client: Any, scraped: CollectorRegistry
+) -> None:
+    """A fresh deployment has no heartbeat and nothing to poll. Reporting that as an unbounded lag
+    would page someone before the system has been given anything to do."""
+    await client.get("/metrics")
+    assert _lag(scraped) == 0
+
+
+async def test_the_lag_is_the_age_of_the_last_completed_tick(
+    client: Any, session: AsyncSession, scraped: CollectorRegistry
+) -> None:
+    await _beat(session, datetime.timedelta(minutes=5))
+
+    await client.get("/metrics")
+    assert _lag(scraped) == pytest.approx(300, abs=60)
+
+
+async def test_a_poller_that_stopped_reads_as_climbing(
+    client: Any, session: AsyncSession, scraped: CollectorRegistry
+) -> None:
+    """The failure this metric exists for: the process is gone, the heartbeat stands still, and the
+    gauge grows with every scrape instead of sitting at a comfortable zero."""
+    await _beat(session, datetime.timedelta(hours=2))
+
+    await client.get("/metrics")
+    assert _lag(scraped) == pytest.approx(7200, abs=60)
 
 
 async def test_a_kind_that_drains_reads_as_zero_on_the_next_scrape(
