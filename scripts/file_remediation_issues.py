@@ -4,6 +4,10 @@
     uv run scripts/file_remediation_issues.py --show-bodies  # dry run, with the full issue bodies
     uv run scripts/file_remediation_issues.py --apply        # actually file them
 
+`GITHUB_TOKEN` is the only variable this reads, in either mode: it loads `GitHubSettings` rather
+than the whole `Settings`, so filing issues on the fork does not wait on Devin credentials or a
+database (`docs/adr/2026-08-10-a-script-loads-the-configuration-group-it-reads.md`).
+
 **A dry run is what this script does unless it is told otherwise.** Filing eight issues on a public
 fork is not a step to discover you have taken: it starts eight Devin sessions, spends the ACU budget
 and opens eight pull requests on a repository other people can see. So `--apply` is a word an
@@ -51,7 +55,7 @@ from typing import Any, Final
 
 import httpx
 
-from sentinel.config import ConfigurationError, Settings, get_settings
+from sentinel.config import ConfigurationError, GitHubSettings, TargetSettings, load_config
 from sentinel.devin.playbooks import IssueClass, UnknownIssueClass, parse_issue_class
 from sentinel.github.client import API_VERSION, GITHUB_API_BASE
 from sentinel.observability.logging import REDACTED, secret_values
@@ -336,7 +340,7 @@ def issue_title(candidate: Candidate) -> str:
     return f"{candidate.issue_class}: {_BACKTICK.sub('', candidate.title)}"
 
 
-def issue_labels(candidate: Candidate, settings: Settings) -> tuple[str, ...]:
+def issue_labels(candidate: Candidate, settings: TargetSettings) -> tuple[str, ...]:
     """The trigger label and the class label — the two the pipeline reads.
 
     The trigger label is what `sentinel.github.events` dispatches on, and the class label is what
@@ -346,7 +350,7 @@ def issue_labels(candidate: Candidate, settings: Settings) -> tuple[str, ...]:
     return (settings.autofix_label, f"{CLASS_LABEL_PREFIX}{candidate.issue_class}")
 
 
-def issue_body(candidate: Candidate, triage: Triage, settings: Settings) -> str:
+def issue_body(candidate: Candidate, triage: Triage, settings: TargetSettings) -> str:
     """The issue as an agent that has read nothing else receives it."""
     rows = [f"| Class | `{candidate.issue_class}` |"]
     if candidate.evidence_strength:
@@ -414,7 +418,7 @@ class Label:
         return body
 
 
-def required_labels(candidates: Sequence[Candidate], settings: Settings) -> tuple[Label, ...]:
+def required_labels(candidates: Sequence[Candidate], settings: TargetSettings) -> tuple[Label, ...]:
     """Every label the issues about to be filed carry, in the order they are created.
 
     Only those — not the whole set `scripts/bootstrap_github.py` reconciles. That script is the
@@ -621,7 +625,7 @@ def sync_labels(fork: Fork, labels: Sequence[Label]) -> None:
 def file_issues(
     fork: Fork,
     triage: Triage,
-    settings: Settings,
+    settings: TargetSettings,
     *,
     show_bodies: bool = False,
 ) -> int:
@@ -690,7 +694,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     dry_run = not args.apply
 
     try:
-        settings = get_settings()
+        settings = load_config(GitHubSettings)
     except ConfigurationError as exc:
         print(exc, file=sys.stderr)
         return EXIT_MISCONFIGURED

@@ -15,7 +15,20 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from sentinel.config import ConfigurationError, Settings, get_settings
+from sentinel.config import (
+    ConfigurationError,
+    ConfigurationGroup,
+    DatabaseSettings,
+    DevinSettings,
+    GitHubSettings,
+    PolicySettings,
+    ReportingSettings,
+    Settings,
+    TargetSettings,
+    WebhookSettings,
+    get_settings,
+    load_config,
+)
 from test_env_example import documented_variables
 
 # The required column of the table, with a value that satisfies each one.
@@ -544,3 +557,205 @@ def test_the_playbook_map_accepts_the_shape_the_example_documents(load: Load) ->
     documented = json.dumps({"security": "playbook-abc", "bug": "playbook-def"})
 
     assert load(DEVIN_PLAYBOOK_IDS=documented).devin_playbook_ids["bug"] == "playbook-def"
+
+
+# --------------------------------------------------------- the groups a script can load one of
+
+GROUPS: tuple[type[ConfigurationGroup], ...] = (
+    TargetSettings,
+    GitHubSettings,
+    WebhookSettings,
+    DevinSettings,
+    DatabaseSettings,
+    PolicySettings,
+    ReportingSettings,
+)
+"""Every group `Settings` is composed of. Listed here rather than derived from `Settings.__mro__`,
+so that a group dropped out of the composition fails the coverage test below instead of quietly
+taking its variables with it."""
+
+
+def test_the_groups_cover_the_documented_table_between_them() -> None:
+    # `Settings` is the union of these, and the tests above hold `Settings` to the table. Without
+    # this, a variable could be declared on `Settings` itself and belong to no group — loadable by a
+    # service and unreachable by any script.
+    covered = {name.upper() for group in GROUPS for name in group.model_fields}
+
+    assert covered == set(documented_variables())
+
+
+@pytest.mark.parametrize("group", GROUPS, ids=lambda group: group.__name__)
+def test_a_group_requires_exactly_its_own_variables_that_the_table_requires(
+    group: type[ConfigurationGroup],
+) -> None:
+    """Narrowing changes which variables are read, never whether one is optional.
+
+    A group that relaxed a required variable would let a script start half-configured and fail
+    later, at the call that needed it — which is the failure mode `get_settings()` exists to avoid.
+    """
+    documented = {name for name, spec in documented_variables().items() if spec.required}
+    declared = {name.upper() for name in group.model_fields}
+    required = {name.upper() for name, field in group.model_fields.items() if field.is_required()}
+
+    assert required == documented & declared
+
+
+def test_a_narrowed_configuration_reads_only_the_variables_it_declares(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reported fault: filing issues on the fork needed a Devin token and a database URL.
+
+    Nothing but `GITHUB_TOKEN` is set here — no Devin credentials, no `DATABASE_URL` — and the
+    configuration a GitHub-only script loads is complete.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", REQUIRED["GITHUB_TOKEN"])
+
+    settings = load_config(GitHubSettings)
+
+    assert settings.github_token.get_secret_value() == REQUIRED["GITHUB_TOKEN"]
+    assert settings.target_repo == "taxpon/superset"
+    assert settings.autofix_label == "devin:autofix"
+    assert not hasattr(settings, "database_url")
+
+
+def test_a_narrowed_configuration_still_fails_on_a_variable_of_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Everything *else* is configured, so the only thing that can fail is the one variable this
+    # group is about.
+    for name, value in REQUIRED.items():
+        if name != "GITHUB_TOKEN":
+            monkeypatch.setenv(name, value)
+
+    with pytest.raises(ConfigurationError) as raised:
+        load_config(GitHubSettings)
+
+    assert "GITHUB_TOKEN: Field required" in str(raised.value)
+
+
+def test_a_narrowed_configuration_says_nothing_about_the_variables_it_does_not_read() -> None:
+    with pytest.raises(ConfigurationError) as raised:
+        load_config(GitHubSettings)
+
+    message = str(raised.value)
+    for unrelated in set(REQUIRED) - {"GITHUB_TOKEN"}:
+        assert unrelated not in message
+
+
+def test_a_service_still_needs_every_variable_when_only_one_group_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Narrowing is for scripts. `api`, `worker` and `poller` load `Settings`, and an environment
+    that would satisfy a script must still stop a process from starting half-configured."""
+    monkeypatch.setenv("GITHUB_TOKEN", REQUIRED["GITHUB_TOKEN"])
+    get_settings.cache_clear()
+
+    with pytest.raises(ConfigurationError) as raised:
+        get_settings()
+
+    message = str(raised.value)
+    for missing in set(REQUIRED) - {"GITHUB_TOKEN"}:
+        assert missing in message
+
+
+def test_groups_compose_into_the_configuration_a_script_declares(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """How a script asks for two groups — `scripts/bootstrap_github.py` declares exactly this."""
+
+    class Configuration(GitHubSettings, WebhookSettings):
+        pass
+
+    monkeypatch.setenv("GITHUB_TOKEN", REQUIRED["GITHUB_TOKEN"])
+
+    with pytest.raises(ConfigurationError) as raised:
+        load_config(Configuration)
+    assert "GITHUB_WEBHOOK_SECRET: Field required" in str(raised.value)
+
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", REQUIRED["GITHUB_WEBHOOK_SECRET"])
+    settings = load_config(Configuration)
+
+    assert settings.github_token.get_secret_value() == REQUIRED["GITHUB_TOKEN"]
+    assert settings.github_webhook_secret.get_secret_value() == REQUIRED["GITHUB_WEBHOOK_SECRET"]
+
+
+def test_a_narrowed_configuration_keeps_the_properties_of_the_whole(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A script prints, and a script's configuration is loaded in the same shell that holds the
+    credentials. Nothing about masking or immutability may be traded for the narrowing."""
+    monkeypatch.setenv("GITHUB_TOKEN", f"  {REQUIRED['GITHUB_TOKEN']}  ")
+
+    settings = load_config(GitHubSettings)
+
+    # Stripped on the way in, masked in every rendering, and not rebindable afterwards.
+    assert settings.github_token.get_secret_value() == REQUIRED["GITHUB_TOKEN"]
+    for rendering in (repr(settings), str(settings.model_dump()), settings.model_dump_json()):
+        assert REQUIRED["GITHUB_TOKEN"] not in rendering
+    with pytest.raises(ValidationError):
+        settings.github_token = "rebound"  # type: ignore[assignment]  # the point of the test
+
+
+def test_a_narrowed_configuration_keeps_the_blank_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The `gh`-configured shell that exports a blank GITHUB_TOKEN is exactly the shell a bootstrap
+    # script is run from, so this hint matters more here than it does at a service's startup.
+    monkeypatch.setenv("GITHUB_TOKEN", "")
+
+    with pytest.raises(ConfigurationError) as raised:
+        load_config(GitHubSettings)
+
+    assert "set but blank" in str(raised.value)
+
+
+def test_a_group_carries_the_validators_of_the_variables_it_declares(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The parsing, the immutable container and the located error travel with the group.
+
+    They are declared beside their fields, so this is a property of the split rather than of any
+    care taken at the call site — and the located error is what an operator gets from a script.
+    """
+    monkeypatch.setenv("DEVIN_API_TOKEN", REQUIRED["DEVIN_API_TOKEN"])
+    monkeypatch.setenv("DEVIN_ORG_ID", REQUIRED["DEVIN_ORG_ID"])
+    monkeypatch.setenv("DEVIN_PLAYBOOK_IDS", REQUIRED["DEVIN_PLAYBOOK_IDS"])
+
+    settings = load_config(DevinSettings)
+
+    assert settings.devin_playbook_ids["security"] == "playbook-sec"
+    with pytest.raises(TypeError):
+        settings.devin_playbook_ids["security"] = "hijacked"  # type: ignore[index]  # the point
+
+    monkeypatch.setenv("DEVIN_PLAYBOOK_IDS", '{"security": 17}')
+    with pytest.raises(ConfigurationError) as raised:
+        load_config(DevinSettings)
+
+    assert "DEVIN_PLAYBOOK_IDS.security" in str(raised.value)
+
+
+def test_a_narrowed_configuration_normalises_the_database_url_as_a_service_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `alembic/env.py` borrows `normalise_database_url` rather than the model for the same reason
+    # this group exists; the two must not answer differently.
+    monkeypatch.setenv("DATABASE_URL", "postgres://sentinel:dbpassword@db.internal:5432/sentinel")
+
+    settings = load_config(DatabaseSettings)
+
+    assert settings.database_url.get_secret_value() == (
+        "postgresql+asyncpg://sentinel:dbpassword@db.internal:5432/sentinel"
+    )
+
+
+def test_a_narrowed_configuration_is_read_afresh_each_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`load_config` is deliberately not cached, unlike `get_settings()`: a script reads its
+    configuration once in `main`, so there is nothing to share and no cache to clear between
+    tests. This pins that, because a cache added later would leak one test's environment into the
+    next."""
+    monkeypatch.setenv("TARGET_REPO", "taxpon/superset")
+    first = load_config(TargetSettings)
+    monkeypatch.setenv("TARGET_REPO", "someone/else")
+
+    assert first.target_repo == "taxpon/superset"
+    assert load_config(TargetSettings).target_repo == "someone/else"

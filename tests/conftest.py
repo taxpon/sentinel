@@ -91,6 +91,20 @@ def make_settings(**overrides: Any) -> Settings:
     return Settings(**{**CONFIGURATION, **overrides})
 
 
+@pytest.fixture
+def bare_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Nothing configured at all: no variable of the model set, and no `.env` to be found.
+
+    For the tests that load a real configuration rather than being handed `make_settings()` — the
+    scripts, which declare the group they read and must start with only the variables of that
+    group. `env_file` is resolved against the working directory, so the run has to happen in an
+    empty one or the developer's own `.env` fills in what the test is asserting is unnecessary.
+    """
+    for field in Settings.model_fields:
+        monkeypatch.delenv(field.upper(), raising=False)
+    monkeypatch.chdir(tmp_path)
+
+
 @pytest.fixture(scope="session")
 def database_url() -> str:
     return os.environ.get("DATABASE_URL") or DEFAULT_DATABASE_URL

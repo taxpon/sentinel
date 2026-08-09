@@ -50,7 +50,7 @@ from typing import Any, Final, Self
 import httpx
 from pydantic import BaseModel, ValidationError
 
-from sentinel.config import Settings
+from sentinel.config import DevinSettings
 from sentinel.devin.playbooks import (
     NAMESPACE_TAG,
     TAG_PREFIXES,
@@ -280,11 +280,15 @@ class DevinClient:
     One `httpx.AsyncClient` is held for the life of the object, so connections are reused across a
     poll cycle. `sleep` and `rng` are injectable so that the backoff can be asserted without a test
     waiting for it.
+
+    `DevinSettings` rather than `Settings`: everything read here is Devin's own or the target
+    repository's, and `scripts/bootstrap_devin.py` is entitled to a configuration that stops there.
+    A service hands over its whole `Settings`, which is one.
     """
 
     def __init__(
         self,
-        settings: Settings,
+        settings: DevinSettings,
         *,
         retry: RetryPolicy = DEFAULT_RETRY,
         metrics: Metrics = METRICS,

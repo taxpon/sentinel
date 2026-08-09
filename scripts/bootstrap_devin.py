@@ -3,6 +3,9 @@
 
     make bootstrap-devin
 
+It reads the Devin variables and nothing else — no `GITHUB_TOKEN`, no `DATABASE_URL` — because
+nothing here talks to GitHub or stores anything. See `Configuration` below.
+
 Four steps, in this order:
 
 1. **token** — list the organisation's sessions. Nothing is created against a token Devin has not
@@ -61,7 +64,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TextIO
 
-from sentinel.config import ConfigurationError, Settings, get_settings
+from sentinel.config import (
+    ConfigurationError,
+    DevinSettings,
+    ReportingSettings,
+    TargetSettings,
+    load_config,
+)
 from sentinel.devin.client import (
     DevinAPIError,
     DevinClient,
@@ -71,6 +80,14 @@ from sentinel.devin.client import (
 from sentinel.devin.playbooks import NAMESPACE_TAG, TAG_PREFIXES, IssueClass
 from sentinel.devin.schemas import Capability, Unavailability
 from sentinel.observability.logging import configure_logging
+
+
+class Configuration(DevinSettings, ReportingSettings):
+    """What this script reads: the Devin organisation, the repository the nightly sweep is told to
+    watch, and the level its own diagnostics are logged at. Not `GITHUB_TOKEN` and not a database —
+    nothing here talks to GitHub or stores anything
+    (`docs/adr/2026-08-10-a-script-loads-the-configuration-group-it-reads.md`)."""
+
 
 # --- What is registered ---------------------------------------------------------------------------
 
@@ -640,7 +657,7 @@ async def _seed_knowledge(devin: DevinClient, env: EnvFile) -> str:
     return f"created {len(outstanding)} note(s){already}; {KNOWLEDGE_IDS} written to {env.path}"
 
 
-async def _create_schedule(devin: DevinClient, settings: Settings, env: EnvFile) -> str:
+async def _create_schedule(devin: DevinClient, settings: TargetSettings, env: EnvFile) -> str:
     """Create the nightly sweep, unless `.env` records that it already exists.
 
     The same shape as the notes, for the same reason: `POST /schedules` creates one every time it
@@ -676,7 +693,7 @@ async def _create_schedule(devin: DevinClient, settings: Settings, env: EnvFile)
 # --- The probe ------------------------------------------------------------------------------------
 
 
-async def _probe(devin: DevinClient, settings: Settings) -> list[Capable]:
+async def _probe(devin: DevinClient, settings: DevinSettings) -> list[Capable]:
     """Ask each optional capability whether this deployment can have it.
 
     Nothing here raises, but not everything here is an answer. A **refusal** — the `403` and `404`
@@ -742,7 +759,7 @@ async def _probe_acu_spend(devin: DevinClient) -> Capable:
     )
 
 
-def _probe_playbook_creation(settings: Settings) -> Capable:
+def _probe_playbook_creation(settings: DevinSettings) -> Capable:
     """Report B6 without probing it, and say why.
 
     `POST /v3/enterprise/playbooks` is deliberately absent from the endpoint table in
@@ -814,7 +831,7 @@ CAPABILITY_HEADING = "\nOptional capabilities — the degradation path, before t
 
 async def bootstrap(
     devin: DevinClient,
-    settings: Settings,
+    settings: DevinSettings,
     *,
     env: EnvFile,
     out: TextIO,
@@ -865,7 +882,7 @@ async def bootstrap(
     return report
 
 
-async def _run(settings: Settings, env: EnvFile, out: TextIO) -> Report:
+async def _run(settings: DevinSettings, env: EnvFile, out: TextIO) -> Report:
     async with DevinClient(settings) as devin:
         return await bootstrap(devin, settings, env=env, out=out)
 
@@ -884,7 +901,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
 
     try:
-        settings = get_settings()
+        settings = load_config(Configuration)
     except ConfigurationError as exc:
         print(exc, file=sys.stderr)
         return 2

@@ -3,6 +3,14 @@
 Every variable in the table in `docs/09-operations.md#configuration` appears here exactly once, with
 the documented default and required-ness. `.env.example` is the canonical list of names;
 `tests/test_env_example.py` keeps that file and the table in step.
+
+The variables are declared in groups — what the pipeline acts on, the GitHub token, the webhook
+secret, Devin, the database, the policy, the reporting — and `Settings` is all of them at once.
+`api`, `worker` and `poller` load `Settings` through `get_settings()` and so still fail at startup
+if any one variable is missing. A script loads one group, or a composition of a few, through
+`load_config()` and is told about nothing else: filing issues on the fork needs a GitHub token, not
+Devin credentials and a database
+(`docs/adr/2026-08-10-a-script-loads-the-configuration-group-it-reads.md`).
 """
 
 from __future__ import annotations
@@ -74,7 +82,15 @@ def _decode_json(value: Any, variable: str) -> Any:
         raise ValueError(f"{variable} must be valid JSON: {exc.msg}") from None
 
 
-class Settings(BaseSettings):
+class ConfigurationGroup(BaseSettings):
+    """The loading rules, shared by every group below and by `Settings`.
+
+    A group is a set of variables that are read together: nothing else about it differs from the
+    whole. Composing several is ordinary inheritance — `class C(GitHubSettings, WebhookSettings)` —
+    because every group reads the same environment under the same rules, with no prefix and no
+    nesting, so a variable means the same thing whichever model happens to declare it.
+    """
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -96,7 +112,40 @@ class Settings(BaseSettings):
         frozen=True,
     )
 
-    # --- Devin ---
+
+class TargetSettings(ConfigurationGroup):
+    """Which repository the pipeline acts on, on which branch, under which label.
+
+    No credential and no required variable: this group says *what* is being remediated, and every
+    part of the system that touches the fork needs it — which is why the two groups below extend it
+    rather than sit beside it.
+    """
+
+    target_repo: str = Field(default="taxpon/superset", min_length=1)
+    target_base_branch: str = Field(default="master", min_length=1)
+    autofix_label: str = Field(default="devin:autofix", min_length=1)
+
+
+class GitHubSettings(TargetSettings):
+    """What talking to GitHub about that repository needs.
+
+    Not the webhook secret. That one verifies deliveries *arriving*; it has nothing to do with
+    making a call, and requiring it here would mean a script that only files issues could not start
+    without it.
+    """
+
+    github_token: SecretStr = Field(min_length=1)
+
+
+class WebhookSettings(ConfigurationGroup):
+    """The shared secret deliveries are signed with — `api`, and the bootstrap that registers it."""
+
+    github_webhook_secret: SecretStr = Field(min_length=1)
+
+
+class DevinSettings(TargetSettings):
+    """The Devin organisation, and what a session about the target repository is created with."""
+
     devin_api_base: str = Field(default="https://api.devin.ai", min_length=1)
     devin_api_token: SecretStr = Field(min_length=1)
     devin_org_id: str = Field(min_length=1)
@@ -109,31 +158,6 @@ class Settings(BaseSettings):
     # remediation; freezing the model above stops a field being rebound but not edited in place.
     devin_playbook_ids: Annotated[Mapping[str, str], NoDecode, AfterValidator(MappingProxyType)]
     devin_knowledge_ids: Annotated[tuple[str, ...], NoDecode] = ()
-
-    # --- GitHub ---
-    github_token: SecretStr = Field(min_length=1)
-    github_webhook_secret: SecretStr = Field(min_length=1)
-    target_repo: str = Field(default="taxpon/superset", min_length=1)
-    target_base_branch: str = Field(default="master", min_length=1)
-    autofix_label: str = Field(default="devin:autofix", min_length=1)
-
-    # --- Database ---
-    # A SecretStr because the DSN embeds the password: it must not surface in a repr or a log line
-    # any more than a token does. Read it with `.get_secret_value()`.
-    database_url: SecretStr
-
-    # --- Policy ---
-    max_concurrent_sessions: int = Field(default=3, gt=0)
-    daily_acu_budget: float = Field(default=100.0, gt=0)
-    # Zero is meaningful: escalate to a human on the first review rather than attempting a fix.
-    max_fix_cycles: int = Field(default=3, ge=0)
-    max_job_attempts: int = Field(default=5, gt=0)
-    job_lease_timeout_seconds: int = Field(default=900, gt=0)
-    poll_interval_seconds: int = Field(default=20, gt=0)
-
-    # --- Reporting ---
-    acu_unit_cost_usd: float = Field(default=2.25, ge=0)
-    log_level: LogLevel = "info"
 
     @field_validator("devin_playbook_ids", mode="before")
     @classmethod
@@ -158,17 +182,61 @@ class Settings(BaseSettings):
         # `is None`, so a whitespace-only value must not survive as an empty string.
         return None if isinstance(value, str) and not value.strip() else value
 
-    @field_validator("log_level", mode="before")
-    @classmethod
-    def _normalise_log_level(cls, value: Any) -> Any:
-        # `str_strip_whitespace` does not reach a Literal field, so strip here too.
-        return value.strip().lower() if isinstance(value, str) else value
+
+class DatabaseSettings(ConfigurationGroup):
+    """Where the queue, the remediations and the event log live."""
+
+    # A SecretStr because the DSN embeds the password: it must not surface in a repr or a log line
+    # any more than a token does. Read it with `.get_secret_value()`.
+    database_url: SecretStr
 
     @field_validator("database_url")
     @classmethod
     def _apply_asyncpg_driver(cls, value: SecretStr) -> SecretStr:
         # Re-wrapped, because the normalised URL carries the same password the given one did.
         return SecretStr(normalise_database_url(value.get_secret_value()))
+
+
+class PolicySettings(ConfigurationGroup):
+    """The ceilings the pipeline runs under. Every one has a default; none is a credential."""
+
+    max_concurrent_sessions: int = Field(default=3, gt=0)
+    daily_acu_budget: float = Field(default=100.0, gt=0)
+    # Zero is meaningful: escalate to a human on the first review rather than attempting a fix.
+    max_fix_cycles: int = Field(default=3, ge=0)
+    max_job_attempts: int = Field(default=5, gt=0)
+    job_lease_timeout_seconds: int = Field(default=900, gt=0)
+    poll_interval_seconds: int = Field(default=20, gt=0)
+
+
+class ReportingSettings(ConfigurationGroup):
+    """What the cost panel scales by, and how much anything says about itself."""
+
+    acu_unit_cost_usd: float = Field(default=2.25, ge=0)
+    log_level: LogLevel = "info"
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _normalise_log_level(cls, value: Any) -> Any:
+        # `str_strip_whitespace` does not reach a Literal field, so strip here too.
+        return value.strip().lower() if isinstance(value, str) else value
+
+
+class Settings(
+    DevinSettings,
+    GitHubSettings,
+    WebhookSettings,
+    DatabaseSettings,
+    PolicySettings,
+    ReportingSettings,
+):
+    """Every group at once — the configuration `api`, `worker` and `poller` load.
+
+    Composed rather than declared, so that the table in `docs/09-operations.md#configuration` stays
+    covered exactly once: a variable belongs to one group, and this model is the union of them.
+    A service is only ever configured through this, so narrowing is something a script opts into and
+    never something a process falls into.
+    """
 
 
 def _describe(error: ValidationError) -> str:
@@ -215,17 +283,27 @@ def _blank_hint(variable: str, error_type: str) -> str:
     )
 
 
-@cache
-def get_settings() -> Settings:
-    """The configuration for this process.
+def load_config[Group: ConfigurationGroup](model: type[Group]) -> Group:
+    """Read `model` from the environment, or raise `ConfigurationError` naming what is wrong.
 
-    Cached, because the environment does not change while the process runs: validation happens once,
-    at the first call, so `api`, `worker` and `poller` fail on startup rather than on whichever
-    request first reads a bad value, and every module sees the same object. Tests that need a
-    different environment call `get_settings.cache_clear()`.
+    What a script calls, with the group — or the composition of groups — it actually reads:
+
+        class Configuration(GitHubSettings, WebhookSettings):
+            '''Exactly what this script uses.'''
+
+        settings = load_config(Configuration)
+
+    Only the variables of `model` are required, so a dry run of a script that talks to GitHub starts
+    with a GitHub token and nothing else. Everything the whole model does is kept, because it is the
+    same model: `SecretStr`, `env_ignore_empty`, the frozen fields, and an error that names
+    variables without echoing values.
+
+    Not cached, unlike `get_settings()`. A script reads its configuration once, in `main`, and
+    hands the object down; there is no second reader for a cache to keep in step with, and no cache
+    to remember to clear between tests.
     """
     try:
-        return Settings()
+        return model()
     except ValidationError as exc:
         # The ValidationError carries the input it rejected, and for a variable reported as missing
         # that input is the raw environment — every credential at once, before SecretStr wraps any
@@ -234,3 +312,19 @@ def get_settings() -> Settings:
         # Outside the handler there is no exception left for Python to attach.
         message = _describe(exc)
     raise ConfigurationError(message) from None
+
+
+@cache
+def get_settings() -> Settings:
+    """The configuration for this process — every variable, whichever ones this process reads.
+
+    Cached, because the environment does not change while the process runs: validation happens once,
+    at the first call, so `api`, `worker` and `poller` fail on startup rather than on whichever
+    request first reads a bad value, and every module sees the same object. Tests that need a
+    different environment call `get_settings.cache_clear()`.
+
+    A service loads `Settings` and nothing narrower. A process that started without its Devin
+    credentials would fail on the first session it tried to create — mid-remediation, against an
+    issue somebody had already labelled — instead of on the deploy that misconfigured it.
+    """
+    return load_config(Settings)
