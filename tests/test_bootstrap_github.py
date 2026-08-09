@@ -279,11 +279,11 @@ def run(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> Run:
     mean, and restored by monkeypatch afterwards.
     """
     monkeypatch.delenv("TUNNEL_URL", raising=False)
-    monkeypatch.setattr(bootstrap, "get_settings", lambda: settings)
+    monkeypatch.setattr(bootstrap, "load_config", lambda _model: settings)
 
     def invoke(*argv: str, config: Settings | None = None) -> int:
         if config is not None:
-            monkeypatch.setattr(bootstrap, "get_settings", lambda: config)
+            monkeypatch.setattr(bootstrap, "load_config", lambda _model: config)
         return int(bootstrap.main(list(argv)))
 
     return invoke
@@ -898,10 +898,10 @@ def test_the_configuration_error_names_no_values(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def unconfigured() -> Settings:
+    def unconfigured(_model: type[Settings]) -> Settings:
         raise ConfigurationError("invalid configuration: GITHUB_TOKEN: Field required")
 
-    monkeypatch.setattr(bootstrap, "get_settings", unconfigured)
+    monkeypatch.setattr(bootstrap, "load_config", unconfigured)
 
     assert bootstrap.main([]) == 2
 
@@ -943,3 +943,80 @@ def test_every_request_is_authenticated_and_pinned(
         assert request.headers["accept"] == "application/vnd.github+json"
         assert request.headers["x-github-api-version"]
         assert request.headers["user-agent"] == "sentinel-bootstrap"
+
+
+# ------------------------------------------------------- the configuration a run actually needs
+
+
+def test_a_dry_run_starts_with_nothing_configured_but_a_github_token(
+    repo: FakeRepo,
+    github_api: FakeAPI,
+    bare_environment: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The reported fault, as an operator meets it: nothing else in the environment.
+
+    No `get_settings` is patched here — the configuration is read from the environment the way a
+    real run reads it, because what is being asserted is which variables that read demands. A dry
+    run exists to be safe to run before anything is set up, so it is the run that must not need
+    the Devin credentials, the webhook secret or a database.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", GITHUB_TOKEN)
+    monkeypatch.delenv("TUNNEL_URL", raising=False)
+
+    assert bootstrap.main(["--dry-run", "--webhook-url", TUNNEL]) == 0
+
+    assert {request.method for request in github_api.requests} == {"GET"}
+    assert repo.hooks == []
+    out = capsys.readouterr().out
+    assert f"[dry run] webhook: registered {DELIVERY_URL}" in out
+
+
+def test_a_run_that_writes_refuses_to_start_without_the_webhook_secret(
+    repo: FakeRepo,
+    github_api: FakeAPI,
+    bare_environment: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The secret is what the hook is registered with, and a hook registered without one accepts
+    unsigned deliveries. Narrowing the dry run must not narrow the run that writes."""
+    monkeypatch.setenv("GITHUB_TOKEN", GITHUB_TOKEN)
+    monkeypatch.delenv("TUNNEL_URL", raising=False)
+
+    assert bootstrap.main(["--webhook-url", TUNNEL]) == bootstrap.EXIT_MISCONFIGURED
+
+    assert github_api.requests == []
+    assert "GITHUB_WEBHOOK_SECRET" in capsys.readouterr().err
+
+
+def test_a_run_that_writes_needs_no_more_than_the_token_and_the_secret(
+    repo: FakeRepo,
+    github_api: FakeAPI,
+    bare_environment: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", GITHUB_TOKEN)
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
+    monkeypatch.delenv("TUNNEL_URL", raising=False)
+
+    assert bootstrap.main(["--webhook-url", TUNNEL]) == 0
+
+    assert github_api.only("POST", f"/repos/{REPO}/hooks").json["config"]["secret"] == (
+        WEBHOOK_SECRET
+    )
+
+
+def test_a_dry_run_builds_a_hook_body_without_a_secret_it_was_never_given() -> None:
+    """What `--dry-run` has instead of a secret is nothing at all, and nothing is what it sends.
+
+    A body missing the secret must never reach GitHub — a PATCH replaces `config` wholesale, so it
+    would strip the secret from a working hook — which is why the two other tests above pin that
+    only a run with a secret writes at all.
+    """
+    body = bootstrap._body(DELIVERY_URL, None)
+
+    assert "secret" not in body["config"]
+    assert body["config"]["url"] == DELIVERY_URL
+    assert body["events"] == list(bootstrap.WEBHOOK_EVENTS)

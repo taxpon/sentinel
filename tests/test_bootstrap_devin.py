@@ -1022,7 +1022,7 @@ def test_main_reports_success_without_touching_stdout_with_diagnostics(
     capsys: pytest.CaptureFixture[str],
     no_recorded_ids: None,
 ) -> None:
-    monkeypatch.setattr(bootstrap_devin, "get_settings", lambda: settings)
+    monkeypatch.setattr(bootstrap_devin, "load_config", lambda _model: settings)
 
     assert bootstrap_devin.main(["--env", str(env_path)]) == 0
 
@@ -1042,7 +1042,7 @@ def test_main_records_into_dot_env_when_no_path_is_given(
 ) -> None:
     """`make bootstrap-devin` passes no `--env`, so the default is the path every real run uses and
     the one no other test here exercises."""
-    monkeypatch.setattr(bootstrap_devin, "get_settings", lambda: settings)
+    monkeypatch.setattr(bootstrap_devin, "load_config", lambda _model: settings)
     monkeypatch.chdir(tmp_path)
     write(tmp_path / ".env", ENV_TEXT)
 
@@ -1064,7 +1064,7 @@ def test_main_reports_an_unwritable_record_without_a_traceback(
     note that was created nowhere in the output."""
     path = tmp_path / ".env"
     write(path, "A=1\n")
-    monkeypatch.setattr(bootstrap_devin, "get_settings", lambda: settings)
+    monkeypatch.setattr(bootstrap_devin, "load_config", lambda _model: settings)
     monkeypatch.setattr(bootstrap_devin.os, "replace", _raise(OSError(13, "Permission denied")))
 
     assert bootstrap_devin.main(["--env", str(path)]) == 1
@@ -1084,7 +1084,7 @@ def test_main_exits_nonzero_with_a_legible_failure_and_no_traceback(
     capsys: pytest.CaptureFixture[str],
     no_recorded_ids: None,
 ) -> None:
-    monkeypatch.setattr(bootstrap_devin, "get_settings", lambda: settings)
+    monkeypatch.setattr(bootstrap_devin, "load_config", lambda _model: settings)
     devin_api.responds("GET", SESSIONS, 401, {"detail": "invalid token"})
 
     assert bootstrap_devin.main(["--env", str(env_path)]) == 1
@@ -1102,12 +1102,12 @@ def test_main_reports_a_bad_configuration_distinctly(
     """A configuration that does not describe a usable deployment is not a bootstrap failure, and
     its message already names the variables — so it is passed through rather than wrapped."""
 
-    def raise_configuration_error() -> Settings:
+    def raise_configuration_error(_model: type[Settings]) -> Settings:
         from sentinel.config import ConfigurationError
 
         raise ConfigurationError("invalid configuration — DEVIN_ORG_ID: Field required")
 
-    monkeypatch.setattr(bootstrap_devin, "get_settings", raise_configuration_error)
+    monkeypatch.setattr(bootstrap_devin, "load_config", raise_configuration_error)
 
     assert bootstrap_devin.main(["--env", str(tmp_path / ".env")]) == 2
     assert "DEVIN_ORG_ID" in capsys.readouterr().err
@@ -1120,3 +1120,45 @@ def test_the_script_does_not_declare_an_isolated_environment() -> None:
     source = (ROOT / "scripts" / "bootstrap_devin.py").read_text()
     assert "# /// script" not in source
     assert "$(UV) run scripts/bootstrap_devin.py" in (ROOT / "Makefile").read_text()
+
+
+# ------------------------------------------------------- the configuration a run actually needs
+
+
+def test_it_starts_with_the_devin_variables_and_nothing_else(
+    wired: FakeAPI,
+    bare_environment: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """No `GITHUB_TOKEN`, no `GITHUB_WEBHOOK_SECRET`, no `DATABASE_URL`: nothing here reaches
+    GitHub or stores anything. Nothing is patched — the environment is read as a real run reads
+    it, because which variables that read demands is the whole subject."""
+    monkeypatch.setenv("DEVIN_API_TOKEN", DEVIN_TOKEN)
+    monkeypatch.setenv("DEVIN_ORG_ID", ORG)
+    monkeypatch.setenv("DEVIN_PLAYBOOK_IDS", '{"security-fix": "pb-1"}')
+    # The record lives below the working directory, so `.env` is this script's record here and
+    # not also a source of configuration: the three variables above are the whole of what is set.
+    record = tmp_path / "record"
+    record.mkdir()
+    (record / ".env").write_text(ENV_TEXT, encoding="utf-8")
+
+    assert bootstrap_devin.main(["--env", str(record / ".env")]) == 0
+
+    assert "[1/4] token" in capsys.readouterr().out
+
+
+def test_a_missing_devin_variable_is_still_named(
+    bare_environment: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("DEVIN_API_TOKEN", DEVIN_TOKEN)
+
+    assert bootstrap_devin.main(["--env", str(tmp_path / ".env")]) == 2
+
+    error = capsys.readouterr().err
+    assert "DEVIN_ORG_ID: Field required" in error
+    assert "DEVIN_PLAYBOOK_IDS: Field required" in error

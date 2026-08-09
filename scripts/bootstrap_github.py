@@ -9,6 +9,10 @@ new is the ordinary case rather than the exceptional one.
     uv run scripts/bootstrap_github.py
     uv run scripts/bootstrap_github.py --webhook-url https://kind-otter.trycloudflare.com
 
+`GITHUB_TOKEN` is everything a dry run needs; a run that writes also needs `GITHUB_WEBHOOK_SECRET`,
+which is the value it gives the hook. Neither reads the Devin credentials or a database — see
+`Configuration` and `WritingConfiguration` below.
+
 Every step reconciles rather than recreates. Issues are enabled only when they are off, a label is
 patched only in the fields that differ, and the webhook Sentinel already owns — recognised by the
 receiver path it points at, not by the host, which is what changes — is updated in place. Run
@@ -47,7 +51,13 @@ from urllib.parse import quote, urlparse
 import httpx
 from pydantic import SecretStr
 
-from sentinel.config import ConfigurationError, Settings, get_settings
+from sentinel.config import (
+    ConfigurationError,
+    GitHubSettings,
+    TargetSettings,
+    WebhookSettings,
+    load_config,
+)
 from sentinel.devin.playbooks import IssueClass
 from sentinel.github.client import API_VERSION, GITHUB_API_BASE
 from sentinel.observability.logging import REDACTED, secret_values
@@ -81,6 +91,25 @@ BODY_EXCERPT_CHARS: Final = 400
 
 EXIT_STEP_FAILED: Final = 1
 EXIT_MISCONFIGURED: Final = 2
+
+
+class Configuration(GitHubSettings):
+    """What a run of this script reads: a token, and which repository to reconcile.
+
+    Not the Devin credentials and not a database. Nothing here creates a session or stores anything,
+    and requiring them would mean the repository could not be prepared until the rest of the system
+    was configured — `docs/adr/2026-08-10-a-script-loads-the-configuration-group-it-reads.md`.
+    """
+
+
+class WritingConfiguration(Configuration, WebhookSettings):
+    """That, plus the secret — for a run that actually writes.
+
+    `--dry-run` reports what would change and sends nothing, so it needs no secret to send. Loading
+    this one only when the run writes is what keeps a dry run runnable before the secret has been
+    chosen, which is when an operator most wants to see what the script would do. A run that writes
+    gets the ordinary required-variable error if it is missing, from the same loader.
+    """
 
 
 class BootstrapError(RuntimeError):
@@ -156,7 +185,7 @@ def _hint(response: httpx.Response) -> str:
     return ""
 
 
-def desired_labels(settings: Settings) -> tuple[Label, ...]:
+def desired_labels(settings: TargetSettings) -> tuple[Label, ...]:
     """The label set from `docs/09-operations.md#bootstrap`.
 
     The trigger label is read from the configuration rather than written out, so that bootstrapping
@@ -332,8 +361,13 @@ def sync_labels(api: GitHub, labels: Sequence[Label]) -> None:
         api.change(f"label {label.name}: updated {', '.join(sorted(changes))}")
 
 
-def sync_webhook(api: GitHub, *, url: str | None, secret: SecretStr) -> None:
-    """Register the delivery webhook, move the existing one to a new tunnel, or repair it."""
+def sync_webhook(api: GitHub, *, url: str | None, secret: SecretStr | None) -> None:
+    """Register the delivery webhook, move the existing one to a new tunnel, or repair it.
+
+    `secret` is `None` on a dry run and only there — see `Configuration`. Everything below still
+    runs, because what a dry run reports is what a real run would send; the one thing it cannot
+    report is the field it has no value for, and that field is never printed anyway.
+    """
     hooks = [hook for hook in api.collection(f"{api.repo_path}/hooks") if _is_sentinel_hook(hook)]
 
     if not hooks:
@@ -379,20 +413,23 @@ def sync_webhook(api: GitHub, *, url: str | None, secret: SecretStr) -> None:
         )
 
 
-def _body(url: str, secret: SecretStr) -> dict[str, Any]:
-    """The whole of a hook's configuration. `PATCH` replaces `config`, so it is sent whole."""
-    return {
-        "active": True,
-        "events": list(WEBHOOK_EVENTS),
-        "config": {
-            "url": url,
-            "content_type": "json",
-            # A delivery signed with the shared secret still travels over the wire, and GitHub
-            # will happily post to a certificate it cannot verify if asked to.
-            "insecure_ssl": "0",
-            "secret": secret.get_secret_value(),
-        },
+def _body(url: str, secret: SecretStr | None) -> dict[str, Any]:
+    """The whole of a hook's configuration. `PATCH` replaces `config`, so it is sent whole.
+
+    Whole includes the secret, and a body without one is not a body this script would send: a PATCH
+    replacing `config` without it removes the secret from a working hook. It is left out only when
+    there is none to send, which is a dry run, whose bodies are built and then discarded unsent.
+    """
+    configuration: dict[str, Any] = {
+        "url": url,
+        "content_type": "json",
+        # A delivery signed with the shared secret still travels over the wire, and GitHub
+        # will happily post to a certificate it cannot verify if asked to.
+        "insecure_ssl": "0",
     }
+    if secret is not None:
+        configuration["secret"] = secret.get_secret_value()
+    return {"active": True, "events": list(WEBHOOK_EVENTS), "config": configuration}
 
 
 def _canonical(hooks: Sequence[Mapping[str, Any]], url: str | None) -> Mapping[str, Any]:
@@ -488,10 +525,12 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        settings = get_settings()
+        settings = load_config(Configuration if args.dry_run else WritingConfiguration)
     except ConfigurationError as exc:
         print(exc, file=sys.stderr)
         return EXIT_MISCONFIGURED
+    # Present exactly when the run writes, which is what `WritingConfiguration` is.
+    secret = settings.github_webhook_secret if isinstance(settings, WebhookSettings) else None
 
     print(f"repository {settings.target_repo}{' (dry run)' if args.dry_run else ''}")
     try:
@@ -516,7 +555,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             enable_issues(api)
             sync_labels(api, desired_labels(settings))
-            sync_webhook(api, url=url, secret=settings.github_webhook_secret)
+            sync_webhook(api, url=url, secret=secret)
     except BootstrapError as exc:
         print(f"bootstrap failed: {exc}", file=sys.stderr)
         print("Nothing is undone; re-run to complete the remaining steps.", file=sys.stderr)

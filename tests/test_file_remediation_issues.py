@@ -232,11 +232,11 @@ def fork(http_mock: respx.MockRouter) -> FakeFork:
 @pytest.fixture
 def run(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> Run:
     """Invoke the script in-process, always against the real document unless told otherwise."""
-    monkeypatch.setattr(filing, "get_settings", lambda: settings)
+    monkeypatch.setattr(filing, "load_config", lambda _model: settings)
 
     def invoke(*argv: str, config: Settings | None = None) -> int:
         if config is not None:
-            monkeypatch.setattr(filing, "get_settings", lambda: config)
+            monkeypatch.setattr(filing, "load_config", lambda _model: config)
         if not any(arg.startswith("--document") for arg in argv):
             argv = (*argv, "--document", str(DOCUMENT))
         return int(filing.main(list(argv)))
@@ -722,10 +722,10 @@ def test_a_misconfigured_environment_files_nothing(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    def unconfigured() -> Settings:
+    def unconfigured(_model: type[Settings]) -> Settings:
         raise ConfigurationError("GITHUB_TOKEN: Field required")
 
-    monkeypatch.setattr(filing, "get_settings", unconfigured)
+    monkeypatch.setattr(filing, "load_config", unconfigured)
 
     assert run("--apply") == filing.EXIT_MISCONFIGURED
 
@@ -812,3 +812,55 @@ def test_the_repr_of_the_fork_names_the_repository_not_the_credentials(
     with httpx.Client(base_url=GITHUB_API_BASE) as http:
         fork = filing.Fork(http, settings.target_repo, secrets=frozenset(), dry_run=True)
         assert repr(fork) == f"Fork(repo={settings.target_repo!r}, dry_run=True)"
+
+
+# ------------------------------------------------------- the configuration a run actually needs
+
+
+def test_a_dry_run_starts_with_nothing_configured_but_a_github_token(
+    fork: FakeFork,
+    github_api: FakeAPI,
+    bare_environment: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The reported fault, as an operator meets it.
+
+    Filing these issues took a Devin token, an organisation id, a playbook map, a webhook secret
+    and a database URL, none of which this script reads — and the dry run, whose whole purpose is
+    to be safe to run before any of that exists, was blocked in exactly the same way. Nothing is
+    patched here: the configuration is read from the environment as a real run reads it.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", GITHUB_TOKEN)
+
+    assert filing.main(["--document", str(DOCUMENT)]) == 0
+
+    assert {request.method for request in github_api.requests} == {"GET"}
+    assert "nothing was written" in capsys.readouterr().out
+
+
+def test_a_run_that_files_needs_no_more_than_the_token(
+    fork: FakeFork,
+    github_api: FakeAPI,
+    bare_environment: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `--apply` writes to the fork, and it still reads nothing but the token: what this script does
+    # to GitHub is authenticated by one credential, whichever mode it runs in.
+    monkeypatch.setenv("GITHUB_TOKEN", GITHUB_TOKEN)
+
+    assert filing.main(["--apply", "--document", str(DOCUMENT)]) == 0
+
+    assert len(fork.issues) == 8
+
+
+def test_a_missing_github_token_is_named_and_files_nothing(
+    fork: FakeFork,
+    github_api: FakeAPI,
+    bare_environment: None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert filing.main(["--apply", "--document", str(DOCUMENT)]) == filing.EXIT_MISCONFIGURED
+
+    assert github_api.requests == []
+    assert "GITHUB_TOKEN" in capsys.readouterr().err
