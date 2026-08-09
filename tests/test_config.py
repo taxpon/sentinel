@@ -151,6 +151,53 @@ def test_a_blank_required_variable_is_rejected(load: Load, variable: str, blank:
     assert variable in str(raised.value)
 
 
+def test_an_empty_variable_says_so_rather_than_reading_as_absent(load: Load) -> None:
+    """ "Field required" is true of an empty value and of no value, and the fixes are opposite ones.
+
+    `env_ignore_empty` is what makes an empty value mean "unset", which `.env.example` shipping the
+    required variables blank depends on. The cost lands on the operator: Compose gives a shell
+    variable precedence over the same name in `env_file`, and a shell with the `gh` CLI configured
+    exports an empty `GITHUB_TOKEN` — so a correct `.env` is overridden and the error sends them to
+    inspect the one file that was already right. It cost a stack crash-looping through four restarts
+    to find.
+    """
+    with pytest.raises(ConfigurationError) as raised:
+        load(GITHUB_TOKEN="")
+
+    assert "set but blank" in str(raised.value)
+    assert "precedence" in str(raised.value)
+
+
+def test_a_whitespace_only_variable_needs_no_hint(load: Load) -> None:
+    """It never claimed to be absent. `env_ignore_empty` ignores only the exactly-empty value, so
+    whitespace survives to `str_strip_whitespace` and fails `min_length` — an error that already
+    says the value was read and found wanting."""
+    with pytest.raises(ConfigurationError) as raised:
+        load(GITHUB_TOKEN="   ")
+
+    assert "Field required" not in str(raised.value)
+    assert "blank" not in str(raised.value)
+
+
+def test_a_variable_nobody_set_is_not_blamed_on_the_shell(load: Load) -> None:
+    """The hint is only true when the variable is really there. Offering it for an absent one would
+    send the operator to unset something that does not exist."""
+    with pytest.raises(ConfigurationError) as raised:
+        load(GITHUB_TOKEN=None)
+
+    assert "GITHUB_TOKEN: Field required" in str(raised.value)
+    assert "blank" not in str(raised.value)
+
+
+def test_the_hint_is_not_offered_for_a_value_that_was_read_and_rejected(load: Load) -> None:
+    """A malformed `DATABASE_URL` is present and non-blank: it failed a validator, not the
+    required-ness check, and "set but blank" would be a false explanation of it."""
+    with pytest.raises(ConfigurationError) as raised:
+        load(DATABASE_URL="postgresql://a:b@c/d")
+
+    assert "blank" not in str(raised.value)
+
+
 def test_whitespace_around_a_pasted_value_is_discarded(load: Load) -> None:
     settings = load(
         DEVIN_ORG_ID="  org-pasted  ",
