@@ -31,7 +31,7 @@ from pydantic import SecretStr
 from structlog.processors import NAME_TO_LEVEL
 from structlog.typing import EventDict, FilteringBoundLogger, Processor, WrappedLogger
 
-from sentinel.config import Settings, get_settings
+from sentinel.config import ConfigurationGroup, ReportingSettings, get_settings
 
 REDACTED: Final = "[redacted]"
 """What a credential is replaced with. A visible marker, so a reader can tell redaction from
@@ -58,13 +58,17 @@ configured with — a token read back from an API response, a DSN built at runti
 of another installation quoted in an error message."""
 
 
-def secret_values(settings: Settings) -> frozenset[str]:
+def secret_values(settings: ConfigurationGroup) -> frozenset[str]:
     """Every credential the configuration holds, as the literal text to scrub out of a log line.
 
     Read off the model rather than from a hand-kept list, so that a `SecretStr` field added to
     `Settings` later is scrubbed without anyone remembering to come back here. Length is not
     considered: a secret short enough to also occur as ordinary text still redacts every
     occurrence, which mangles a line but never leaks one.
+
+    Any configuration group, not only the whole `Settings`: a script that loaded one group holds
+    the credentials of that group and no others, so those are exactly the values there are to
+    scrub. What it never read, it cannot print.
     """
     return frozenset(
         value.get_secret_value()
@@ -130,7 +134,9 @@ def _redactor(secrets: frozenset[str]) -> Processor:
     return redact
 
 
-def configure_logging(settings: Settings | None = None, *, stream: TextIO | None = None) -> None:
+def configure_logging(
+    settings: ReportingSettings | None = None, *, stream: TextIO | None = None
+) -> None:
     """Install the JSON pipeline. Called once by each of `api`, `worker` and `poller`, at startup.
 
     `stream` exists for tests, which need somewhere to read the output back from.
