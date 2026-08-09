@@ -67,6 +67,8 @@ Each session works in its own git worktree, sharing one `.git` directory:
 ```bash
 git worktree add ../wt/T11-devin-client -b task/T11-devin-client
 # ... work, commit, /finish-task, open PR ...
+# once the PR is merged:
+COMPOSE_PROJECT_NAME=sentinel-t11 docker compose down -v
 git worktree remove ../wt/T11-devin-client
 ```
 
@@ -81,6 +83,16 @@ export API_PORT=8001                # only needed if you run `make up`
 
 `make db` creates `.env` from `.env.example` if it is missing — Compose refuses to load the project
 without it, and an untracked `.env` does not follow you into a new worktree.
+
+**The container dies with the branch.** `docker compose down -v` belongs in the same breath as
+`git worktree remove`, not in a later tidy-up. Left running they accumulate — nineteen of them, and
+6.4GB of images, by the time the first wave was merged — and a stopped-mid-run container leaves
+backends idle in a transaction, holding locks that make the *next* run of the suite look like flaky
+application code rather than a database nobody cleaned up.
+
+**One suite per database.** `pgrep -f pytest` before you start: two runs against one Postgres
+deadlock on the `TRUNCATE` between tests and report a different, shifting set of failures each time.
+A run that takes minutes instead of a minute is waiting on locks, not working.
 
 ### What runs at session start
 

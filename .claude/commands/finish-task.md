@@ -65,3 +65,13 @@ Take the current task from "code written" to "pull request open". Work through t
 8. **Report** the pull request URL, what the review found and how it was resolved, and anything left
    undone. If something was left out, say so plainly rather than letting the checklist imply it was
    finished.
+
+9. **After the merge, tear the worktree's database down** — in the same breath as removing the
+   worktree, not as a later tidy-up:
+   ```bash
+   COMPOSE_PROJECT_NAME=sentinel-<task> docker compose down -v
+   git worktree remove ../wt/<task>
+   ```
+   Left running they accumulate, and a container abandoned mid-run keeps backends idle in a
+   transaction — holding locks that make the next run of the suite look like flaky application code
+   rather than a database nobody cleaned up.
