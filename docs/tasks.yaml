@@ -538,9 +538,15 @@ tasks:
     wave: 5
     area: remediation
     spec: docs/01-overview.md#issue-classes
-    owns: []
+    owns:
+      - scripts/file_remediation_issues.py
+      - tests/test_file_remediation_issues.py
     depends_on: [T50, T41]
-    adrs: []
+    adrs: [2026-08-09-the-remediation-filing-script-is-a-dry-run-until-told-otherwise]
+    notes: >-
+      Delivers the script, not the issues. A dry run is the default and --apply
+      is what writes: filing on taxpon/superset is outward-facing and stays an
+      operator's decision rather than a step in a build.
 
   - id: T52
     title: Execute and monitor the remediation runs
