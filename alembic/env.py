@@ -4,7 +4,10 @@ Two things here are not the generated default.
 
 **The URL comes from `DATABASE_URL`, not from `sentinel.config.Settings`.** Settings also requires
 the Devin and GitHub credentials, and applying a migration needs a database, not an API token — a
-deploy step should not fail because a token has been rotated out of the environment.
+deploy step should not fail because a token has been rotated out of the environment. Only the
+normalisation is borrowed, so that a `postgres://` URL from a managed provider reaches the same
+driver here as it does in the processes; without it the migration is the one place a deployment
+still fails on the scheme, and on Fly it is the release command, so the deploy never starts.
 
 **A caller may supply its own connection** in `config.attributes["connection"]`. Tests use this to
 run the migrations on the connection they already hold, inside the event loop they already have,
@@ -19,6 +22,7 @@ from alembic import context
 from sqlalchemy import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from sentinel.config import normalise_database_url
 from sentinel.models import Base
 
 config = context.config
@@ -35,7 +39,7 @@ def database_url() -> str:
         raise RuntimeError(
             "DATABASE_URL is not set. Alembic needs the database to migrate; see .env.example."
         )
-    return url
+    return normalise_database_url(url)
 
 
 def run_migrations_offline() -> None:

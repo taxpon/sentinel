@@ -32,7 +32,7 @@ A working register, updated throughout implementation.
 | [B6](#b6) | Devin API | Playbook CRUD is enterprise-scoped | Programmatic playbook creation | Open |
 | [B7](#b7) | Devin API | Org tag vocabulary may need pre-registration | Session creation | Open |
 | [B8](#b8) | Credentials | Devin `org_id` and service-user token not yet obtained | **All live execution** | **Open — highest priority** |
-| [B9](#b9) | Operations | Webhook needs a public URL; free tunnels rotate | Live demo reliability | Open |
+| [B9](#b9) | Operations | Webhook needs a public URL; free tunnels rotate | Live demo reliability | Open — a Fly deployment retires it, and is not yet done |
 | [B10](#b10) | Evaluation | PRs are merged within the fork, not upstream | Interpretation of "merged" | Accepted |
 | [B11](#b11) | Cost | Superset's test suite is heavy; ACU per session unpredictable | Budget calibration | Open |
 | [B12](#b12) | Delivery | This repository is private | Reviewer access | Open |
@@ -179,6 +179,14 @@ stale hook URL means silently failed deliveries.
 `gh api repos/taxpon/superset/hooks --jq '.[].last_response.status'` as a demo preflight step.
 Failed deliveries are redelivered by GitHub once the URL is corrected, and delivery-level
 deduplication makes redelivery safe ([06](./06-event-pipeline.md)).
+
+**A way out, not yet taken.** Deploying to Fly.io gives a permanent `https://<app>.fly.dev`
+hostname, so the hook is registered once and the rotation disappears — the tunnel is not the only
+way in. `fly.toml` and the runbook are in place
+([09](./09-operations.md#deployment-flyio)). **Nothing has been deployed**, and `flyctl` was not
+installed on the machine that runbook was written on, so none of its commands has been run. This
+stays `Open` until an app exists and `gh api repos/taxpon/superset/hooks` shows a `fly.dev` URL
+delivering successfully.
 
 ### B10 — PRs are merged in the fork, not upstream {#b10}
 
