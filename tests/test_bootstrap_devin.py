@@ -1106,6 +1106,22 @@ async def test_the_listing_refuses_to_choose_between_two_playbooks_of_one_title(
     assert name not in json.loads(re.findall(r"^  DEVIN_PLAYBOOK_IDS=(.+)$", out.text, re.M)[0])
 
 
+async def test_an_organisation_with_no_playbooks_is_reported_as_such(
+    devin: DevinClient, settings: Settings, devin_api: FakeAPI
+) -> None:
+    """A permission that is carried over an organisation nobody has created a playbook in. The
+    answer is a listing of nothing, not an error — and all four names are named as unmatched, which
+    is what tells the operator the UI step has not been done yet."""
+    devin_api.responds("GET", PLAYBOOKS, 200, a_page([]))
+    out = Out()
+
+    row = await list_playbooks(devin, settings, out)
+
+    assert (row.status, "0 playbook(s) visible") == (bootstrap_devin.REACHABLE, row.detail)
+    assert out.text.count("not matched: ") == len(pb.PLAYBOOKS)
+    assert "DEVIN_PLAYBOOK_IDS={}" in out.text
+
+
 async def test_the_listing_says_when_it_has_only_the_first_page(
     devin: DevinClient, settings: Settings, devin_api: FakeAPI
 ) -> None:
