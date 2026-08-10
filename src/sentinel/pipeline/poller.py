@@ -30,6 +30,14 @@ or the pull request could never be linked.
 reports them and GitHub never hears about them
 (`docs/adr/2026-08-08-a-session-with-nothing-to-show-fails.md`).
 
+**The pull request is what tells a stall from an offer.** `status_detail: waiting_for_user` covers
+both a session that cannot go on without an answer and one that has delivered its pull request and
+is offering to do something further. Before a pull request exists the first reading is the only one
+available and the remediation escalates; after it, the session is finished with what it was asked
+for and the remediation carries on through CI and review, with the question recorded once as an
+observation rather than as an escalation
+(`docs/adr/2026-08-10-an-offer-after-the-pull-request-is-not-a-stall.md`).
+
 **Reconciliation is idempotent**, because it runs every tick and almost every tick sees exactly what
 the last one saw. Two rules make it so, and between them they cover every trigger:
 
@@ -104,13 +112,16 @@ SOURCE: Final = "poller"
 `webhook_delivery_id`, and neither does a worker one, so the audit trail says which."""
 
 STALLED_STATUSES: Final[frozenset[SessionStatus]] = frozenset({SessionStatus.RUNNING})
-"""The statuses on which `status_detail: waiting_for_user` means the session is stalled.
+"""The statuses on which `status_detail: waiting_for_user` means the session is waiting on a human.
 
 Narrower than `SessionStatus.is_working`, deliberately. `docs/05-devin-integration.md` describes the
 stall as a session *running* and waiting; `claimed` has not begun work, so it cannot have asked
 anything yet, and `resuming` is by definition a session the worker has just sent a message to — the
 one moment a `waiting_for_user` left over from before that message would be read as a fresh
-question. See `docs/adr/2026-08-08-a-stalled-session-is-blocked.md`."""
+question. See `docs/adr/2026-08-08-a-stalled-session-is-blocked.md`.
+
+Whether that waiting is a *stall* is a second question, and the pull request answers it — see
+`blocked_reason`."""
 
 SESSION_ERROR: Final = "session_error"
 """`blocked_reason` for a session Devin reports as `error`."""
@@ -131,8 +142,25 @@ SESSION_UNREADABLE: Final = "session_unreadable"
 structured report missing a field `structured_output_required` promised."""
 
 SESSION_WAITING_FOR_USER: Final = "session_waiting_for_user"
-"""`blocked_reason` for a session stalled on a question. See
-`docs/adr/2026-08-08-a-stalled-session-is-blocked.md`."""
+"""`blocked_reason` for a session stalled on a question *before* it produced a pull request. See
+`docs/adr/2026-08-08-a-stalled-session-is-blocked.md` and
+`docs/adr/2026-08-10-an-offer-after-the-pull-request-is-not-a-stall.md`."""
+
+OBSERVATION: Final = "devin_call"
+"""`remediation_event.kind` for a row that records what a Devin call saw rather than a transition.
+
+One of the five kinds `docs/03-data-model.md` defines, and the one that fits: the fact came back
+from `GET /v3/…/sessions/{id}` and moved nothing. `from_state` equals `to_state` on such a row."""
+
+SESSION_QUESTION_AFTER_PULL_REQUEST: Final = "session_question_after_pull_request"
+"""`detail.note` on the `OBSERVATION` row written when a session that already has a pull request is
+seen waiting on a human.
+
+Devin ends a session by offering to do something further — run the app end to end, take a related
+fix — and asking sets `status_detail: waiting_for_user` on a session it has otherwise finished. That
+is not an escalation, so nothing else would record that it happened. Written **once** per
+remediation: the condition persists, and the poller re-reads the same session every
+`POLL_INTERVAL_SECONDS`, so a row per tick would say the same thing a few hundred times."""
 
 PR_NUMBER_UNRESOLVED: Final = "pr_number_unresolved"
 """Recorded in `remediation_event.detail`, against the URL it was derived from, on every transition
@@ -186,17 +214,46 @@ class Tick:
     failed: int = 0
 
 
-def blocked_reason(session: Session) -> str | None:
+def pull_request_exists(session: Session, *, pr_linked: bool) -> bool:
+    """Whether a pull request exists, counting either side of the observation.
+
+    `pr_linked` is the remediation's own link. The session may report a pull request for the first
+    time in this very observation, and an already-linked remediation must not be judged by a
+    `pull_requests[]` that has since gone quiet — so one is enough.
+    """
+    return pr_linked or session.pull_request_url is not None
+
+
+def waiting_on_a_human(session: Session) -> bool:
+    """Whether this observation shows the session waiting for someone to answer it.
+
+    Only the status set and the detail, deliberately: two different situations wear this same shape
+    and it is the pull request that tells them apart, which is `blocked_reason`'s business rather
+    than this predicate's.
+    """
+    return session.status in STALLED_STATUSES and session.waiting_for_user
+
+
+def blocked_reason(session: Session, *, has_pull_request: bool) -> str | None:
     """Why this observation says the remediation cannot proceed, or `None` if it does not.
 
     Two causes, both of which `docs/04-state-machine.md` escalates. Devin reporting
-    `outcome: blocked` is the one the spec tabulates. The other is a session in one of
-    `STALLED_STATUSES` reporting `waiting_for_user`: it has asked a question, nothing in an
-    unattended pipeline will answer it, and without this it would look busy for ever. Which statuses
-    those are matters as much as the detail — a `suspended` or `exit` session idling between fix
-    cycles also waits for input, and that is the normal state of every remediation in review.
+    `outcome: blocked` is the one the spec tabulates, and it escalates whatever else is true — it is
+    Devin saying outright that it cannot go on.
+
+    The other is a session in one of `STALLED_STATUSES` reporting `waiting_for_user`, **and only
+    while no pull request exists**. Before the pull request the session is stuck on a question
+    nothing in an unattended pipeline will answer, and without this it would look busy for ever.
+    After it, the work asked for has been delivered and the question is about something further —
+    Devin routinely ends a session by offering one — so escalating would end a remediation that is
+    finished, and `BLOCKED` is terminal
+    (`docs/adr/2026-08-10-an-offer-after-the-pull-request-is-not-a-stall.md`).
+
+    Which statuses count matters as much as the detail: a `suspended` or `exit` session idling
+    between fix cycles also waits for input, and that is the normal state of every remediation in
+    review.
     """
-    if session.status in STALLED_STATUSES and session.waiting_for_user:
+    if waiting_on_a_human(session) and not has_pull_request:
         return SESSION_WAITING_FOR_USER
     report = session.structured_output
     if report is not None and report.outcome is Outcome.BLOCKED:
@@ -236,17 +293,18 @@ def observed_triggers(
     `RUNNING` before `PR_OPENED` is reachable, and `BLOCKED` is applied before `FAILED` so that a
     session which reported *why* it stopped is recorded as blocked rather than as a bare failure.
 
-    `pr_linked` is the remediation's own link. A pull request counts as existing if either side
-    knows of one: the session may report it for the first time in this very observation, and an
-    already-linked remediation must not be failed by a `pull_requests[]` that has since gone quiet.
+    Whether a pull request exists — `pull_request_exists`, from either side of the observation —
+    decides two of the four: it is what the ACU cap and the end-of-session failure are conditional
+    on, and it is what separates a session stuck on a question from one offering to do something
+    further after the work was delivered.
     """
-    has_pull_request = pr_linked or session.pull_request_url is not None
+    has_pull_request = pull_request_exists(session, pr_linked=pr_linked)
     triggers: list[tuple[Trigger, str | None]] = []
     if session.status is not SessionStatus.NEW:
         triggers.append((Trigger.SESSION_RUNNING, None))
     if session.pull_request_url is not None:
         triggers.append((Trigger.PR_OPENED, None))
-    if (blocked := blocked_reason(session)) is not None:
+    if (blocked := blocked_reason(session, has_pull_request=has_pull_request)) is not None:
         triggers.append((Trigger.BLOCKED, blocked))
     failed = failure_reason(session, issue_class=issue_class, has_pull_request=has_pull_request)
     if failed is not None:
@@ -337,17 +395,15 @@ async def reconcile(
 ) -> tuple[Transition, ...]:
     """Bring one remediation into line with one observation of its session.
 
-    Columns first — status, ACUs, the structured report — then the triggers the observation carries.
-    Both halves are idempotent: an unchanged column is not written, and a trigger that moves nothing
-    returns nothing.
+    Columns first — status, ACUs, the structured report — then the triggers the observation carries,
+    then the one thing worth recording that is not a trigger. All three are idempotent: an unchanged
+    column is not written, a trigger that moves nothing returns nothing, and the note is written at
+    most once per remediation.
     """
     _reconcile_columns(remediation, session)
     pull_request = session.pull_requests[0] if session.pull_requests else None
-    observed = observed_triggers(
-        session,
-        issue_class=remediation.issue_class,
-        pr_linked=remediation.pr_url is not None,
-    )
+    pr_linked = remediation.pr_url is not None
+    observed = observed_triggers(session, issue_class=remediation.issue_class, pr_linked=pr_linked)
     moved: list[Transition] = []
     for trigger, reason in observed:
         result = await apply(
@@ -355,6 +411,10 @@ async def reconcile(
         )
         if result is not None:
             moved.append(result)
+    # After the triggers, so that the tick which links the pull request records the link first and
+    # the question against the state that link produced.
+    if waiting_on_a_human(session) and pull_request_exists(session, pr_linked=pr_linked):
+        await _note_question(db, remediation)
     return tuple(moved)
 
 
@@ -524,6 +584,58 @@ def _event(remediation: Remediation, result: Transition, reason: str | None) -> 
         kind="transition",
         detail={key: value for key, value in detail.items() if value is not None},
     )
+
+
+async def _note_question(db: AsyncSession, remediation: Remediation) -> None:
+    """Record, once, that the session asked something after its pull request was open.
+
+    Nothing else records it. The question moves no state — that is the whole point of
+    `docs/adr/2026-08-10-an-offer-after-the-pull-request-is-not-a-stall.md` — so without this row
+    the fact that Devin asked at all survives only in `status_detail`, which no column holds and
+    which the next observation overwrites.
+
+    **The log is the memory.** `docs/adr/2026-08-08-a-stalled-session-is-blocked.md` turned down a
+    rule that needed to count consecutive observations because "consecutive" is state no column
+    holds, and a counter in the poller's memory would be lost on every restart and absent whenever
+    `poll_once` is called directly. "Has this been recorded" does not have that problem: the
+    append-only log already answers it, durably and from any process.
+    """
+    if await _already_noted(db, remediation.id):
+        return
+    db.add(
+        RemediationEvent(
+            remediation_id=remediation.id,
+            from_state=remediation.state,
+            to_state=remediation.state,
+            kind=OBSERVATION,
+            detail={
+                "source": SOURCE,
+                "note": SESSION_QUESTION_AFTER_PULL_REQUEST,
+                "devin_session_id": remediation.devin_session_id,
+                "devin_status": remediation.devin_status,
+            },
+        )
+    )
+    log.info("poller.session.question_after_pull_request", state=remediation.state)
+
+
+async def _already_noted(db: AsyncSession, remediation_id: int) -> bool:
+    """Whether this remediation's log already carries the note.
+
+    Indexed by `(remediation_id, created_at)`, and asked only on the ticks where the condition
+    holds — which is every tick once it does, so the query is the price of not writing a row every
+    twenty seconds for the rest of the remediation's life.
+    """
+    found = await db.scalar(
+        select(RemediationEvent.id)
+        .where(
+            RemediationEvent.remediation_id == remediation_id,
+            RemediationEvent.kind == OBSERVATION,
+            RemediationEvent.detail["note"].astext == SESSION_QUESTION_AFTER_PULL_REQUEST,
+        )
+        .limit(1)
+    )
+    return found is not None
 
 
 async def _reconcile_one(

@@ -727,12 +727,17 @@ async def test_a_blocked_report_without_a_reason_still_names_one(
 # --- The stall signal -----------------------------------------------------------------------------
 
 
-async def test_a_session_waiting_for_user_is_blocked(
+async def test_a_session_waiting_for_user_before_a_pull_request_is_blocked(
     seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
 ) -> None:
     """`status_detail: waiting_for_user` on a working session is the stall signal of
     `docs/05-devin-integration.md`. Nothing in an unattended pipeline will answer the question, so
-    it is escalated rather than left looking busy."""
+    it is escalated rather than left looking busy.
+
+    The premise this test encodes, and the one the next two remove: **no pull request exists**, on
+    the remediation or on the session. The session has nothing to show for itself, so a question is
+    the only thing standing between it and the work — which is what makes it a stall.
+    """
     remediation = await seed(state=State.RUNNING.value)
     devin_api.responds(
         "GET", session_path, 200, a_session(status="running", status_detail="waiting_for_user")
@@ -793,6 +798,138 @@ async def test_a_session_being_started_is_not_stalled(
     await session.refresh(remediation)
     assert remediation.state == State.CI_FAILED.value
     assert remediation.blocked_reason is None
+
+
+# --- An offer is not a stall ----------------------------------------------------------------------
+
+
+async def test_a_question_after_the_pull_request_does_not_escalate(
+    seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
+) -> None:
+    """The defect the live re-run of issue #5 exposed, in one tick.
+
+    Devin opened the pull request, reported, and then asked whether it should run the app end to
+    end as an optional extra. The question set `status_detail: waiting_for_user` on a session that
+    had already delivered what it was asked for, and the poller escalated 41 seconds after
+    `PR_OPENED` — `BLOCKED` and terminal, on a remediation with nothing wrong with it.
+
+    What is asserted is everything the escalation would have done and does not: no state change, no
+    `blocked_reason`, no `escalate` job, and no `closed_at`.
+    """
+    remediation = await seed(state=State.PR_OPENED.value, pr_url=PR_URL, pr_number=PR_NUMBER)
+    devin_api.responds(
+        "GET",
+        session_path,
+        200,
+        a_session(
+            status="running",
+            status_detail="waiting_for_user",
+            pull_requests=a_pull_request(),
+            structured_output=REPORT,
+        ),
+    )
+
+    assert (await poll()).moved == 0
+
+    await session.refresh(remediation)
+    assert remediation.state == State.PR_OPENED.value
+    assert remediation.blocked_reason is None
+    assert remediation.closed_at is None
+    assert await jobs(session) == []
+
+
+async def test_the_question_is_recorded_once_rather_than_every_tick(
+    seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
+) -> None:
+    """Not escalating must not mean saying nothing: the question is a fact about the run, and
+    nothing else in the pipeline records it.
+
+    It is recorded as an observation rather than a transition, and once. The condition persists —
+    the session stays `waiting_for_user` until somebody answers it, which nobody will — and a tick
+    lands every `POLL_INTERVAL_SECONDS`, so a row per tick would be the same sentence a few hundred
+    times in the log the timeline panel renders.
+    """
+    remediation = await seed(state=State.PR_OPENED.value, pr_url=PR_URL, pr_number=PR_NUMBER)
+    devin_api.responds(
+        "GET",
+        session_path,
+        200,
+        a_session(
+            status="running", status_detail="waiting_for_user", pull_requests=a_pull_request()
+        ),
+    )
+
+    for _ in range(3):
+        await poll()
+
+    [note] = await events(session)
+    assert (note.from_state, note.to_state) == (State.PR_OPENED.value, State.PR_OPENED.value)
+    assert note.kind == poller.OBSERVATION
+    assert note.detail == {
+        "source": poller.SOURCE,
+        "note": poller.SESSION_QUESTION_AFTER_PULL_REQUEST,
+        "devin_session_id": SESSION_ID,
+        "devin_status": SessionStatus.RUNNING.value,
+    }
+    await session.refresh(remediation)
+    assert remediation.state == State.PR_OPENED.value
+
+
+async def test_a_question_arriving_with_the_first_pull_request_links_it_and_records_the_question(
+    seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
+) -> None:
+    """One observation can carry both, because the poller reads the session every twenty seconds
+    and Devin opens the pull request and offers the extra within the same interval.
+
+    The pull request counts from either side, so the link made by *this* observation is enough to
+    say the question is an offer — and the log records the link first, since the question is only
+    an offer by virtue of it.
+    """
+    remediation = await seed(state=State.RUNNING.value)
+    devin_api.responds(
+        "GET",
+        session_path,
+        200,
+        a_session(
+            status="running", status_detail="waiting_for_user", pull_requests=a_pull_request()
+        ),
+    )
+
+    assert (await poll()).moved == 1
+
+    await session.refresh(remediation)
+    assert remediation.state == State.PR_OPENED.value
+    assert remediation.blocked_reason is None
+    assert [(event.to_state, event.kind) for event in await events(session)] == [
+        (State.PR_OPENED.value, "transition"),
+        (State.PR_OPENED.value, poller.OBSERVATION),
+    ]
+
+
+async def test_a_blocked_report_still_escalates_with_a_pull_request_open(
+    seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
+) -> None:
+    """Only the `waiting_for_user` reading is conditional on the pull request. `outcome: blocked`
+    is Devin saying outright that it cannot go on, which is the cause `docs/04-state-machine.md`
+    tabulates and which a pull request does not answer."""
+    remediation = await seed(state=State.PR_OPENED.value, pr_url=PR_URL, pr_number=PR_NUMBER)
+    devin_api.responds(
+        "GET",
+        session_path,
+        200,
+        a_session(
+            status="running",
+            status_detail="waiting_for_user",
+            pull_requests=a_pull_request(),
+            structured_output={**REPORT, "outcome": "blocked", "blocked_reason": "needs a key"},
+        ),
+    )
+
+    await poll()
+
+    await session.refresh(remediation)
+    assert remediation.state == State.BLOCKED.value
+    assert remediation.blocked_reason == "needs a key"
 
 
 # --- What Devin will not answer -------------------------------------------------------------------
