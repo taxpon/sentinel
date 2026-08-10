@@ -1,9 +1,10 @@
-"""The nightly dependency sweep: resolve the target's manifests against OSV, and file the findings
-that are worth a remediation.
+"""The dependency sweep: resolve the target's manifests against OSV, and file the findings that are
+worth a remediation.
 
 `docs/05-devin-integration.md#scheduled-sweep` closes the loop — the sweep produces the issues the
-rest of the pipeline consumes. That makes three properties load-bearing, and each is decided here
-rather than left to the caller.
+rest of the pipeline consumes — and says how it is run, which is by hand: nothing schedules it
+(B16). That makes three properties load-bearing, and each is decided here rather than left to the
+caller.
 
 **One advisory source, both ecosystems.** Everything is resolved against the OSV API: the pins in
 `requirements/*.txt` as PyPI, and the resolved tree in `superset-frontend/package-lock.json` as npm.
@@ -94,8 +95,8 @@ FRONTEND_LOCKFILE: Final = "superset-frontend/package-lock.json"
 MAX_ISSUES_PER_SWEEP: Final = 3
 """How many issues one run may file.
 
-The sweep runs nightly, so this is a rate, not a total: a real backlog drains at three a night
-instead of arriving in one morning. Three is the number the rest of the system is already sized for
+This is a rate, not a total: a real backlog drains three at a time across successive runs instead of
+arriving in one morning. Three is the number the rest of the system is already sized for
 — `MAX_CONCURRENT_SESSIONS` defaults to 3, and three `dep-upgrade` sessions at their 10-ACU ceiling
 is 30 of the 100-ACU daily budget (`docs/09-operations.md#configuration`), which leaves the
 webhook-driven work the budget guard is actually there to protect. Findings over the limit are
@@ -126,8 +127,9 @@ class Suppression:
 
     Distinct from the rules in `triage`, which are judgements about a *shape* of finding. These are
     judgements about a specific advisory against a specific package in this specific tree, made
-    once by a human and recorded here so that the sweep does not re-litigate them nightly. Every
-    entry names the evidence, because an unexplained suppression is indistinguishable from a bug.
+    once by a human and recorded here so that the sweep does not re-litigate them on every run.
+    Every entry names the evidence, because an unexplained suppression is indistinguishable from a
+    bug.
     """
 
     ecosystem: str
@@ -1199,7 +1201,7 @@ class IssueTracker(Protocol):
 
 
 class ScannerError(RuntimeError):
-    """A request the sweep could not complete. The schedule is the retry — see `sweep`."""
+    """A request the sweep could not complete. The next run is the retry — see `sweep`."""
 
 
 class TargetRepository:
@@ -1211,9 +1213,9 @@ class TargetRepository:
     client's business: the pipeline acts on issues other people filed, and widening its route table
     to give the sweep two endpoints would widen it for every caller.
 
-    There is no retry policy here, unlike that client. The sweep is a nightly job whose whole
-    design is that running it twice files nothing twice, so a failed run is retried by the schedule
-    — tomorrow, from the top, against a tree that may have changed — rather than in place.
+    There is no retry policy here, unlike that client. The sweep's whole design is that running it
+    twice files nothing twice, so a failed run is retried by running it again — from the top,
+    against a tree that may have changed — rather than in place.
     """
 
     def __init__(self, settings: Settings | None = None) -> None:
@@ -1500,8 +1502,9 @@ async def sweep(
 
     Idempotent by construction. The fingerprints are read from the issues already filed before
     anything is decided, so a second run on an unchanged tree files nothing and reports every
-    finding as `already-filed`. That property is what makes a failed run safe to leave to the
-    schedule rather than retry in place.
+    finding as `already-filed`. That property is what makes a failed run safe to re-run from the
+    top rather than retry in place — and, with nothing scheduling this, safe to run by hand as
+    often as anyone likes (`docs/05-devin-integration.md#scheduled-sweep`).
     """
     settings = get_settings() if settings is None else settings
     manifests = await read_manifests(tracker)
