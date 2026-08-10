@@ -13,7 +13,11 @@ Four steps, in this order:
    after three notes exist is three notes to clean up by hand.
 2. **tags** — `PUT /v3/organizations/{org}/tags` with the vocabulary of `devin/playbooks.py`
    ([B7](../docs/blockers.md)). A `PUT` **replaces the whole set**: any tag the organisation
-   allows that `devin/playbooks.py` does not list is removed by the first run.
+   allows that `devin/playbooks.py` does not list is removed by the first run. A **refusal** here
+   is reported and does not stop the run: allowed-tag management is documented as an enterprise
+   feature, an organisation without it answers `403`, and steps 3 and 4 do not depend on the
+   vocabulary having been registered — only on tags being applied to sessions, which they are
+   either way.
 3. **knowledge** — the four notes of `docs/05-devin-integration.md#knowledge-notes`, whose ids are
    written into `.env` as `DEVIN_KNOWLEDGE_IDS`.
 4. **schedule** — the nightly vulnerability sweep, whose id is written into `.env` as
@@ -104,6 +108,7 @@ from sentinel.config import (
     load_config,
 )
 from sentinel.devin.client import (
+    DEGRADES,
     DevinAPIError,
     DevinClient,
     DevinError,
@@ -535,8 +540,9 @@ REACHABLE = "reachable"
 
 DEGRADED = "degraded"
 """Asked, and **refused** — a `403` or a `404`, which `client.DEGRADES` calls a capability this
-deployment does not have. Only this status claims a fallback, because only a refusal is an answer
-the fallback is the right response to."""
+deployment does not have. A refusal is an answer, so the run goes on and the row says what happens
+instead: the fallback from the degradation table, or — for step 2's registration, which nothing
+replaces — what is left unresolved by not having it. A `FAULT` names neither."""
 
 FAULT = "fault"
 """Asked, and something went wrong that is not an answer: a `401`, a `500`, a dead connection, a
@@ -562,6 +568,23 @@ class Capable:
     status: str
     detail: str
     remedy: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class Refused:
+    """A write Devin answered no to — the `403` or `404` `client.DEGRADES` recognises.
+
+    Step 2 is the only write that has one. It is reported rather than raised because what it
+    produces is optional to everything downstream: Sentinel depends on *applying* tags to a
+    session, not on the vocabulary having been pre-registered, so a run that stops here would cost
+    the knowledge notes and the nightly sweep over a step whose product nothing else reads.
+    """
+
+    status_code: int
+    reason: Unavailability
+
+    def __str__(self) -> str:
+        return f"{self.reason.value} ({self.status_code})"
 
 
 @dataclass
@@ -666,14 +689,30 @@ class Writer:
     def __repr__(self) -> str:
         return f"Writer(env={str(self.env.path)!r}, dry_run={self.dry_run!r})"
 
-    async def register_vocabulary(self) -> None:
-        """`PUT` the whole vocabulary. Idempotent by nature, and a replacement of whatever is
-        registered rather than an addition to it."""
+    async def register_vocabulary(self) -> Refused | None:
+        """`PUT` the whole vocabulary, or report the refusal that says this organisation does not
+        have allowed-tag management. Idempotent by nature, and a replacement of whatever is
+        registered rather than an addition to it.
 
-        async def register() -> None:
-            await self._devin.register_tags(VOCABULARY)
+        `client.DEGRADES` draws the line, and it is drawn there rather than here so that this step
+        and the capability probes cannot come to disagree about what a refusal is: `403` and `404`
+        are answers this run reports and continues past, and everything else — `401` above all —
+        stays a fault that leaves the run non-zero at this step. A rejected token is something to
+        fix, not a capability to work around, and catching `DevinAPIError` broadly here would turn
+        it into one.
+        """
 
-        await self._apply("tags", register)
+        async def register() -> Refused | None:
+            try:
+                await self._devin.register_tags(VOCABULARY)
+            except DevinAPIError as exc:
+                reason = DEGRADES.get(exc.status_code)
+                if reason is None:
+                    raise
+                return Refused(exc.status_code, reason)
+            return None
+
+        return await self._apply("tags", register)
 
     async def create_note(self, note: Note, recorded: list[str]) -> None:
         """Create one knowledge note and append its id to the record, or neither.
@@ -756,9 +795,25 @@ class Vocabulary:
     why: str = ""
     """Why `current` is `None`, short enough for the step line. The table row carries the rest."""
 
+    refused: bool = False
+    """Whether `current` is `None` because Devin *refused* the read rather than because it faulted.
+
+    The two point the preview in different directions. A fault says try again; a refusal says this
+    organisation does not have allowed-tag management — the read and the write want the same
+    enterprise permission — so the honest preview of step 2 is that the write is likely to be
+    refused too, not that it is about to replace a vocabulary nobody could read."""
+
     def change(self) -> str:
         """The `PUT` as a change to what is there, rather than as a list of what is sent."""
         listed = ", ".join(VOCABULARY)
+        if self.refused:
+            return (
+                f"would send the PUT, and it is likely to be refused as this read was ({self.why}) "
+                "— both want the enterprise permission this organisation appears not to have. A "
+                f"refusal is reported and the run continues, leaving the {len(VOCABULARY)} tags "
+                f"({listed}) NOT registered and B7 unresolved. If it is accepted instead, it "
+                "replaces the whole vocabulary and may remove tags nothing here can name"
+            )
         if self.current is None:
             return (
                 f"would replace the whole vocabulary with these {len(VOCABULARY)}: {listed} — and "
@@ -800,6 +855,7 @@ async def _read_vocabulary(devin: DevinClient) -> Vocabulary:
             _refused("B7", capability, result.reason.value, result.status_code),
             None,
             f"{result.reason.value}{status}",
+            refused=True,
         )
     current = result.value.tags
     return Vocabulary(
@@ -813,8 +869,50 @@ async def _read_vocabulary(devin: DevinClient) -> Vocabulary:
     )
 
 
-async def _register_vocabulary(writer: Writer, vocabulary: Vocabulary | None) -> str:
-    """Register the tag vocabulary.
+@dataclass(frozen=True, slots=True)
+class Registration:
+    """What step 2 did about the vocabulary: the line the operator reads, and B7's table row.
+
+    Both come from one place because they are two renderings of one outcome, and the outcome now
+    has three of them — registered, refused, or a dry run that sent nothing. Reporting `registered`
+    after a `PUT` that was refused, or after one that was never sent, would close B7's mitigation
+    on a run that did not perform it.
+    """
+
+    summary: str
+    row: Capable
+
+
+B7_UNRESOLVED = (
+    "B7 is unresolved rather than fine: if Devin does validate session tags against a registered "
+    "vocabulary, the first POST /sessions fails 422, and that is the moment B7 is answered."
+)
+"""What a run that did not register the vocabulary leaves behind.
+
+Sentinel goes on applying tags either way — `create_session` sends them, `handlers.py` adds
+`cycle:N` on a resume, and the session listing is filtered by them — so nothing here degrades to a
+fallback. What is unknown is whether Devin will *accept* tags it was never told about, which is
+B7's whole question and which only session creation can put.
+
+Step 4 below is the one weaker signal that arrives sooner: it sends `POST /schedules` carrying
+`sentinel` and `class:scheduled-sweep`. A run that reports this step as not registered and then
+creates the sweep has had unregistered tags accepted on a *schedule*, which is not a session and is
+not what the reference ties the feature to. It is not pointed at here because it would read as an
+answer, and it is not one."""
+
+
+REFUSAL_CAUSE = (
+    "Managing allowed tags is documented as ManageEnterpriseSettings with the session tags feature "
+    "enabled for the enterprise, so an organisation without it cannot register a vocabulary at all."
+)
+"""Why a refusal here is expected rather than surprising, and therefore why it is reported.
+
+Observed once: the owner's `--dry-run` against the real organisation was answered `403` on the
+*read* of its allowed tags, and no tag settings are visible in the Devin web app either."""
+
+
+async def _register_vocabulary(writer: Writer, vocabulary: Vocabulary | None) -> Registration:
+    """Register the tag vocabulary, or report that this organisation would not let us.
 
     Idempotent, and that word has been carrying more than it should: running this twice changes
     nothing, but the `PUT` is a **replacement** — "Replace the full set of allowed session tags for
@@ -826,11 +924,53 @@ async def _register_vocabulary(writer: Writer, vocabulary: Vocabulary | None) ->
     What it does is make the answer visible before the write: on a dry run `vocabulary` holds what
     is allowed today, and the summary is a change — kept, added, removed — rather than a list of
     what would be sent.
+
+    And a refusal of the write does not stop the run. What this step produces is optional to
+    everything after it, so failing here would cost steps 3 and 4 — the knowledge notes and the
+    nightly sweep — over a vocabulary nothing downstream reads. The summary says so in the words an
+    operator has to act on: not registered, and what that leaves open.
     """
-    await writer.register_vocabulary()
+    refused = await writer.register_vocabulary()
+    if refused is not None:
+        return Registration(
+            f"NOT registered — Devin refused the PUT ({refused}), so the organisation's allowed "
+            f"tags are whatever they already were. {REFUSAL_CAUSE} {B7_UNRESOLVED} Steps 3 and 4 "
+            "continue: they do not depend on it",
+            Capable(
+                "B7",
+                "tag_vocabulary",
+                DEGRADED,
+                f"{refused} -> not registered, and nothing here replaces it. {REFUSAL_CAUSE} "
+                "Sentinel applies tags to sessions regardless; whether Devin accepts ones it was "
+                "never told about shows at the first POST /sessions (B7)",
+            ),
+        )
     if vocabulary is None:
-        return f"registered {len(VOCABULARY)} tags: {', '.join(VOCABULARY)}"
-    return vocabulary.change()
+        return Registration(
+            f"registered {len(VOCABULARY)} tags: {', '.join(VOCABULARY)}",
+            Capable(
+                "B7",
+                "tag_vocabulary",
+                REGISTERED,
+                f"{len(VOCABULARY)} tags accepted; whether Devin enforces the vocabulary shows "
+                "only at session creation, which this script does not do",
+            ),
+        )
+    return Registration(
+        vocabulary.change(),
+        Capable(
+            "B7",
+            "tag_vocabulary",
+            NOT_PROBED,
+            f"{len(VOCABULARY)} tags would be registered; nothing was sent, so the vocabulary is "
+            "whatever it already was"
+            + (
+                f". The read was refused ({vocabulary.why}), so the write likely would be too"
+                if vocabulary.refused
+                else ""
+            ),
+        ),
+    )
 
 
 async def _seed_knowledge(writer: Writer) -> str:
@@ -1261,14 +1401,15 @@ async def bootstrap(
     # After step 1 and only on a dry run: the read that turns "what would be sent" into "what would
     # change", and it is worth nothing if the token behind it was never checked.
     vocabulary = await _read_vocabulary(devin) if dry_run else None
-    done("tags", await _register_vocabulary(writer, vocabulary))
+    registration = await _register_vocabulary(writer, vocabulary)
+    done("tags", registration.summary)
     done("knowledge", await _seed_knowledge(writer))
     done("schedule", await _create_schedule(writer, settings))
 
     report.capabilities.extend(await _probe(devin, settings))
     if vocabulary is not None:
         report.capabilities.append(vocabulary.row)
-    report.capabilities.append(_vocabulary_row(dry_run))
+    report.capabilities.append(registration.row)
     print(CAPABILITY_HEADING, file=out)
     print("\n".join(_table(report.capabilities)), file=out)
     if dry_run:
@@ -1294,28 +1435,6 @@ async def bootstrap(
             ),
         )
     return report
-
-
-def _vocabulary_row(dry_run: bool) -> Capable:
-    """B7's row: what step 2 did about the vocabulary, which on a dry run is nothing.
-
-    Reporting `registered` after a run that sent no `PUT` would close B7's mitigation on a preview.
-    """
-    if dry_run:
-        return Capable(
-            "B7",
-            "tag_vocabulary",
-            NOT_PROBED,
-            f"{len(VOCABULARY)} tags would be registered; nothing was sent, so the vocabulary is "
-            "whatever it already was",
-        )
-    return Capable(
-        "B7",
-        "tag_vocabulary",
-        REGISTERED,
-        f"{len(VOCABULARY)} tags accepted; whether Devin enforces the vocabulary shows only at "
-        "session creation, which this script does not do",
-    )
 
 
 async def _run(settings: DevinSettings, env: EnvFile, out: TextIO, *, dry_run: bool) -> Report:

@@ -174,10 +174,37 @@ see [B14](#b14), which is now the harder half of this question.
 **Impact.** If enforced, creating a session with an unregistered tag fails with `422` — and tags
 carry the whole audit-trail argument ([05](./05-devin-integration.md)).
 
-**Mitigation.** Register the vocabulary at bootstrap before any session is created.
+**Observed, 2026-08-10.** `uv run scripts/bootstrap_devin.py --dry-run` was run against the real
+organisation. `GET /v3/enterprise/organizations/{org_id}/tags` — the documented read — answered
+**`403`**. The reference requires `ManageEnterpriseSettings` for it and states *"the session tags
+feature must be enabled for the enterprise"*; no tag settings are visible in the Devin web app for
+this organisation either. So allowed-tag management looks like an enterprise feature this
+organisation does not have.
 
-**To verify.** After [B8](#b8): create a session with a deliberately unregistered tag and record
-whether it is rejected. Update this entry with the answer.
+**Inferred, not observed.** That the `PUT` of step 2 is refused for the same reason. The write has
+not been attempted, and it goes to a different path ([B14](#b14)); a `403` on the read is evidence
+about the write, not a measurement of it.
+
+**Mitigation, and what it is now worth.** The vocabulary is registered at bootstrap before any
+session is created — *when the organisation allows it*. Since 2026-08-10 a `403` or `404` on that
+`PUT` is a reported degradation rather than a failed run: step 2 says in one line that the
+vocabulary was **not** registered and that this is unresolved, and steps 3 and 4 go on to create the
+knowledge notes and the nightly sweep. Nothing else depends on the registration having succeeded —
+`create_session` sends tags, `handlers.py` adds `cycle:N` on a resume, and the session listing is
+filtered by tag, none of which reads the registered vocabulary. What is unknown is whether Devin
+*accepts* those tags without it.
+
+**To verify.** The first real `POST /sessions` is the measurement, and it is now the only one this
+question has. A session created with Sentinel's tags either succeeds — Devin does not validate
+session tags against a registered vocabulary, or this organisation's vocabulary is not enforced —
+or fails `422`, which answers B7 in the affirmative and makes registering the vocabulary a
+prerequisite that this organisation cannot currently satisfy. Record the outcome here either way.
+
+**One weaker signal arrives first.** Step 4 of the same bootstrap run sends
+`POST /schedules` with `sentinel` and `class:scheduled-sweep` on it. So a run that reports step 2 as
+*not registered* and still creates the sweep has had unregistered tags accepted **on a schedule** —
+which is not the same object as a session, and the reference ties the feature to *session* tags. It
+is evidence, not the answer.
 
 ### B14 — The tag path we write is undocumented, and the documented one is enterprise-scoped {#b14}
 
@@ -204,14 +231,27 @@ only add to it is a decision, not a bug: **`PUT` is kept deliberately**, because
 Sentinel's alone. On an organisation shared with anyone else, `POST` is the right method and this
 entry is the reason to change it before running.
 
+**Observed, 2026-08-10 — the destructive risk is much reduced.** The preview was run against the
+real organisation and the documented read answered **`403`** ([B7](#b7)). If the write is refused
+the same way, the second row of that table cannot happen: a `PUT` that never lands removes nothing.
+That is the harmless outcome, and it is now the likely one.
+
+Still inferred, not observed: that the write *is* refused. It goes to
+`/v3/organizations/{org_id}/tags`, which the reference does not list, so a `403` on the
+enterprise-prefixed read does not establish what the organisation-scoped write does. If the
+undocumented alias is served without the enterprise permission, the replacement risk is exactly what
+it was.
+
 **Mitigation in place.** `uv run scripts/bootstrap_devin.py --dry-run` reads the *documented* path
 and reports which tags would be kept, added and **removed**, naming the removals individually. Where
-it cannot read — `403` is likely, since the read wants enterprise scope too — it says so and warns
-that the write may remove tags it cannot name. It also states that the path it read is not the path
-step 2 writes, so a removal list is never mistaken for a certainty.
+it cannot read — which is what happened — it says the write is likely to be refused too, and that
+if it is accepted instead it may remove tags nothing here can name. It also states that the path it
+read is not the path step 2 writes, so a removal list is never mistaken for a certainty. A refused
+write is reported and does not stop the run.
 
 **To resolve.** Run the preview. If the read is refused, check the organisation's allowed tags in
-the Devin web app before running step 2 for real.
+the Devin web app before running step 2 for real — and read step 2's own line afterwards, which
+says whether the write was accepted or refused.
 
 ### B8 — Devin credentials not yet obtained {#b8}
 
