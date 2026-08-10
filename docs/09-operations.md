@@ -56,7 +56,10 @@ writes nothing, needs no more than it takes to read
 - `make bootstrap-github` — `GITHUB_TOKEN`, `GITHUB_WEBHOOK_SECRET` (the value it gives the hook);
 - `uv run scripts/bootstrap_github.py --dry-run` — `GITHUB_TOKEN`;
 - `uv run scripts/file_remediation_issues.py`, with or without `--apply` — `GITHUB_TOKEN`;
-- `make bootstrap-devin` — `DEVIN_API_TOKEN`, `DEVIN_ORG_ID`, `DEVIN_PLAYBOOK_IDS`;
+- `make bootstrap-devin`, and `scripts/bootstrap_devin.py --dry-run` — `DEVIN_API_TOKEN`,
+  `DEVIN_ORG_ID`, `DEVIN_PLAYBOOK_IDS`. The preview reads the same group as the run rather than a
+  smaller one: it verifies the token, probes the optional endpoints and counts the playbook ids,
+  which are the reads that make a preview worth having;
 - `make devin-playbooks` — `DEVIN_API_TOKEN`, `DEVIN_ORG_ID`, and deliberately not
   `DEVIN_PLAYBOOK_IDS`: this is the read that *finds* it, and demanding it first would make the
   lookup unusable at the one moment anyone wants it
@@ -320,6 +323,25 @@ into `.env`. It creates nothing and writes to no file. If the service user does 
 playbook permission it says so in one line and exits 0; read the ids from the playbook pages in the
 web app instead.
 
+Then look at what the run would do, before it does any of it:
+
+```bash
+uv run scripts/bootstrap_devin.py --dry-run
+```
+
+It prints the four steps in the tense of a run that has not happened and writes nothing — no
+request that changes anything, and no line in `.env`. Step 1 and the capability probes still run,
+because they are reads: the preview tells you whether the token is accepted and which optional
+endpoints answer. For each of the other three it says what would *change* — the whole tag set the
+`PUT` would replace the vocabulary with, and whether `DEVIN_KNOWLEDGE_IDS` and `DEVIN_SCHEDULE_ID`
+already record ids, which is what decides between "create" and "skip". It closes with what it
+cannot tell you.
+
+Worth reading rather than skipping. Step 4 registers a *recurring* sweep, so a run made by mistake
+leaves something that keeps acting on its own every night; and steps 3 and 4 are idempotent only
+through what `.env` records, so a run against a `.env` freshly copied from `.env.example` creates a
+second set of notes and a second sweep that nothing afterwards can tell apart.
+
 ```bash
 make bootstrap-devin
 ```
@@ -329,6 +351,9 @@ make bootstrap-devin
 - creates the nightly sweep schedule;
 - verifies the token by listing sessions, and reports which optional enterprise endpoints are
   reachable so the degradation path is known before the demo, not during it.
+
+Every step is idempotent, so a second run repeats nothing that already succeeded — but idempotence
+for the last two *is* the `.env` record, which is why the preview names what it holds.
 
 ### 3. Webhook
 
