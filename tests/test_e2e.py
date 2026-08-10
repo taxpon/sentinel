@@ -39,7 +39,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from conftest import ClientFactory, Delivery, DeliveryFactory, FakeAPI
-from factories import ISSUE_CLASS, ISSUE_NUMBER, PR_NUMBER, REPO, github_payload
+from factories import (
+    ISSUE_CLASS,
+    ISSUE_NUMBER,
+    PR_NUMBER,
+    REPO,
+    a_consumption_body,
+    github_payload,
+)
 from sentinel import db
 from sentinel.api.main import create_app
 from sentinel.config import Settings
@@ -310,7 +317,7 @@ async def test_what_sentinel_sends_across_a_whole_remediation(
     assert create_job.payload["delivery_id"] == LABELLED
 
     # --- The worker creates the session: budget, issue, `POST /sessions`. ---
-    devin_api.responds("GET", CONSUMPTION, json={"days": []})
+    devin_api.responds("GET", CONSUMPTION, json=a_consumption_body())
     github_api.responds("GET", ISSUE, json=github_payload("issues.labeled")["issue"])
     devin_api.responds(
         "POST", SESSIONS, 201, {"session_id": SESSION_ID, "status": "new", "url": SESSION_URL}
@@ -495,7 +502,7 @@ async def a_labelled_remediation(
 ) -> None:
     """The first two steps of the walkthrough above: labelled, and a session opened for it."""
     await pipeline.deliver(classified(delivery))
-    devin_api.responds("GET", CONSUMPTION, json={"days": []})
+    devin_api.responds("GET", CONSUMPTION, json=a_consumption_body())
     github_api.responds("GET", ISSUE, json=github_payload("issues.labeled")["issue"])
     creations = devin_api.responds(
         "POST", SESSIONS, 201, {"session_id": SESSION_ID, "status": "new", "url": SESSION_URL}

@@ -41,7 +41,15 @@ from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from conftest import FakeAPI
-from factories import ISSUE_CLASS, ISSUE_NUMBER, PR_NUMBER, REPO, a_remediation, github_payload
+from factories import (
+    ISSUE_CLASS,
+    ISSUE_NUMBER,
+    PR_NUMBER,
+    REPO,
+    a_consumption_body,
+    a_remediation,
+    github_payload,
+)
 from sentinel import queue
 from sentinel.config import Settings
 from sentinel.devin.client import DevinClient, RetryPolicy
@@ -283,9 +291,9 @@ def a_review_comment(**overrides: Any) -> dict[str, Any]:
     }
 
 
-def fake_budget(devin_api: FakeAPI, days: list[dict[str, Any]] | None = None) -> None:
+def fake_budget(devin_api: FakeAPI, *days: tuple[datetime.date, float]) -> None:
     """The consumption endpoint the admission policy reads before it admits anything."""
-    devin_api.responds("GET", CONSUMPTION, json={"days": days or []})
+    devin_api.responds("GET", CONSUMPTION, json=a_consumption_body(*days))
 
 
 def fake_session_creation(devin_api: FakeAPI, **overrides: Any) -> None:
@@ -533,7 +541,7 @@ async def test_create_session_defers_at_the_concurrency_cap_without_calling_devi
     for number in range(settings.max_concurrent_sessions):
         await seed(issue_number=1000 + number, state=State.RUNNING, devin_session_id=f"s-{number}")
     await a_create_job(seed, enqueue)
-    devin_api.responds("GET", CONSUMPTION, json={"days": []})
+    devin_api.responds("GET", CONSUMPTION, json=a_consumption_body())
 
     await handlers.create_session(context, await claim())
 
@@ -552,8 +560,8 @@ async def test_create_session_blocks_and_escalates_when_the_budget_is_exhausted(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     remediation_id = await a_create_job(seed, enqueue)
-    today = datetime.datetime.now(datetime.UTC).date().isoformat()
-    devin_api.responds("GET", CONSUMPTION, json={"days": [{"date": today, "acus": 999}]})
+    today = datetime.datetime.now(datetime.UTC).date()
+    devin_api.responds("GET", CONSUMPTION, json=a_consumption_body((today, 999.0)))
 
     await handlers.create_session(context, await claim())
 
@@ -1351,12 +1359,9 @@ async def test_sync_acu_writes_every_day_the_endpoint_reports(
     devin_api.responds(
         "GET",
         CONSUMPTION,
-        json={
-            "days": [
-                {"date": "2026-08-07", "acus": 12.5},
-                {"date": "2026-08-08", "acus": 3.25},
-            ]
-        },
+        json=a_consumption_body(
+            (datetime.date(2026, 8, 7), 12.5), (datetime.date(2026, 8, 8), 3.25)
+        ),
     )
 
     await handlers.sync_acu(context, await claim())
@@ -1381,8 +1386,8 @@ async def test_sync_acu_updates_a_day_it_has_already_written(
     await enqueue(JobKind.SYNC_ACU, {}, None)
     devin_api.route("GET", CONSUMPTION).mock(
         side_effect=[
-            httpx.Response(200, json={"days": [{"date": "2026-08-08", "acus": 3.25}]}),
-            httpx.Response(200, json={"days": [{"date": "2026-08-08", "acus": 9.0}]}),
+            httpx.Response(200, json=a_consumption_body((datetime.date(2026, 8, 8), 3.25))),
+            httpx.Response(200, json=a_consumption_body((datetime.date(2026, 8, 8), 9.0))),
         ]
     )
 

@@ -182,6 +182,9 @@ SCHEDULES_URL = SCHEDULES.format(org_id=ORG)
 PLAYBOOKS_URL = PLAYBOOKS.format(org_id=ORG)
 CONSUMPTION_URL = CONSUMPTION_DAILY.format(org_id=ORG)
 
+METRICS_WINDOW = {"time_after": 1_754_006_400, "time_before": 1_756_598_400}
+"""The window every `session_metrics` call here states, because the reference requires one."""
+
 ISSUE: dict[str, Any] = {
     "issue_number": 42,
     "issue_title": "Stored XSS in the dashboard filter box",
@@ -570,17 +573,20 @@ async def test_a_body_that_is_not_json_is_a_protocol_error(
 
 
 async def test_list_sessions_filters_by_tag(client: DevinClient, devin_api: FakeAPI) -> None:
-    devin_api.responds("GET", SESSIONS_URL, 200, {"sessions": [a_session(), a_session()]})
+    """The page size is `first` — default 100, maximum 200 — and not the `limit` this used to
+    send, which `SessionsQueryParams` does not define."""
+    devin_api.responds("GET", SESSIONS_URL, 200, {"items": [a_session(), a_session()]})
 
     sessions = await client.list_sessions(tags=[pb.NAMESPACE_TAG], limit=50)
 
     assert len(sessions) == 2
     sent = devin_api.only("GET", SESSIONS_URL)
-    assert dict(sent.url.params) == {"tags": pb.NAMESPACE_TAG, "limit": "50"}
+    assert dict(sent.url.params) == {"tags": pb.NAMESPACE_TAG, "first": "50"}
 
 
 async def test_list_sessions_accepts_a_bare_list(client: DevinClient, devin_api: FakeAPI) -> None:
-    """The spec names the endpoint but not its envelope (B8), so both shapes parse."""
+    """The reference wraps the page in `items`; a bare list stays acceptable so that a fixture can
+    state only the sessions it is about."""
     devin_api.responds("GET", SESSIONS_URL, 200, [a_session()])
 
     assert len(await client.list_sessions()) == 1
@@ -713,7 +719,6 @@ async def test_register_tags_puts_the_whole_vocabulary(
     "body",
     [
         {"tags": ["sentinel", "team:platform"]},
-        {"allowed_tags": ["sentinel", "team:platform"]},
         ["sentinel", "team:platform"],
     ],
 )
@@ -773,17 +778,22 @@ async def test_a_rejected_token_on_the_vocabulary_read_still_raises(
 async def test_create_knowledge_note_returns_the_id_config_needs(
     client: DevinClient, devin_api: FakeAPI
 ) -> None:
-    devin_api.responds("POST", KNOWLEDGE_URL, 201, {"id": "note-tests", "name": "Running tests"})
+    """`KnowledgeNoteResponse` names the id `note_id`, and `KnowledgeNoteCreateRequest` requires
+    `trigger` — not the `trigger_description` this used to send, which the reference does not
+    define at all."""
+    devin_api.responds(
+        "POST", KNOWLEDGE_URL, 201, {"note_id": "note-tests", "name": "Running tests"}
+    )
 
     note = await client.create_knowledge_note(
-        name="Running tests", body="pytest -m 'not slow'", trigger_description="running the suite"
+        name="Running tests", body="pytest -m 'not slow'", trigger="running the suite"
     )
 
     assert note.id == "note-tests"
     assert devin_api.only("POST", KNOWLEDGE_URL).json == {
         "name": "Running tests",
         "body": "pytest -m 'not slow'",
-        "trigger_description": "running the suite",
+        "trigger": "running the suite",
     }
 
 
@@ -796,7 +806,7 @@ async def test_create_schedule_sends_the_nightly_sweep_as_specified(
     so the session tag rule rejects it while Devin — which registered the bare `class:` prefix —
     accepts it. A test that passed only the namespace tag left the bootstrap call unbuildable.
     """
-    devin_api.responds("POST", SCHEDULES_URL, 201, {"schedule_id": "sched-1"})
+    devin_api.responds("POST", SCHEDULES_URL, 201, {"scheduled_session_id": "sched-1"})
     prompt = "Run pip-audit and npm audit on the target repo."
 
     schedule = await client.create_schedule(
@@ -859,13 +869,18 @@ async def test_a_listing_filter_outside_the_vocabulary_never_reaches_devin(
 async def test_a_listing_can_filter_on_the_sweep_tag(
     client: DevinClient, devin_api: FakeAPI
 ) -> None:
-    """Searching for the sweep's own sessions is legitimate, so the filter takes the wider rule."""
-    devin_api.responds("GET", SESSIONS_URL, 200, {"sessions": []})
+    """Searching for the sweep's own sessions is legitimate, so the filter takes the wider rule.
+
+    `SessionsQueryParams.tags` is an array, so the tags go out as a repeated parameter. Joined with
+    a comma — which is what this sent — they are one tag with a comma in its name, and match
+    nothing.
+    """
+    devin_api.responds("GET", SESSIONS_URL, 200, {"items": []})
 
     await client.list_sessions(tags=[pb.NAMESPACE_TAG, "class:scheduled-sweep"])
 
     sent = devin_api.only("GET", SESSIONS_URL)
-    assert dict(sent.url.params) == {"tags": "sentinel,class:scheduled-sweep"}
+    assert sent.url.params.get_list("tags") == ["sentinel", "class:scheduled-sweep"]
 
 
 # --- Retries --------------------------------------------------------------------------------------
@@ -1085,16 +1100,36 @@ async def test_consumption_degrades_rather_than_failing_the_caller(
     assert result.fallback == "Sum `acus_consumed` across sessions"
 
 
+def billing_day(day: dt.date) -> int:
+    """The epoch `ConsumptionByDateResponse.date` carries for `day`.
+
+    The reference types the field `integer` and says what the number means: "Billing cycles use
+    midnight PST (Pacific Standard Time) as the day boundary, which corresponds to 08:00:00 UTC".
+    An 08:00 instant is what a real response sends, and it is also the case an ISO-string fixture
+    could never have caught — `dt.date` refuses a timestamp with a time on it.
+    """
+    return int(dt.datetime.combine(day, dt.time(8), dt.UTC).timestamp())
+
+
 async def test_consumption_parses_the_daily_spend(client: DevinClient, devin_api: FakeAPI) -> None:
     devin_api.responds(
         "GET",
         CONSUMPTION_URL,
         200,
         {
-            "consumption": [
-                {"date": "2026-08-06", "acus": 12.5},
-                {"date": "2026-08-07", "acus": 30.0},
-            ]
+            "total_acus": 42.5,
+            "consumption_by_date": [
+                {
+                    "date": billing_day(dt.date(2026, 8, 6)),
+                    "acus": 12.5,
+                    "acus_by_product": {"devin": 12.5, "cascade": 0.0, "terminal": 0.0},
+                },
+                {
+                    "date": billing_day(dt.date(2026, 8, 7)),
+                    "acus": 30.0,
+                    "acus_by_product": {"devin": 28.0, "cascade": 2.0, "terminal": 0.0},
+                },
+            ],
         },
     )
 
@@ -1110,7 +1145,7 @@ async def test_enterprise_metrics_are_not_attempted_without_enterprise_scope(
     client: DevinClient, devin_api: FakeAPI
 ) -> None:
     """No `DEVIN_ENTERPRISE_ID` means a `403` on every dashboard refresh, for a known answer."""
-    result = await client.session_metrics()
+    result = await client.session_metrics(**METRICS_WINDOW)
 
     assert isinstance(result, Unavailable)
     assert result.reason is Unavailability.NOT_CONFIGURED
@@ -1133,18 +1168,46 @@ async def enterprise_client(devin_api: FakeAPI, metrics: Metrics) -> AsyncIterat
 async def test_enterprise_metrics_parse_the_two_aggregates(
     enterprise_client: DevinClient, devin_api: FakeAPI
 ) -> None:
+    """`SessionMetricsResponse` calls the session total `sessions_created_count`; the
+    `sessions_count` this fixture used to send exists nowhere in v3."""
     devin_api.responds(
         "GET",
         ENTERPRISE_SESSION_METRICS,
         200,
-        {"sessions_with_merged_prs_count": 6, "avg_acus_per_session": 8.25, "sessions_count": 9},
+        {
+            "sessions_created_count": 9,
+            "sessions_created_by_size": {"xs": 1, "s": 2, "m": 3, "l": 2, "xl": 1},
+            "sessions_created_by_origin": {"api": 9},
+            "sessions_created_with_playbook_count": 9,
+            "sessions_created_with_search_count": 0,
+            "sessions_with_merged_prs_count": 6,
+            "sessions_with_merged_prs_by_size": {"xs": 1, "s": 2, "m": 3},
+            "avg_acus_per_session": 8.25,
+        },
     )
 
-    result = await enterprise_client.session_metrics()
+    result = await enterprise_client.session_metrics(**METRICS_WINDOW)
 
     assert result.available
     assert result.value.sessions_with_merged_prs_count == 6
     assert result.value.avg_acus_per_session == 8.25
+    assert result.value.sessions_created_count == 9
+
+
+async def test_the_metrics_window_is_sent_because_the_reference_requires_it(
+    enterprise_client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """`time_before` and `time_after` are the only query parameters in this audit the reference
+    marks `required: true`. Omitting them is a `422`, which `DEGRADES` does not turn into a
+    fallback, so the panel would have raised rather than degraded."""
+    devin_api.responds("GET", ENTERPRISE_SESSION_METRICS, 403, text="missing ViewAccountMetrics")
+
+    await enterprise_client.session_metrics(**METRICS_WINDOW)
+
+    assert dict(devin_api.only("GET", ENTERPRISE_SESSION_METRICS).url.params) == {
+        "time_after": str(METRICS_WINDOW["time_after"]),
+        "time_before": str(METRICS_WINDOW["time_before"]),
+    }
 
 
 async def test_a_missing_permission_degrades_the_metrics_panel(
@@ -1153,7 +1216,7 @@ async def test_a_missing_permission_degrades_the_metrics_panel(
     """B5: the service user may lack `ViewAccountMetrics`. The dashboard derives the figures."""
     devin_api.responds("GET", ENTERPRISE_SESSION_METRICS, 403, text="missing ViewAccountMetrics")
 
-    result = await enterprise_client.session_metrics()
+    result = await enterprise_client.session_metrics(**METRICS_WINDOW)
 
     assert isinstance(result, Unavailable)
     assert result.capability is Capability.SESSION_METRICS
@@ -1167,7 +1230,7 @@ async def test_a_rejected_token_is_a_fault_not_a_degradation(
     devin_api.responds("GET", ENTERPRISE_SESSION_METRICS, 401, text="invalid token")
 
     with pytest.raises(DevinAPIError):
-        await enterprise_client.session_metrics()
+        await enterprise_client.session_metrics(**METRICS_WINDOW)
 
 
 @pytest.mark.parametrize(
@@ -1193,7 +1256,7 @@ async def test_a_body_we_cannot_read_degrades_rather_than_raising(
     result = await (
         enterprise_client.daily_consumption()
         if capability is Capability.ACU_SPEND
-        else enterprise_client.session_metrics()
+        else enterprise_client.session_metrics(**METRICS_WINDOW)
     )
 
     assert isinstance(result, Unavailable)
@@ -1258,12 +1321,11 @@ async def test_listing_playbooks_carries_the_flag_that_there_are_more(
     assert result.value.has_next_page
 
 
-@pytest.mark.parametrize("envelope", ["items", "playbooks", "data", None])
-async def test_listing_playbooks_parses_whichever_envelope_arrives(
+@pytest.mark.parametrize("envelope", ["items", None])
+async def test_listing_playbooks_parses_the_paginated_envelope(
     client: DevinClient, devin_api: FakeAPI, envelope: str | None
 ) -> None:
-    """The reference says `items`; nothing has been seen for real (B8), and the sibling listings
-    here hedge the same way."""
+    """`PaginatedResponse[PlaybookResponse]` puts the playbooks in `items`."""
     books = [{"playbook_id": "pb-1", "title": "security-fix"}]
     devin_api.responds("GET", PLAYBOOKS_URL, 200, books if envelope is None else {envelope: books})
 
@@ -1316,26 +1378,32 @@ async def test_a_session_we_cannot_read_still_raises(
         await client.get_session(SESSION_ID)
 
 
-@pytest.mark.parametrize("envelope", ["days", "consumption", "daily", "data", None])
-async def test_consumption_parses_whichever_envelope_arrives(
+@pytest.mark.parametrize("envelope", ["consumption_by_date", None])
+async def test_consumption_parses_the_envelope_the_reference_names(
     client: DevinClient, devin_api: FakeAPI, envelope: str | None
 ) -> None:
-    """The envelope is unverified (B8). The hedge is only worth having if it works."""
-    day = [{"date": "2026-08-07", "acus": 30.0}]
+    """`ConsumptionResponse` wraps the days in `consumption_by_date`. The four envelopes this used
+    to accept — `days`, `consumption`, `daily`, `data` — were guesses, and none of them was the
+    right one, so the budget guard would have used its fallback for ever."""
+    day = [{"date": billing_day(dt.date(2026, 8, 7)), "acus": 30.0}]
     devin_api.responds("GET", CONSUMPTION_URL, 200, day if envelope is None else {envelope: day})
 
     result = await client.daily_consumption()
 
     assert result.available
     assert result.value.total_acus == 30.0
+    assert result.value.acus_on(dt.date(2026, 8, 7)) == 30.0
 
 
-@pytest.mark.parametrize("alias", ["acus", "acus_consumed", "acu"])
-async def test_a_days_spend_parses_under_any_of_its_spellings(
-    client: DevinClient, devin_api: FakeAPI, alias: str
+@pytest.mark.parametrize("unit", [1, 1000], ids=["seconds", "milliseconds"])
+async def test_a_billing_day_is_read_from_its_epoch_in_either_unit(
+    client: DevinClient, devin_api: FakeAPI, unit: int
 ) -> None:
+    """The reference types `date` `integer` without saying which unit, and both readings fail
+    silently — a value read in the wrong one lands in 1970 and `acus_on(today)` returns 0.0."""
+    day = billing_day(dt.date(2026, 8, 7)) * unit
     devin_api.responds(
-        "GET", CONSUMPTION_URL, 200, {"consumption": [{"date": "2026-08-07", alias: 12.5}]}
+        "GET", CONSUMPTION_URL, 200, {"consumption_by_date": [{"date": day, "acus": 12.5}]}
     )
 
     result = await client.daily_consumption()
@@ -1344,32 +1412,31 @@ async def test_a_days_spend_parses_under_any_of_its_spellings(
     assert result.value.acus_on(dt.date(2026, 8, 7)) == 12.5
 
 
-@pytest.mark.parametrize("envelope", ["sessions", "data", "items", None])
-async def test_a_listing_parses_whichever_envelope_arrives(
+@pytest.mark.parametrize("envelope", ["items", None])
+async def test_a_listing_parses_the_paginated_envelope(
     client: DevinClient, devin_api: FakeAPI, envelope: str | None
 ) -> None:
+    """`PaginatedResponse[SessionResponse]` puts the sessions in `items`."""
     page = [a_session()]
     devin_api.responds("GET", SESSIONS_URL, 200, page if envelope is None else {envelope: page})
 
     assert len(await client.list_sessions()) == 1
 
 
-@pytest.mark.parametrize("alias", ["id", "note_id", "knowledge_id"])
-async def test_a_knowledge_note_id_parses_under_any_of_its_spellings(
-    client: DevinClient, devin_api: FakeAPI, alias: str
+async def test_a_knowledge_note_id_is_read_from_note_id(
+    client: DevinClient, devin_api: FakeAPI
 ) -> None:
-    devin_api.responds("POST", KNOWLEDGE_URL, 201, {alias: "note-tests"})
+    devin_api.responds("POST", KNOWLEDGE_URL, 201, {"note_id": "note-tests"})
 
-    note = await client.create_knowledge_note(name="Running tests", body="pytest")
+    note = await client.create_knowledge_note(name="Running tests", body="pytest", trigger="tests")
 
     assert note.id == "note-tests"
 
 
-@pytest.mark.parametrize("alias", ["id", "schedule_id"])
-async def test_a_schedule_id_parses_under_either_spelling(
-    client: DevinClient, devin_api: FakeAPI, alias: str
+async def test_a_schedule_id_is_read_from_scheduled_session_id(
+    client: DevinClient, devin_api: FakeAPI
 ) -> None:
-    devin_api.responds("POST", SCHEDULES_URL, 201, {alias: "sched-1"})
+    devin_api.responds("POST", SCHEDULES_URL, 201, {"scheduled_session_id": "sched-1"})
 
     schedule = await client.create_schedule(
         name="sweep", prompt="…", frequency="0 3 * * *", tags=[pb.NAMESPACE_TAG]
@@ -1378,23 +1445,33 @@ async def test_a_schedule_id_parses_under_either_spelling(
     assert schedule.id == "sched-1"
 
 
-async def test_the_metrics_aggregates_parse_under_their_alternative_names(
-    enterprise_client: DevinClient, devin_api: FakeAPI
+@pytest.mark.parametrize(
+    ("url", "body"),
+    [
+        (KNOWLEDGE_URL, {"id": "note-tests"}),
+        (KNOWLEDGE_URL, {"knowledge_id": "note-tests"}),
+        (SCHEDULES_URL, {"id": "sched-1"}),
+        (SCHEDULES_URL, {"schedule_id": "sched-1"}),
+    ],
+    ids=["note.id", "note.knowledge_id", "schedule.id", "schedule.schedule_id"],
+)
+async def test_a_bootstrap_id_under_a_name_v3_does_not_use_is_a_fault(
+    client: DevinClient, devin_api: FakeAPI, url: str, body: dict[str, str]
 ) -> None:
-    """The one model whose field names were invented rather than quoted (B8)."""
-    devin_api.responds(
-        "GET",
-        ENTERPRISE_SESSION_METRICS,
-        200,
-        {"merged_pr_count": 6, "average_acus_per_session": 8.25, "total_sessions": 9},
-    )
+    """These four spellings were what the models accepted before this audit, and all four were
+    invented. Accepting them again would let a fixture drift back to a shape the API never sends
+    and take the suite green with it — which is how the bootstrap shipped unable to record either
+    id it creates.
+    """
+    devin_api.responds("POST", url, 201, body)
 
-    result = await enterprise_client.session_metrics()
-
-    assert result.available
-    assert result.value.sessions_with_merged_prs_count == 6
-    assert result.value.avg_acus_per_session == 8.25
-    assert result.value.sessions_count == 9
+    with pytest.raises(DevinResponseError):
+        if url == KNOWLEDGE_URL:
+            await client.create_knowledge_note(name="n", body="b", trigger="t")
+        else:
+            await client.create_schedule(
+                name="sweep", prompt="…", frequency="0 3 * * *", tags=[pb.NAMESPACE_TAG]
+            )
 
 
 async def test_an_unavailable_capability_is_logged_with_its_fallback(

@@ -105,6 +105,37 @@ def a_job(**overrides: Any) -> Job:
     )
 
 
+def billing_day(day: datetime.date) -> int:
+    """The epoch `ConsumptionByDateResponse.date` carries for `day`.
+
+    The v3 reference types the field `integer` and says what the number means: "Billing cycles use
+    midnight PST (Pacific Standard Time) as the day boundary, which corresponds to 08:00:00 UTC".
+    An 08:00 instant is what a real response sends, and it is the case an ISO-string fixture could
+    never have reached — `dt.date` refuses a timestamp that has a time on it.
+    """
+    return int(datetime.datetime.combine(day, datetime.time(8), datetime.UTC).timestamp())
+
+
+def a_consumption_body(*days: tuple[datetime.date, float]) -> dict[str, Any]:
+    """The body of `GET /v3/organizations/{org_id}/consumption/daily` — `ConsumptionResponse`.
+
+    Built here rather than in each test because the envelope is the field this audit found wrong:
+    the days arrive under `consumption_by_date`, and the four names the client used to look under
+    were guesses that a fixture repeating the same guess kept green.
+    """
+    return {
+        "total_acus": sum(acus for _, acus in days),
+        "consumption_by_date": [
+            {
+                "date": billing_day(day),
+                "acus": acus,
+                "acus_by_product": {"devin": acus, "cascade": 0.0, "terminal": 0.0},
+            }
+            for day, acus in days
+        ],
+    }
+
+
 def an_acu_ledger_entry(**overrides: Any) -> AcuLedger:
     """One day of ACU consumption, as the sync job writes it."""
     return AcuLedger(

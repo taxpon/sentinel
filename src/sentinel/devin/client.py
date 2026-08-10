@@ -429,16 +429,21 @@ class DevinClient:
         organisation's own. Filters are checked against the registered vocabulary rather than the
         session rule: `class:scheduled-sweep` is a legitimate thing to search for.
 
-        There is no pagination here. The spec documents neither a cursor nor a page size, but the
-        body observed on 2026-08-10 carries `end_cursor`, `has_next_page` and `total` beside the
-        items — so the endpoint does paginate and this reads the first page only. A backfill over an
-        organisation with more sessions than one page silently sees a prefix of them.
+        `tags` is a **repeated** query parameter — `SessionsQueryParams.tags` is an array of
+        strings — not the comma-joined string this sent, which would have asked for one tag whose
+        name contains a comma and matched nothing. The page size is `first` (default 100, maximum
+        200), not `limit`, which the reference does not define.
+
+        There is no pagination here. `after` is the documented cursor and the body observed on
+        2026-08-10 carries `end_cursor`, `has_next_page` and `total` beside the items — so the
+        endpoint does paginate and this reads the first page only. A backfill over an organisation
+        with more sessions than one page silently sees a prefix of them, which is worth closing.
         """
         params: dict[str, Any] = {}
         if tags:
-            params["tags"] = ",".join(registered_tag(tag) for tag in tags)
+            params["tags"] = [registered_tag(tag) for tag in tags]
         if limit is not None:
-            params["limit"] = limit
+            params["first"] = limit
         payload = await self._request("GET", SESSIONS, params=params, path=self._org())
         return self._parse(SessionPage, payload, "GET", SESSIONS).sessions
 
@@ -501,15 +506,21 @@ class DevinClient:
             Capability.TAG_DISCOVERY, "GET", ALLOWED_TAGS, TagVocabulary, path=self._org()
         )
 
-    async def create_knowledge_note(
-        self, *, name: str, body: str, trigger_description: str | None = None
-    ) -> KnowledgeNote:
+    async def create_knowledge_note(self, *, name: str, body: str, trigger: str) -> KnowledgeNote:
         """Seed one repository convention, so every session starts with it instead of rediscovering
-        it. The returned id becomes an entry of `DEVIN_KNOWLEDGE_IDS`."""
-        note: dict[str, Any] = {"name": name, "body": body}
-        if trigger_description is not None:
-            note["trigger_description"] = trigger_description
-        payload = await self._request("POST", KNOWLEDGE_NOTES, json=note, path=self._org())
+        it. The returned id becomes an entry of `DEVIN_KNOWLEDGE_IDS`.
+
+        `KnowledgeNoteCreateRequest` requires all three: `name`, `body` and **`trigger`** — when
+        Devin should reach for the note. It was sent as an optional `trigger_description`, which
+        the reference does not define, so every note would have been rejected `422` for the field
+        that was missing rather than the one that was extra.
+        """
+        payload = await self._request(
+            "POST",
+            KNOWLEDGE_NOTES,
+            json={"name": name, "body": body, "trigger": trigger},
+            path=self._org(),
+        )
         return self._parse(KnowledgeNote, payload, "POST", KNOWLEDGE_NOTES)
 
     async def create_schedule(
@@ -568,18 +579,31 @@ class DevinClient:
         Degrades to `Unavailable` when the organisation does not expose consumption; the caller
         sums `acus_consumed` across sessions instead.
 
-        *Unverified* (B8): no window parameters are sent, because the spec does not document any —
-        so what comes back is whatever window Devin considers current, and `acus_on(today)` is only
-        the day's spend if that window includes today. This is the one ambiguity here that fails
-        *silently* — a different default window feeds the budget guard a wrong number rather than
-        raising — so confirm it against a real response before the guard is trusted to stop work.
+        The endpoint takes optional `time_before` and `time_after` epochs and neither is sent, so
+        what comes back is whatever window Devin considers current. What the reference does **not**
+        say is what that default window is, and `acus_on(today)` is only the day's spend if it
+        includes today — so this remains the one ambiguity here that fails *silently*, and it is
+        worth confirming against a real response before the guard is trusted to stop work.
+
+        The day boundary is Devin's, not ours: "Billing cycles use midnight PST (Pacific Standard
+        Time) as the day boundary". A guard comparing a UTC `today` against a Pacific billing day
+        is reading the right number for a day that is up to eight hours out of step with its own.
         """
         return await self._degradable(
             Capability.ACU_SPEND, "GET", CONSUMPTION_DAILY, Consumption, path=self._org()
         )
 
-    async def session_metrics(self) -> Degradable[SessionMetrics]:
+    async def session_metrics(
+        self, *, time_after: int, time_before: int
+    ) -> Degradable[SessionMetrics]:
         """Merged-PR and ACU aggregates from Devin's own accounting — enterprise scope, optional.
+
+        The window is the caller's, and it is not optional: `time_before` and `time_after` are the
+        only two query parameters the reference marks `required: true`, in epoch seconds. Sending
+        neither — which is what this did — is a `422`, and a `422` is not one of the refusals
+        `DEGRADES` turns into a fallback, so the capability would have raised out of every caller
+        rather than degrading. There is no window this client could pick on the caller's behalf
+        without inventing the very figure the panel is meant to report, so the caller states one.
 
         Not attempted at all without `DEVIN_ENTERPRISE_ID`: the deployment has said it does not
         claim enterprise scope, and a request that is certain to be refused is not worth a round
@@ -588,7 +612,11 @@ class DevinClient:
         if self._settings.devin_enterprise_id is None:
             return self._unavailable(Capability.SESSION_METRICS, Unavailability.NOT_CONFIGURED)
         return await self._degradable(
-            Capability.SESSION_METRICS, "GET", ENTERPRISE_SESSION_METRICS, SessionMetrics
+            Capability.SESSION_METRICS,
+            "GET",
+            ENTERPRISE_SESSION_METRICS,
+            SessionMetrics,
+            params={"time_after": time_after, "time_before": time_before},
         )
 
     # --- Internals -------------------------------------------------------------------------------
@@ -604,6 +632,7 @@ class DevinClient:
         endpoint: str,
         model: type[M],
         path: PathParams | None = None,
+        params: Mapping[str, Any] | None = None,
     ) -> Degradable[M]:
         """One optional capability: parsed, or the reason it could not be served.
 
@@ -615,7 +644,7 @@ class DevinClient:
         there is no fallback for one, and a report that does not parse must escalate.
         """
         try:
-            payload = await self._request(method, endpoint, path=path)
+            payload = await self._request(method, endpoint, path=path, params=params)
         except DevinAPIError as exc:
             reason = DEGRADES.get(exc.status_code)
             if reason is None:

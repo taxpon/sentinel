@@ -26,7 +26,7 @@ from sqlalchemy import Row, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from conftest import Configure, FakeAPI
-from factories import ISSUE_CLASS, REPO, a_remediation, an_acu_ledger_entry
+from factories import ISSUE_CLASS, REPO, a_consumption_body, a_remediation, an_acu_ledger_entry
 from sentinel import queue
 from sentinel.config import Settings
 from sentinel.devin.client import DevinAPIError, DevinClient
@@ -104,8 +104,13 @@ class FakeConsumption:
 
 
 def reports(acus: float, *, day: datetime.date = TODAY) -> FakeConsumption:
-    """Devin reporting `acus` spent on `day`."""
-    return FakeConsumption(Available(Consumption(days=({"date": day, "acus": acus},))))
+    """Devin reporting `acus` spent on `day`.
+
+    Validated from the body the endpoint really sends rather than constructed field by field: a
+    double built out of the model's own fields cannot tell anyone whether the model reads the
+    response, which is exactly what was wrong with the envelope this used to skip past.
+    """
+    return FakeConsumption(Available(Consumption.model_validate(a_consumption_body((day, acus)))))
 
 
 def unavailable(reason: Unavailability = Unavailability.FORBIDDEN) -> FakeConsumption:
@@ -657,7 +662,7 @@ async def test_the_guard_reads_the_real_consumption_endpoint(
         "GET",
         CONSUMPTION_PATH,
         200,
-        {"days": [{"date": TODAY.isoformat(), "acus": 92.5}]},
+        a_consumption_body((TODAY, 92.5)),
     )
     remediation = await seed_remediation(session)
     job = await claim_job(session, settings, remediation=remediation)

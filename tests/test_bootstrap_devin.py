@@ -26,6 +26,7 @@ got one.
 
 from __future__ import annotations
 
+import datetime as dt
 import importlib.util
 import json
 import re
@@ -39,6 +40,7 @@ import httpx
 import pytest
 
 from conftest import DEVIN_TOKEN, FakeAPI, make_settings
+from factories import a_consumption_body
 from sentinel.config import Settings
 from sentinel.devin import playbooks as pb
 from sentinel.devin.client import DevinClient, registered_tag
@@ -144,11 +146,11 @@ def wired(devin_api: FakeAPI) -> FakeAPI:
     The enterprise metrics endpoint is deliberately not registered: without `DEVIN_ENTERPRISE_ID`
     the client must not call it at all, and an unregistered route raises rather than answering.
     """
-    devin_api.responds("GET", SESSIONS, 200, {"sessions": []})
+    devin_api.responds("GET", SESSIONS, 200, {"items": []})
     devin_api.responds("PUT", TAGS, 200, {})
     respond_with_notes(devin_api, NOTE_IDS)
-    devin_api.responds("POST", SCHEDULES, 200, {"id": SCHEDULE})
-    devin_api.responds("GET", CONSUMPTION, 200, {"days": [{"date": "2026-08-08", "acus": 12.5}]})
+    devin_api.responds("POST", SCHEDULES, 200, {"scheduled_session_id": SCHEDULE})
+    devin_api.responds("GET", CONSUMPTION, 200, a_consumption_body((dt.date(2026, 8, 8), 12.5)))
     return devin_api
 
 
@@ -164,7 +166,7 @@ def no_recorded_ids(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 def respond_with_notes(devin_api: FakeAPI, ids: Sequence[str], *then: httpx.Response) -> None:
     """Answer successive note creations with `ids`, then with `then`."""
     devin_api.route("POST", NOTES).mock(
-        side_effect=[httpx.Response(200, json={"id": note_id}) for note_id in ids] + list(then)
+        side_effect=[httpx.Response(200, json={"note_id": note}) for note in ids] + list(then)
     )
 
 
@@ -286,7 +288,7 @@ async def test_creates_every_note_with_a_name_a_trigger_and_a_body(
     assert len({note["name"] for note in sent}) == 4
     for note in sent:
         assert note["body"].strip()
-        assert note["trigger_description"].strip()
+        assert note["trigger"].strip()
 
 
 async def test_records_the_note_ids_in_env(
@@ -439,9 +441,9 @@ def reads_only(devin_api: FakeAPI) -> FakeAPI:
     So "a dry run writes nothing" is asserted by the fake itself: a guard that let one through
     would fail here rather than be caught by a request-count assertion that someone could weaken.
     """
-    devin_api.responds("GET", SESSIONS, 200, {"sessions": []})
+    devin_api.responds("GET", SESSIONS, 200, {"items": []})
     devin_api.responds("GET", ALLOWED_TAGS, 200, {"tags": list(CURRENT_TAGS)})
-    devin_api.responds("GET", CONSUMPTION, 200, {"days": []})
+    devin_api.responds("GET", CONSUMPTION, 200, a_consumption_body())
     return devin_api
 
 
@@ -516,8 +518,8 @@ async def test_a_dry_run_says_when_the_registration_would_remove_nothing(
 ) -> None:
     """An organisation whose vocabulary is already Sentinel's: the run is a no-op, and saying so is
     what tells an operator this one is safe to type."""
-    devin_api.responds("GET", SESSIONS, 200, {"sessions": []})
-    devin_api.responds("GET", CONSUMPTION, 200, {"days": []})
+    devin_api.responds("GET", SESSIONS, 200, {"items": []})
+    devin_api.responds("GET", CONSUMPTION, 200, a_consumption_body())
     devin_api.responds("GET", ALLOWED_TAGS, 200, {"tags": list(bootstrap_devin.VOCABULARY)})
 
     report = await preview(devin, settings, env)
@@ -540,8 +542,8 @@ async def test_a_vocabulary_that_cannot_be_read_is_reported_as_removals_nobody_c
     here would be worse than no preview at all: the `PUT` still replaces the whole set, so what the
     run cannot name is exactly what it would destroy. It is a refusal, so the preview still exits
     0 and still previews the other three steps."""
-    devin_api.responds("GET", SESSIONS, 200, {"sessions": []})
-    devin_api.responds("GET", CONSUMPTION, 200, {"days": []})
+    devin_api.responds("GET", SESSIONS, 200, {"items": []})
+    devin_api.responds("GET", CONSUMPTION, 200, a_consumption_body())
     devin_api.responds("GET", ALLOWED_TAGS, status_code, {"detail": "no"})
 
     report = await preview(devin, settings, env)
@@ -564,8 +566,8 @@ async def test_a_fault_reading_the_vocabulary_does_not_exit_zero(
     """A `500` is not a refusal, and reporting it as one would record "the vocabulary is not
     readable here" when the answer is "ask again". The whole preview is still printed first."""
     out = Out()
-    devin_api.responds("GET", SESSIONS, 200, {"sessions": []})
-    devin_api.responds("GET", CONSUMPTION, 200, {"days": []})
+    devin_api.responds("GET", SESSIONS, 200, {"items": []})
+    devin_api.responds("GET", CONSUMPTION, 200, a_consumption_body())
     devin_api.responds("GET", ALLOWED_TAGS, 500, {"detail": "boom"})
 
     with pytest.raises(bootstrap_devin.BootstrapError) as failure:
@@ -731,7 +733,7 @@ async def test_counts_the_organisations_sessions_and_sentinels_own(
         SESSIONS,
         200,
         {
-            "sessions": [
+            "items": [
                 {"session_id": "s-1", "status": "exit", "tags": ["sentinel", "issue:1"]},
                 {"session_id": "s-2", "status": "running", "tags": ["sentinel"]},
                 {"session_id": "s-3", "status": "running", "tags": ["someone-else"]},
@@ -770,15 +772,15 @@ async def test_a_rejected_note_keeps_what_was_already_created_and_resumes(
 ) -> None:
     """The record is written after each creation, so the two notes that exist are still findable
     and the next run picks up at the third rather than creating four more."""
-    devin_api.responds("GET", SESSIONS, 200, {"sessions": []})
+    devin_api.responds("GET", SESSIONS, 200, {"items": []})
     devin_api.responds("PUT", TAGS, 200, {})
-    devin_api.responds("POST", SCHEDULES, 200, {"id": SCHEDULE})
-    devin_api.responds("GET", CONSUMPTION, 200, {"days": []})
+    devin_api.responds("POST", SCHEDULES, 200, {"scheduled_session_id": SCHEDULE})
+    devin_api.responds("GET", CONSUMPTION, 200, a_consumption_body())
     respond_with_notes(
         devin_api,
         NOTE_IDS[:2],
-        httpx.Response(422, json={"detail": "trigger_description too long"}),
-        *[httpx.Response(200, json={"id": note_id}) for note_id in NOTE_IDS[2:]],
+        httpx.Response(422, json={"detail": "trigger too long"}),
+        *[httpx.Response(200, json={"note_id": note}) for note in NOTE_IDS[2:]],
     )
 
     with pytest.raises(bootstrap_devin.BootstrapError) as failure:
@@ -803,7 +805,7 @@ async def test_the_failure_report_names_the_step_the_answer_and_the_remedy(
 ) -> None:
     """An operator at a terminal needs to know which step stopped and what to do; a traceback says
     neither. The token must not appear anywhere in it."""
-    devin_api.responds("GET", SESSIONS, 200, {"sessions": []})
+    devin_api.responds("GET", SESSIONS, 200, {"items": []})
     devin_api.responds("PUT", TAGS, 403, {"detail": "missing ManageOrgSessions"})
 
     with pytest.raises(bootstrap_devin.BootstrapError) as failure:
@@ -1045,7 +1047,7 @@ async def test_an_id_that_would_corrupt_env_is_refused_and_reported(
     id names nothing — `KnowledgeNote` accepts `""`, so the guard is reachable. Writing any of them
     would corrupt a file holding every credential, so the id is handed to the operator instead;
     dropping it silently would leave a note nobody can find."""
-    devin_api.responds("GET", SESSIONS, 200, {"sessions": []})
+    devin_api.responds("GET", SESSIONS, 200, {"items": []})
     devin_api.responds("PUT", TAGS, 200, {})
     respond_with_notes(devin_api, [note_id])
     before = read_bytes(env_path)
