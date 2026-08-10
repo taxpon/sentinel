@@ -73,6 +73,7 @@ SESSIONS = f"{ORGANIZATION}/sessions"
 TAGS = f"{ORGANIZATION}/tags"
 NOTES = f"{ORGANIZATION}/knowledge/notes"
 SCHEDULES = f"{ORGANIZATION}/schedules"
+PLAYBOOKS = f"{ORGANIZATION}/playbooks"
 CONSUMPTION = f"{ORGANIZATION}/consumption/daily"
 ENTERPRISE_METRICS = "/v3/enterprise/metrics/sessions"
 
@@ -1009,6 +1010,222 @@ async def test_the_report_prints_a_row_for_every_open_blocker(
         assert row.status in out.text
     assert "[4/4] schedule" in out.text
     assert report.capability("tag_vocabulary").status == bootstrap_devin.REGISTERED
+
+
+# --- The playbook listing ------------------------------------------------------------------------
+#
+# The one read-only mode of this file, and the answer to a problem the API reference does not
+# address: the four playbooks are made by hand in the Devin UI (B6), and the id the create-session
+# call takes is not something the UI puts in front of whoever made them.
+
+PLAYBOOK_ROWS = [
+    {"playbook_id": f"playbook-{index}", "title": playbook.name, "access_type": "org"}
+    for index, playbook in enumerate(pb.PLAYBOOKS, start=1)
+]
+EXPECTED_IDS = {row["title"]: row["playbook_id"] for row in PLAYBOOK_ROWS}
+
+
+def a_page(rows: list[dict[str, Any]], *, has_next_page: bool = False) -> dict[str, Any]:
+    """A page shaped as the v3 reference's `PaginatedResponse[PlaybookResponse]`."""
+    return {"items": rows, "has_next_page": has_next_page, "total": len(rows)}
+
+
+@pytest.fixture
+def listed(devin_api: FakeAPI) -> FakeAPI:
+    """Devin answering the listing with the four playbooks `docs/playbooks/` describes.
+
+    Nothing else is registered: an unregistered route raises rather than answering, so a mode that
+    started creating or registering anything would fail here rather than pass quietly.
+    """
+    devin_api.responds("GET", PLAYBOOKS, 200, a_page(PLAYBOOK_ROWS))
+    return devin_api
+
+
+async def list_playbooks(devin: DevinClient, settings: Settings, out: Out) -> Any:
+    return await bootstrap_devin.list_playbooks(devin, settings, out=out)
+
+
+async def test_the_listing_prints_every_playbook_and_the_ids_to_paste(
+    devin: DevinClient, settings: Settings, listed: FakeAPI
+) -> None:
+    """The whole point: title next to id, and one line the operator can paste into `.env`.
+
+    The pasteable line is decoded and resolved rather than only matched as text — a JSON blob that
+    is well-formed but keyed wrongly would print identically and configure nothing.
+    """
+    out = Out()
+
+    row = await list_playbooks(devin, settings, out)
+
+    assert (row.blocker, row.status) == ("B6", bootstrap_devin.REACHABLE)
+    assert "4 playbook(s) visible" in row.detail
+    for playbook in pb.PLAYBOOKS:
+        assert re.search(rf"^  {playbook.name} +{EXPECTED_IDS[playbook.name]}", out.text, re.M)
+
+    pasted = re.search(r"^  DEVIN_PLAYBOOK_IDS=(.+)$", out.text, re.M)
+    assert pasted is not None
+    configured = json.loads(pasted.group(1))
+    assert configured == EXPECTED_IDS
+    # Keyed by playbook name, which is what resolves all eight issue classes with four entries.
+    assert pb.playbook_id_for("security", configured) == EXPECTED_IDS["security-fix"]
+    assert pb.playbook_id_for("frontend-dep", configured) == EXPECTED_IDS["dep-upgrade"]
+
+
+async def test_the_listing_names_a_playbook_it_could_not_match(
+    devin: DevinClient, settings: Settings, devin_api: FakeAPI
+) -> None:
+    """A playbook that was never created, or was given a different title, must be said out loud:
+    a `DEVIN_PLAYBOOK_IDS` silently three entries long fails at the first issue of the fourth
+    class, long after this run."""
+    devin_api.responds("GET", PLAYBOOKS, 200, a_page(PLAYBOOK_ROWS[:3]))
+    out = Out()
+
+    await list_playbooks(devin, settings, out)
+
+    missing = pb.PLAYBOOKS[3].name
+    assert f"not matched: {missing} — no playbook of this organisation carries" in out.text
+    assert json.loads(re.findall(r"^  DEVIN_PLAYBOOK_IDS=(.+)$", out.text, re.M)[0]).keys() == {
+        playbook.name for playbook in pb.PLAYBOOKS[:3]
+    }
+
+
+async def test_the_listing_refuses_to_choose_between_two_playbooks_of_one_title(
+    devin: DevinClient, settings: Settings, devin_api: FakeAPI
+) -> None:
+    """Picking one of two would put an id in `.env` that nothing downstream could tell was the
+    wrong one — the class's sessions would simply run under instructions nobody chose."""
+    twin = {"playbook_id": "playbook-9", "title": pb.PLAYBOOKS[0].name, "access_type": "org"}
+    devin_api.responds("GET", PLAYBOOKS, 200, a_page([*PLAYBOOK_ROWS, twin]))
+    out = Out()
+
+    await list_playbooks(devin, settings, out)
+
+    name = pb.PLAYBOOKS[0].name
+    assert f"not matched: {name} — 2 playbooks carry that title" in out.text
+    assert "playbook-1, playbook-9" in out.text
+    assert name not in json.loads(re.findall(r"^  DEVIN_PLAYBOOK_IDS=(.+)$", out.text, re.M)[0])
+
+
+async def test_the_listing_says_when_it_has_only_the_first_page(
+    devin: DevinClient, settings: Settings, devin_api: FakeAPI
+) -> None:
+    """One page is asked for. An organisation with more playbooks than that is told so, rather than
+    being shown a list that looks complete."""
+    devin_api.responds("GET", PLAYBOOKS, 200, a_page(PLAYBOOK_ROWS, has_next_page=True))
+    out = Out()
+
+    row = await list_playbooks(devin, settings, out)
+
+    assert "the organisation has more" in row.detail
+
+
+async def test_the_listing_creates_nothing(
+    devin: DevinClient, settings: Settings, listed: FakeAPI
+) -> None:
+    """This mode exists because the write path is unavailable. It must not become one."""
+    await list_playbooks(devin, settings, Out())
+
+    assert [(request.method, request.path) for request in listed.requests] == [("GET", PLAYBOOKS)]
+
+
+@pytest.mark.parametrize(("status_code", "reason"), [(403, "forbidden"), (404, "not_found")])
+def test_a_refused_listing_reports_the_capability_and_exits_zero(
+    settings: Settings,
+    devin_api: FakeAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    status_code: int,
+    reason: str,
+) -> None:
+    """The likely outcome, and the one this option has to handle well: a service user without the
+    playbook permission gets one line saying so and where to look instead — not a traceback, and
+    not a non-zero exit, because a refusal is an answer."""
+    monkeypatch.setattr(bootstrap_devin, "load_config", lambda _model: settings)
+    devin_api.responds("GET", PLAYBOOKS, status_code, {"detail": "no"})
+
+    assert bootstrap_devin.main(["--list-playbooks"]) == 0
+
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    row = next(
+        line for line in captured.out.splitlines() if Capability.PLAYBOOK_DISCOVERY.value in line
+    )
+    assert bootstrap_devin.DEGRADED in row
+    assert f"{reason} ({status_code})" in row
+    assert Capability.PLAYBOOK_DISCOVERY.fallback in row
+    assert DEVIN_TOKEN not in captured.out + captured.err
+
+
+def test_a_fault_on_the_listing_exits_nonzero_without_a_traceback(
+    settings: Settings,
+    devin_api: FakeAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A `401` is not a missing permission, and reporting it with "read them in the web app" would
+    send an operator hunting for pages their token cannot open either. The failure names the
+    command they actually typed."""
+    monkeypatch.setattr(bootstrap_devin, "load_config", lambda _model: settings)
+    devin_api.responds("GET", PLAYBOOKS, 401, {"detail": "invalid token"})
+
+    assert bootstrap_devin.main(["--list-playbooks"]) == 1
+
+    captured = capsys.readouterr()
+    assert "make devin-playbooks failed at the playbook listing" in captured.err
+    assert "DEVIN_API_TOKEN" in captured.err
+    assert "Traceback" not in captured.err
+    assert Capability.PLAYBOOK_DISCOVERY.fallback not in captured.err
+    assert DEVIN_TOKEN not in captured.out + captured.err
+
+
+def test_the_listing_leaves_the_record_alone(
+    settings: Settings,
+    env_path: Path,
+    listed: FakeAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """It prints the ids for the operator to paste rather than writing them: a rewrite of a file
+    full of credentials, made from a list matched by title, would be a write made on a guess."""
+    monkeypatch.setattr(bootstrap_devin, "load_config", lambda _model: settings)
+    before = read_bytes(env_path)
+
+    assert bootstrap_devin.main(["--list-playbooks", "--env", str(env_path)]) == 0
+
+    assert read_bytes(env_path) == before
+
+
+def test_the_listing_starts_without_the_ids_it_exists_to_find(
+    listed: FakeAPI,
+    bare_environment: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The chicken and the egg. `DEVIN_PLAYBOOK_IDS` is required of the four steps, of `api`, of
+    `worker` and of `poller` — and requiring it of the thing that finds it would make this option
+    unusable at the only moment anyone wants it. Nothing is patched: which variables the read
+    demands is the whole subject."""
+    monkeypatch.setenv("DEVIN_API_TOKEN", DEVIN_TOKEN)
+    monkeypatch.setenv("DEVIN_ORG_ID", ORG)
+
+    assert bootstrap_devin.main(["--list-playbooks"]) == 0
+
+    assert f"  {pb.PLAYBOOKS[0].name}" in capsys.readouterr().out
+
+
+def test_the_run_still_demands_the_playbook_ids(
+    bare_environment: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The relaxation belongs to `--list-playbooks` alone. Without this the option would have
+    quietly made the map optional for the bootstrap run too, which creates sessions with it."""
+    monkeypatch.setenv("DEVIN_API_TOKEN", DEVIN_TOKEN)
+    monkeypatch.setenv("DEVIN_ORG_ID", ORG)
+
+    assert bootstrap_devin.main(["--env", str(tmp_path / ".env")]) == 2
+
+    assert "DEVIN_PLAYBOOK_IDS: Field required" in capsys.readouterr().err
 
 
 # --- The entry point -----------------------------------------------------------------------------

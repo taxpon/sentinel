@@ -18,6 +18,17 @@ Four steps, in this order:
 4. **schedule** — the nightly vulnerability sweep, whose id is written into `.env` as
    `DEVIN_SCHEDULE_ID`.
 
+And one thing this file does that is not part of that run:
+
+    make devin-playbooks
+
+which lists the organisation's playbooks as title and id and prints the `DEVIN_PLAYBOOK_IDS` to
+paste into `.env`. It is **read-only** — it creates, updates and deletes nothing, and does not touch
+`.env` — because it exists precisely where the write path does not: the four playbooks are made by
+hand in the Devin UI ([B6](../docs/blockers.md)), and the id a session must be created with is not
+something the UI puts in front of whoever made them. It reads one variable fewer than the run above,
+`DEVIN_PLAYBOOK_IDS` being the map it exists to fill in.
+
 Then a **capability probe**, which is the part that earns the run. `docs/blockers.md` records B5
 (enterprise session metrics) and B6 (enterprise playbook CRUD) as unverified because no credentials
 existed to verify them with, and the whole `Degradable` design in `devin/schemas.py` exists in case
@@ -62,11 +73,15 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import TextIO
+
+from pydantic import Field
 
 from sentinel.config import (
     ConfigurationError,
     DevinSettings,
+    PlaybookIds,
     ReportingSettings,
     TargetSettings,
     load_config,
@@ -77,8 +92,8 @@ from sentinel.devin.client import (
     DevinError,
     DevinTransportError,
 )
-from sentinel.devin.playbooks import NAMESPACE_TAG, TAG_PREFIXES, IssueClass
-from sentinel.devin.schemas import Capability, Unavailability
+from sentinel.devin.playbooks import NAMESPACE_TAG, PLAYBOOKS, TAG_PREFIXES, IssueClass
+from sentinel.devin.schemas import Capability, PlaybookPage, Unavailability
 from sentinel.observability.logging import configure_logging
 
 
@@ -87,6 +102,22 @@ class Configuration(DevinSettings, ReportingSettings):
     watch, and the level its own diagnostics are logged at. Not `GITHUB_TOKEN` and not a database —
     nothing here talks to GitHub or stores anything
     (`docs/adr/2026-08-10-a-script-loads-the-configuration-group-it-reads.md`)."""
+
+
+class PlaybookLookup(Configuration):
+    """What `--list-playbooks` reads: the same variables, minus the one it exists to find.
+
+    `DEVIN_PLAYBOOK_IDS` is required of `api`, `worker` and `poller` and of the four steps above,
+    because a session cannot be created without it. It cannot be required *here*: this option is
+    what an operator runs when they do not have the ids yet, and demanding them first would make it
+    unusable at the only moment it is wanted. So `DEVIN_API_TOKEN` and `DEVIN_ORG_ID` are the whole
+    of what a lookup needs.
+    """
+
+    # A factory rather than a plain default: pydantic deep-copies a default, and a `mappingproxy`
+    # cannot be pickled. The empty map is still immutable, which is what every other holder of this
+    # field is.
+    devin_playbook_ids: PlaybookIds = Field(default_factory=lambda: MappingProxyType({}))
 
 
 # --- What is registered ---------------------------------------------------------------------------
@@ -242,16 +273,21 @@ class BootstrapError(RuntimeError):
     of those things.
     """
 
-    def __init__(self, step: str, problem: str, remedy: str) -> None:
+    def __init__(
+        self, step: str, problem: str, remedy: str, command: str = "make bootstrap-devin"
+    ) -> None:
         self.step = step
         self.problem = problem
         self.remedy = remedy
+        # Which command the operator actually typed. The two modes of this file are two Makefile
+        # targets, and a failure that names the one they did not run sends them to the wrong place.
+        self.command = command
         super().__init__(f"{step}: {problem}")
 
     def report(self) -> str:
         return "\n".join(
             [
-                f"make bootstrap-devin failed at {self.step}",
+                f"{self.command} failed at {self.step}",
                 f"  what happened:  {self.problem}",
                 f"  what to do:     {self.remedy}",
             ]
@@ -824,6 +860,127 @@ def _table(rows: Sequence[Capable]) -> list[str]:
     ]
 
 
+# --- The lookup -----------------------------------------------------------------------------------
+
+PLAYBOOK_NAMES: tuple[str, ...] = tuple(playbook.name for playbook in PLAYBOOKS)
+"""The four names `docs/playbooks/README.md` tells an operator to give the playbooks in the Devin
+UI, which are also the keys `DEVIN_PLAYBOOK_IDS` is written under: four entries resolve all eight
+issue classes (`docs/adr/2026-08-08-playbook-ids-keyed-by-class-or-name.md`)."""
+
+PLAYBOOK_IDS = "DEVIN_PLAYBOOK_IDS"
+"""Unlike `KNOWLEDGE_IDS` and `SCHEDULE_ID` above, this one is printed and never written: the
+listing matches playbooks to names by title, which is not a match worth editing a file of
+credentials on."""
+
+PASTE_HEADING = f"{PLAYBOOK_IDS} for the four playbooks of docs/playbooks/ — paste this into .env:"
+
+
+def _resolved(page: PlaybookPage) -> tuple[dict[str, str], list[str]]:
+    """The four playbooks of `docs/playbooks/` resolved to ids, and what could not be resolved.
+
+    Matched on the title, ignoring case and surrounding space, because the title is what somebody
+    typed into the Devin UI and `docs/playbooks/README.md` is what told them what to type.
+
+    A name matching *two* playbooks is left out rather than guessed at. Writing one of two ids into
+    `.env` would point a whole issue class at the wrong playbook, and neither Sentinel nor Devin
+    would report anything wrong about it — the sessions would simply be run under instructions
+    nobody chose.
+    """
+    by_title: dict[str, list[str]] = {}
+    for playbook in page.playbooks:
+        by_title.setdefault(playbook.title.strip().casefold(), []).append(playbook.playbook_id)
+    resolved: dict[str, str] = {}
+    unresolved: list[str] = []
+    for name in PLAYBOOK_NAMES:
+        found = by_title.get(name.casefold(), [])
+        if len(found) == 1:
+            resolved[name] = found[0]
+        elif not found:
+            unresolved.append(f"{name} — no playbook of this organisation carries that title")
+        else:
+            ids = ", ".join(found)
+            unresolved.append(f"{name} — {len(found)} playbooks carry that title: {ids}")
+    return resolved, unresolved
+
+
+def _listing(page: PlaybookPage) -> list[str]:
+    """Every playbook the organisation holds: its title, its id, and the scope it was created at.
+
+    `access_type` is printed because it is the one thing here that speaks to B6 — a playbook
+    reported as `enterprise` was created at a scope this organisation's own token may not be able
+    to write to, which is worth knowing before somebody tries to edit it through the API.
+    """
+    width = max(len(playbook.title) for playbook in page.playbooks)
+    return [
+        f"  {playbook.title:<{width}}  {playbook.playbook_id}"
+        + (f"  ({playbook.access_type})" if playbook.access_type else "")
+        for playbook in page.playbooks
+    ]
+
+
+async def list_playbooks(devin: DevinClient, settings: DevinSettings, *, out: TextIO) -> Capable:
+    """Print the organisation's playbooks, and the `DEVIN_PLAYBOOK_IDS` they make up.
+
+    Read-only, and the only thing in this file that is: the four steps above register and create,
+    this asks a question. Nothing is sent but a `GET`, and `.env` is not opened at all — the ids are
+    printed for the operator to paste, because a run that rewrote `.env` from a list it had just
+    matched by title would be a write made on a guess.
+
+    A **refusal** is the likely answer if this service user does not carry the playbook permission,
+    and it is reported in the one line `_refused` builds, carrying the fallback that replaces it:
+    open each playbook in the web app and read its id from the page. That exits 0, because it is an
+    answer. A **fault** is not, and raises once the row has been printed — the same distinction the
+    probe above draws, for the same reason.
+    """
+    capability = Capability.PLAYBOOK_DISCOVERY
+    page: PlaybookPage | None = None
+    try:
+        result = await devin.list_playbooks()
+    except DevinError as exc:
+        row = _fault("B6", capability, exc)
+    else:
+        if result.available:
+            page = result.value
+            more = (
+                "; this is the first page, the organisation has more" if page.has_next_page else ""
+            )
+            row = Capable(
+                "B6",
+                capability.value,
+                REACHABLE,
+                f"{len(page.playbooks)} playbook(s) visible{more}",
+            )
+        else:
+            row = _refused("B6", capability, result.reason.value, result.status_code)
+
+    lines = [
+        f"Devin playbooks — organisation {settings.devin_org_id} at {settings.devin_api_base}",
+        "",
+        *_table([row]),
+    ]
+    if page is not None:
+        resolved, unresolved = _resolved(page)
+        if page.playbooks:
+            lines += ["", *_listing(page)]
+        if unresolved:
+            lines += ["", *(f"  not matched: {problem}" for problem in unresolved)]
+        lines += [
+            "",
+            PASTE_HEADING,
+            "",
+            f"  {PLAYBOOK_IDS}={json.dumps(resolved, separators=(',', ':'))}",
+        ]
+    print("\n".join(lines), file=out)
+
+    # After the row, not instead of it — as in the probe above. A fault leaves the question
+    # unanswered, so it must not exit 0; a refusal is an answer and does.
+    if row.status == FAULT:
+        raise BootstrapError(
+            "the playbook listing", row.detail, row.remedy, command="make devin-playbooks"
+        )
+    return row
+
+
 # --- The run --------------------------------------------------------------------------------------
 
 CAPABILITY_HEADING = "\nOptional capabilities — the degradation path, before the demo not during it"
@@ -887,6 +1044,11 @@ async def _run(settings: DevinSettings, env: EnvFile, out: TextIO) -> Report:
         return await bootstrap(devin, settings, env=env, out=out)
 
 
+async def _lookup(settings: DevinSettings, out: TextIO) -> Capable:
+    async with DevinClient(settings) as devin:
+        return await list_playbooks(devin, settings, out=out)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Register the tag vocabulary, knowledge notes and nightly sweep in the Devin "
@@ -898,10 +1060,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=Path(".env"),
         help="the file the created ids are recorded in (default: .env)",
     )
+    parser.add_argument(
+        "--list-playbooks",
+        action="store_true",
+        help="instead of the run above: list the organisation's playbooks and print the "
+        f"{PLAYBOOK_IDS} to paste into .env. Creates nothing and writes to no file",
+    )
     arguments = parser.parse_args(argv)
 
+    # The lookup is what an operator runs *before* they have DEVIN_PLAYBOOK_IDS, so it must not be
+    # among the variables demanded of them.
     try:
-        settings = load_config(Configuration)
+        settings = load_config(PlaybookLookup if arguments.list_playbooks else Configuration)
     except ConfigurationError as exc:
         print(exc, file=sys.stderr)
         return 2
@@ -909,7 +1079,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     configure_logging(settings, stream=sys.stderr)
 
     try:
-        asyncio.run(_run(settings, EnvFile(arguments.env, os.environ), sys.stdout))
+        if arguments.list_playbooks:
+            asyncio.run(_lookup(settings, sys.stdout))
+        else:
+            asyncio.run(_run(settings, EnvFile(arguments.env, os.environ), sys.stdout))
     except BootstrapError as exc:
         print(exc.report(), file=sys.stderr)
         return 1

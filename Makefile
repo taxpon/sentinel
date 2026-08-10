@@ -4,7 +4,8 @@ UV ?= uv
 .DEFAULT_GOAL := help
 .PHONY: help install lint format typecheck test test-cov ci \
         db up down logs migrate shell \
-        adr-index adr-check seed-issues bootstrap bootstrap-devin bootstrap-github
+        adr-index adr-check seed-issues bootstrap bootstrap-devin bootstrap-github \
+        devin-playbooks
 
 help:  ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sort | \
@@ -69,6 +70,9 @@ bootstrap: bootstrap-github bootstrap-devin  ## One-time setup of the target rep
 
 bootstrap-devin:  ## Register tags, knowledge and the nightly schedule in the Devin org
 	$(UV) run scripts/bootstrap_devin.py
+
+devin-playbooks:  ## List the Devin playbooks and print the DEVIN_PLAYBOOK_IDS to paste into .env
+	$(UV) run scripts/bootstrap_devin.py --list-playbooks
 
 bootstrap-github:  ## Configure the fork's labels, issues and webhook
 	$(UV) run scripts/bootstrap_github.py
