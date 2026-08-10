@@ -525,10 +525,10 @@ def _stamp(
 ) -> None:
     """The timestamp columns `docs/03-data-model.md` puts on entering a state.
 
-    `ci_green_at` is the *first* successful suite, and the state machine absorbs a second success
-    from `CI_PASSED` and `IN_REVIEW` — but not from `CI_FAILED`, where a re-run that goes green is
-    a real move onto a pull request that has been green before. The guard is what keeps the column
-    the first one.
+    `ci_green_at` is the *first* green verdict, and the state machine absorbs a second one from
+    `CI_PASSED` and `IN_REVIEW` — but not from `CI_FAILED`, where a re-run that goes green is a real
+    move onto a pull request that has been green before. The guard is what keeps the column the
+    first one.
     """
     if to_state is State.CI_PASSED:
         remediation.ci_green_at = remediation.ci_green_at or now
@@ -546,18 +546,40 @@ def _stamp(
 async def _act_without_trigger(
     session: AsyncSession, remediation: Remediation, *, mapped: MappedEvent, delivery_id: str
 ) -> bool:
-    """The deliveries that move nothing: an approving review, and a comment for the session.
+    """The deliveries that move nothing *here*: an approval, a comment, a check suite ending.
 
     An approval is recorded by the delivery row alone — review latency is
     `merged_at - ci_green_at`, both of which are stamped by the transitions that produce them.
 
     A comment mentioning the bot is different: `docs/06-event-pipeline.md` says to forward it to the
     session and count it as human intervention, and `human_message_count` is the denominator the
-    autonomy rate in `docs/07-observability.md` rests on. Both halves are skipped for a terminal
-    remediation — nothing will read the message, and a comment on a merged issue is conversation
-    rather than intervention.
+    autonomy rate in `docs/07-observability.md` rests on.
+
+    A completed check suite is different again. It is not that nothing moves, but that what moves
+    cannot be decided from the payload: the conclusion belongs to one of the fork's 46 workflows
+    and says nothing about the others, and the verdict takes a call to GitHub that this path may
+    not make
+    ([ADR](../../../docs/adr/2026-08-10-ci-green-is-the-aggregate-of-the-check-runs.md)). So the
+    work is handed to `evaluate_ci`, which reads every check run on the head SHA and applies
+    whichever trigger the aggregate implies.
+
+    All three are skipped for a terminal remediation — nothing will read the message, a comment on a
+    merged issue is conversation rather than intervention, and a suite finishing after a merge has
+    nothing left to move.
     """
-    if mapped.intent is not Intent.FORWARD_COMMENT or State(remediation.state) in TERMINAL_STATES:
+    if State(remediation.state) in TERMINAL_STATES:
+        return False
+
+    if mapped.intent is Intent.EVALUATE_CI:
+        await enqueue(
+            session,
+            kind=JobKind.EVALUATE_CI,
+            payload=_job_payload(mapped, delivery_id),
+            remediation_id=remediation.id,
+        )
+        return True
+
+    if mapped.intent is not Intent.FORWARD_COMMENT:
         return False
     remediation.human_message_count += 1
     await enqueue(

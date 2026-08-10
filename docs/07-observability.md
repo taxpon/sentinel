@@ -36,6 +36,16 @@ Two deliberate choices:
 - **Blocked is not hidden.** Escalations appear as their own funnel outcome and their own panel.
   A system that hides its failures cannot be evaluated.
 
+One of the timestamps behind these figures changed meaning on 2026-08-10, so numbers recorded before
+that date are not comparable with ones recorded after it:
+
+- **`ci_green_at` now marks the first moment the whole head SHA was green** — the `devin-autofix-ci`
+  check succeeded, nothing else failing, nothing still running — rather than the first check suite
+  of any kind to conclude `success`
+  ([ADR](./adr/2026-08-10-ci-green-is-the-aggregate-of-the-check-runs.md)). It lands later than it
+  used to, so **earlier figures read flatteringly early for time to green CI, and correspondingly
+  long for review latency.**
+
 ## Analytics API
 
 `GET /api/analytics/summary?window=7d` — everything the dashboard needs in one response.

@@ -111,9 +111,14 @@ that was run.
 
 ## Why an untestable diff reports success
 
-`check_suite.completed` drives Sentinel's state machine ([04](../04-state-machine.md),
+> **Updated 2026-08-10.** A `check_suite` conclusion no longer drives the state machine on its own
+> ([04](../04-state-machine.md#what-ci-green-means)). What follows still holds, and matters more
+> than it did: the `devin-autofix-ci` job below is now *the* gate Sentinel reads, so a conclusion it
+> never reaches is a remediation that never leaves `CI_RUNNING`.
+
+`check_suite.completed` drove Sentinel's state machine ([04](../04-state-machine.md),
 [06](../06-event-pipeline.md)): `success` → `CI_PASSED`, `failure`/`timed_out` → resume the Devin
-session. `neutral`, `skipped` and `cancelled` are mapped to nothing, and there is no timeout state
+session. `neutral`, `skipped` and `cancelled` were mapped to nothing, and there is no timeout state
 — a remediation that receives one sits in `CI_RUNNING` indefinitely.
 
 A workflow whose jobs are all skipped concludes as `skipped`. So without an unconditional
@@ -146,20 +151,35 @@ Copy the file to `.github/workflows/devin-autofix-ci.yml` on `master`, then open
 pull request** against `master` (a whitespace change to a Markdown file is enough) purely to make
 the first run happen. Close it once the run appears. Do this before relying on CI for anything.
 
-### 2. Make the head SHA produce exactly one conclusion
+### 2. Disable the inherited workflows — required
 
-The 49 inherited workflows trigger on `pull_request` too, and once registered they will run on
-every remediation PR. Both possible groupings of check runs are bad for the loop:
+> **Done on `taxpon/superset`, 2026-08-10** — 1 active, 45 `disabled_manually`, the survivor being
+> `.github/workflows/devin-autofix-ci.yml`. What follows is why it is not optional, and how to
+> repeat it.
 
-- if GitHub groups all of a SHA's Actions check runs into **one** check suite, its conclusion is
-  gated by the slowest inherited workflow — the tens-of-minutes latency this workflow exists to
-  avoid;
-- if each workflow run gets its **own** check suite, Sentinel receives ~49 `check_suite.completed`
-  events per SHA and would transition to `CI_PASSED` on the first trivially-passing one, long
-  before the real tests finish — a false green.
+**This step was skipped once, and it cost a remediation.** It was written as a precaution against
+something that had not happened yet. It has now happened, so it is a prerequisite rather than a
+recommendation: do not run a remediation against a fork until it is done.
 
-The remedy is the same either way, so it does not need to be resolved first: disable everything
-except this workflow on the fork, so a head SHA yields one conclusion and it is this one.
+The 45 inherited workflows trigger on `pull_request` too, and once registered they run on every
+remediation PR. GitHub raises **one check suite per workflow** — the second of the two groupings
+this section originally anticipated:
+
+> if each workflow run gets its **own** check suite, Sentinel receives ~49 `check_suite.completed`
+> events per SHA and would transition to `CI_PASSED` on the first trivially-passing one, long
+> before the real tests finish — a false green.
+
+That is exactly what happened on [PR #9](https://github.com/taxpon/superset/pull/9): 27 check suites
+on one head SHA, `Hold Label Check` concluding `success` thirteen seconds after the pull request
+opened, and Sentinel reporting CI green off it. `Dependency Review` then concluded `failure` — it
+fails on every pull request in this fork — and spent a fix cycle. See [B2](../blockers.md#b2).
+
+Sentinel no longer reads a conclusion as the verdict
+([04](../04-state-machine.md#what-ci-green-means)), so neither error can recur. But the aggregate it
+reads instead is over *every* check run on the SHA, so while the inherited workflows are active the
+honest answer is **pending** — held there by a `Dependency Review` that never passes, and by
+Cypress, Playwright and Docker runs measured in tens of minutes. A remediation then never reaches
+review at all. The false green became a permanent stall; the remedy is unchanged.
 
 ```bash
 gh workflow list -R taxpon/superset --all --json name,path,id \
@@ -167,16 +187,20 @@ gh workflow list -R taxpon/superset --all --json name,path,id \
   | xargs -n1 gh workflow disable -R taxpon/superset
 ```
 
-`gh workflow disable` only works on registered workflows, so this runs *after* step 1. If the
-inherited workflows never register (they will not run until a PR touches their triggers), delete
-them from `.github/workflows/` on the fork's `master` instead — the same commit that adds this
-file is a good place for it.
+`gh workflow disable` only works on registered workflows, so this runs *after* step 1.
 
-Which grouping GitHub actually uses is worth recording on the activation PR:
+Verify — and expect a single-digit answer where PR #9 produced 27:
 
 ```bash
 gh api "repos/taxpon/superset/commits/<head-sha>/check-suites" --jq '.total_count'
+gh api repos/taxpon/superset/actions/workflows --paginate \
+  --jq '[.workflows[] | select(.state == "active") | .path]'
 ```
+
+`dependency-review.yml` is among the disabled 45, so it cannot run and cannot fail. Were it ever
+re-enabled, the fork's **Dependency graph** setting (Settings → Security & analysis) would have to
+be on first — otherwise it fails with *"Dependency review is not supported on this repository"* on
+every pull request, as it did on PR #9. A repository setting, not anything a diff can fix.
 
 ### 3. Verify
 

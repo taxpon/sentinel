@@ -36,6 +36,8 @@ canonical list.
 | `TARGET_REPO` | | `taxpon/superset` | |
 | `TARGET_BASE_BRANCH` | | `master` | The fork's default branch is `master`, not `main` |
 | `AUTOFIX_LABEL` | | `devin:autofix` | Trigger label |
+| `CI_REQUIRED_CHECK_NAME` | | `devin-autofix-ci` | The check run that decides CI green — the conclusion job of the fork's own workflow |
+| `CI_WORKFLOW_PATH` | | `.github/workflows/devin-autofix-ci.yml` | Which workflow's log a resume message quotes |
 | `DATABASE_URL` | ✓ | | `postgresql+asyncpg://…`. A provider's `postgres://` or `postgresql://` is accepted and the driver applied ([ADR](./adr/2026-08-10-the-asyncpg-driver-is-applied-not-demanded.md)); a URL naming a different driver is rejected at startup. A libpq query string is adapted too — `sslmode` is renamed to asyncpg's `ssl`, and a parameter asyncpg cannot take is rejected by name ([details](#2-postgres)) |
 | `MAX_CONCURRENT_SESSIONS` | | `3` | In-flight session cap |
 | `DAILY_ACU_BUDGET` | | `100` | Hard daily spend ceiling |

@@ -25,7 +25,7 @@ A working register, updated throughout implementation.
 | ID | Area | Summary | Blocks | Status |
 |---|---|---|---|---|
 | [B1](#b1) | GitHub fork | Issues now enabled; label set, webhook and issues still absent | Everything — issues are the trigger | Partly resolved |
-| [B2](#b2) | CI | Fork workflows unregistered; full Superset CI too slow for the loop | Review-fix loop, PR evidence | Open |
+| [B2](#b2) | CI | Scoped workflow on the fork, 45 inherited ones disabled; the signal is still a deliberate narrowing | Review-fix loop, PR evidence | Mitigated |
 | [B3](#b3) | GitHub fork | Default branch is `master`, not `main` | PR base correctness | Mitigated |
 | [B4](#b4) | Devin API | No outbound webhook for session status | Push-based state updates | Accepted |
 | [B5](#b5) | Devin API | Session metrics endpoint is enterprise-scoped | Cost/merge-rate panel fidelity | Open |
@@ -85,17 +85,65 @@ tens of minutes.
 minutes is too slow to be the feedback channel for the review-fix loop, which needs to be
 demonstrable in minutes.
 
-**Mitigation.** Add a lightweight `devin-autofix-ci.yml` to the fork — `pre-commit` on changed
-files, scoped `pytest`, scoped `npm test` — and open one throwaway PR to register workflows. Where
-a remediation touches an area covered by a heavier workflow, run that workflow before merging.
+**Mitigation.** Two halves, and the second is **not optional**. Both are done; see below for what
+skipping the second one cost on the way.
+
+1. Add a lightweight `devin-autofix-ci.yml` to the fork — `pre-commit` on changed files, scoped
+   `pytest`, scoped `npm test` — and open one throwaway PR to register workflows.
+2. **Disable the 45 inherited workflows**, so that a head SHA carries only checks that judge the
+   diff ([fork-ci step 2](./fork-ci/README.md#2-disable-the-inherited-workflows--required)). Where a
+   remediation touches an area covered by a heavier workflow, enable and run that one before
+   merging.
 
 **Honesty note.** This narrows the CI signal. Say so; do not present scoped CI as full-suite
 validation. Specified in [08](./08-testing.md).
 
-**Status, 2026-08-09.** The workflow is written and reviewed — [`fork-ci/devin-autofix-ci.yml`](./fork-ci/devin-autofix-ci.yml) —
-but it is **not on the fork**: `gh api repos/taxpon/superset/contents/.github/workflows` does not
-list it. Putting it there is a commit to a public repository, so it waits with the other three
-writes in [B1](#b1).
+**What happened on the way here, 2026-08-10 — step 2 was skipped, and skipping it caused a defect.**
+The workflow went onto the fork and works: on `taxpon/superset` PR #9 it resolved the scope
+correctly and ran 170 jest suites in 108 seconds, concluding `success` at 3m25s.
+
+Step 2 had not been carried out at that point. All 46 registered workflows were `state: active`, so
+that pull request carried **27 check suites**, and Sentinel — which then read a `check_suite`
+conclusion as the CI verdict — got both errors from the same assumption in one run:
+
+- `Hold Label Check` concluded `success` thirteen seconds after the pull request opened, and moved
+  the remediation `PR_OPENED -> CI_PASSED -> IN_REVIEW`. Review was requested off a label check,
+  three and a quarter minutes before the suite that judges the diff finished.
+- `Dependency Review` concluded `failure` at 1m31s — *"Dependency review is not supported on this
+  repository. Please ensure that Dependency graph is enabled"*, which fails on every pull request in
+  this fork and which no diff can address. It moved `IN_REVIEW -> CI_FAILED` and resumed the Devin
+  session five seconds later, spending fix cycle 1 on a repository setting, with a resume message
+  built from that workflow's log.
+
+**Both halves are now done.** The verdict is no longer read from a conclusion
+([04](./04-state-machine.md#what-ci-green-means)), which removes the false green and the wasted
+cycle — and step 2 was run on 2026-08-10, disabling the 45 inherited workflows:
+
+```console
+$ gh api "repos/taxpon/superset/actions/workflows?per_page=100" --paginate \
+    --jq '.workflows[].state' | sort | uniq -c
+   1 active
+  45 disabled_manually
+```
+
+The one active workflow is `.github/workflows/devin-autofix-ci.yml`, so a remediation's head SHA
+carries only checks that judge the diff.
+
+**The two halves depend on each other, and that is worth keeping in view.** The new definition
+aggregates *every* check run on the SHA. Had the inherited workflows stayed active it would have
+reported an honest *pending* rather than a false green — but a pending held open indefinitely by a
+`Dependency Review` that never passes and by Cypress, Playwright and Docker measured in tens of
+minutes, so no remediation would have reached `IN_REVIEW` at all. Shrinking the population is what
+makes the definition usable rather than merely correct, and re-enabling one inherited workflow
+would put that stall back.
+
+`dependency-review.yml` is among the 45, so it cannot run and cannot fail. Were it ever re-enabled,
+the fork's **Dependency graph** setting (Settings → Security & analysis) would have to be turned on
+first, or it would fail on every pull request exactly as it did on PR #9.
+
+**Status: `Mitigated`, not `Resolved`.** The scoped signal remains a deliberate narrowing of what CI
+proves ([08](./08-testing.md#ci-on-the-fork)); that is the constraint this blocker is about, and it
+has not gone away.
 
 ### B3 — Default branch is `master` {#b3}
 

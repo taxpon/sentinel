@@ -19,7 +19,7 @@ Two properties the spec is explicit about, both of which shape the code:
   explains why the two edges of "does this remediation exist yet" are resolved there rather than by
   the caller.
 
-Two rows of the table needed a decision, and each has a record:
+Three rows of the table needed a decision, and each has a record:
 
 - `issues.unlabeled` / `issues.closed` — "cancel if not yet terminal" — has no trigger and no state
   of its own in `docs/04-state-machine.md`. It is mapped to `Trigger.FAILED` with a cancellation
@@ -28,6 +28,11 @@ Two rows of the table needed a decision, and each has a record:
 - `pull_request.opened` — "link the PR to its remediation" — cannot be resolved here at all, so it
   is ignored and the poller does the linking
   ([ADR](../../../docs/adr/2026-08-08-the-poller-links-the-pull-request.md)).
+- `check_suite.completed` — its conclusion is *not* the CI verdict, and no part of the payload can
+  be made into one. It carries no trigger, and a worker reads the verdict from every check run on
+  the head SHA instead
+  ([ADR](../../../docs/adr/2026-08-10-ci-green-is-the-aggregate-of-the-check-runs.md)). See
+  `_check_suite`.
 
 **What the caller needs in order to find the remediation.** `remediation` is keyed
 `(repo, issue_number)`, and `pr_number` is NULL until `PR_OPENED` has been applied. So an intent
@@ -53,10 +58,6 @@ integration rather than a deployment choice. It becomes a setting the day a seco
 recognised.
 """
 
-CI_FAILURE_CONCLUSIONS: Final = frozenset({"failure", "timed_out"})
-"""The two conclusions the spec treats as a CI failure. Anything else — `cancelled`, `neutral`,
-`skipped`, `stale`, `action_required` — is ignored rather than guessed at."""
-
 
 class Intent(StrEnum):
     """What a delivery means. One member per row of the subscribed-events table."""
@@ -67,8 +68,7 @@ class Intent(StrEnum):
     PULL_REQUEST_MERGED = "pull_request_merged"
     PULL_REQUEST_ABANDONED = "pull_request_abandoned"
     CI_STARTED = "ci_started"
-    CI_PASSED = "ci_passed"
-    RESUME_FOR_CI_FAILURE = "resume_for_ci_failure"
+    EVALUATE_CI = "evaluate_ci"
     RESUME_FOR_REVIEW = "resume_for_review"
     RECORD_REVIEW_APPROVAL = "record_review_approval"
     FORWARD_COMMENT = "forward_comment"
@@ -85,7 +85,6 @@ class Reason(StrEnum):
     MALFORMED_BODY = "malformed_body"
     UNKNOWN_EVENT = "unknown_event"
     UNHANDLED_ACTION = "unhandled_action"
-    UNHANDLED_CONCLUSION = "unhandled_conclusion"
     UNHANDLED_REVIEW_STATE = "unhandled_review_state"
     OTHER_REPOSITORY = "other_repository"
     OTHER_LABEL = "other_label"
@@ -293,16 +292,31 @@ def _pull_request_review(payload: Mapping[str, Any], settings: Settings) -> Mapp
 
 
 def _check_suite(payload: Mapping[str, Any], settings: Settings) -> MappedEvent:
+    """`requested` starts CI; `completed` is a reason to go and look, not a verdict.
+
+    **The conclusion on this payload is not the CI verdict, and cannot be made into one.** It says
+    what one app concluded. GitHub raises a check suite per workflow, `taxpon/superset` carries 46
+    of them, and the first `success` to arrive is whichever is quickest — on the first live
+    remediation
+    that was a workflow checking for a `hold` label, three seconds after the pull request opened.
+    Nor can the payload be filtered down to our own suite: `check_suite` carries no workflow name,
+    and `app.slug` is `github-actions` for every Actions workflow alike.
+
+    So every `completed`, whatever it concluded, maps to `Intent.EVALUATE_CI` with no trigger, and a
+    worker reads the verdict off all of the SHA's check runs at once (`sentinel.github.checks`).
+    Reading it here would mean calling GitHub from the ingress path, which
+    [ADR](../../../docs/adr/2026-08-07-respond-202-before-external-calls.md) forbids.
+
+    `cancelled`, `neutral` and `skipped` are no longer filtered out. They were, while the conclusion
+    was the verdict. Now the question is whether the *SHA* changed state, and the completion that
+    finally answers it may well be a skipped suite — dropping those would leave a remediation
+    waiting on an evaluation that never happens.
+    """
     action = _text(payload, "action")
     if action not in {"requested", "completed"}:
         return _ignored(Reason.UNHANDLED_ACTION)
 
     suite = _object(payload, "check_suite")
-    conclusion = _text(suite, "conclusion")
-    if action == "completed" and not (
-        conclusion == "success" or conclusion in CI_FAILURE_CONCLUSIONS
-    ):
-        return _ignored(Reason.UNHANDLED_CONCLUSION)
 
     # A check suite is resolved to its remediation through the pull request, because that is the
     # link `remediation` stores; the head SHA comes along for the log line and the resume message.
@@ -322,10 +336,10 @@ def _check_suite(payload: Mapping[str, Any], settings: Settings) -> MappedEvent:
         "head_sha": _text(suite, "head_sha"),
     }
     if action == "requested":
+        # No call needed, and none of the ambiguity above: a suite being requested means the SHA
+        # has a check outstanding, whoever raised it, which is what `CI_RUNNING` says.
         return MappedEvent(Intent.CI_STARTED, Trigger.CHECK_SUITE_REQUESTED, **subject)
-    if conclusion == "success":
-        return MappedEvent(Intent.CI_PASSED, Trigger.CHECK_SUITE_SUCCEEDED, **subject)
-    return MappedEvent(Intent.RESUME_FOR_CI_FAILURE, Trigger.CHECK_SUITE_FAILED, **subject)
+    return MappedEvent(Intent.EVALUATE_CI, **subject)
 
 
 def _issue_comment(payload: Mapping[str, Any], settings: Settings) -> MappedEvent:

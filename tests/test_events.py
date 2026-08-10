@@ -163,26 +163,39 @@ SUBSCRIBED: Final = [
         intent=Intent.CI_STARTED,
         trigger=Trigger.CHECK_SUITE_REQUESTED,
     ),
+    # Every `completed` maps the same way and carries no trigger, whatever it concluded. The
+    # conclusion belongs to one of the fork's 46 workflows and is not the CI verdict; a worker reads
+    # that from the check runs on the head SHA. `cancelled` and `skipped` are here because they used
+    # to be dropped, and dropping them now would lose the completion that finally makes a SHA green.
     Row(
         id="check_suite.completed-success",
         event="check_suite",
         build=lambda: github_payload("check_suite.completed.success"),
-        intent=Intent.CI_PASSED,
-        trigger=Trigger.CHECK_SUITE_SUCCEEDED,
+        intent=Intent.EVALUATE_CI,
     ),
     Row(
         id="check_suite.completed-failure",
         event="check_suite",
         build=lambda: github_payload("check_suite.completed.failure"),
-        intent=Intent.RESUME_FOR_CI_FAILURE,
-        trigger=Trigger.CHECK_SUITE_FAILED,
+        intent=Intent.EVALUATE_CI,
     ),
     Row(
         id="check_suite.completed-timed_out",
         event="check_suite",
         build=lambda: variant("check_suite.completed.failure", check_suite__conclusion="timed_out"),
-        intent=Intent.RESUME_FOR_CI_FAILURE,
-        trigger=Trigger.CHECK_SUITE_FAILED,
+        intent=Intent.EVALUATE_CI,
+    ),
+    Row(
+        id="check_suite.completed-cancelled",
+        event="check_suite",
+        build=lambda: variant("check_suite.completed.failure", check_suite__conclusion="cancelled"),
+        intent=Intent.EVALUATE_CI,
+    ),
+    Row(
+        id="check_suite.completed-skipped",
+        event="check_suite",
+        build=lambda: variant("check_suite.completed.success", check_suite__conclusion="skipped"),
+        intent=Intent.EVALUATE_CI,
     ),
     Row(
         id="issue_comment.created-mentioning-the-bot",
@@ -421,14 +434,18 @@ def test_every_row_takes_the_repository_from_the_configuration(
 
 
 @pytest.mark.parametrize("conclusion", ["cancelled", "neutral", "skipped", "stale", None])
-def test_a_check_suite_conclusion_the_spec_does_not_list_is_ignored(
+def test_every_completed_check_suite_asks_for_an_evaluation_whatever_it_concluded(
     conclusion: str | None, settings: Settings
 ) -> None:
+    """These five used to be dropped as `unhandled_conclusion`, which was right while the
+    conclusion *was* the verdict. It is not: the verdict is the aggregate over the head SHA, and the
+    completion that finally settles it can perfectly well be a skipped suite. Dropping one would
+    leave the remediation waiting on an evaluation nothing else will ask for."""
     body = variant("check_suite.completed.success", check_suite__conclusion=conclusion)
 
     mapped = map_event("check_suite", body, settings=settings)
 
-    assert (mapped.intent, mapped.reason) == (Intent.IGNORED, Reason.UNHANDLED_CONCLUSION)
+    assert (mapped.intent, mapped.trigger) == (Intent.EVALUATE_CI, None)
 
 
 @pytest.mark.parametrize("state", ["COMMENTED", "PENDING", "DISMISSED"])
@@ -656,12 +673,32 @@ def test_no_trigger_survives_a_remediation_that_does_not_exist(
 
 def test_an_illegal_trigger_within_the_lifecycle_is_still_returned(settings: Settings) -> None:
     """Only the two edges of the existence boundary are absorbed here. A check suite for a
-    remediation that exists but is in no CI state is a bug, and `transition()` is what says so."""
+    remediation that exists but is in no CI state is a bug, and `transition()` is what says so.
+
+    `requested` rather than `completed`, because a completion no longer carries a trigger at all —
+    it asks for an evaluation, and the worker chooses the trigger from the whole head SHA.
+    """
+    mapped = map_event(
+        "check_suite",
+        variant("check_suite.completed.success", action="requested", check_suite__conclusion=None),
+        settings=settings,
+    )
+
+    assert trigger_for(mapped, State.QUEUED) is Trigger.CHECK_SUITE_REQUESTED
+
+
+def test_a_completed_check_suite_carries_no_trigger_from_any_state(settings: Settings) -> None:
+    """`trigger_for` has nothing to hand back for an evaluation, in any state — including the two
+    it absorbs for other intents. The ingress reads that as "enqueue the job and move nothing"."""
     mapped = map_event(
         "check_suite", github_payload("check_suite.completed.success"), settings=settings
     )
 
-    assert trigger_for(mapped, State.QUEUED) is Trigger.CHECK_SUITE_SUCCEEDED
+    assert [trigger_for(mapped, state) for state in (None, State.QUEUED, State.IN_REVIEW)] == [
+        None,
+        None,
+        None,
+    ]
 
 
 @pytest.mark.parametrize(
@@ -703,7 +740,7 @@ def test_a_cancellation_is_absorbed_once_a_remediation_is_terminal(
 
 def test_an_ignored_event_is_reported_as_such() -> None:
     assert MappedEvent(Intent.IGNORED, reason=Reason.PING).ignored
-    assert not MappedEvent(Intent.CI_PASSED, Trigger.CHECK_SUITE_SUCCEEDED).ignored
+    assert not MappedEvent(Intent.CI_STARTED, Trigger.CHECK_SUITE_REQUESTED).ignored
 
 
 @pytest.mark.parametrize("row", SUBSCRIBED, ids=by_id)

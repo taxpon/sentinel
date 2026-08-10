@@ -57,6 +57,8 @@ DEFAULTS: dict[str, object] = {
     "TARGET_REPO": "taxpon/superset",
     "TARGET_BASE_BRANCH": "master",
     "AUTOFIX_LABEL": "devin:autofix",
+    "CI_REQUIRED_CHECK_NAME": "devin-autofix-ci",
+    "CI_WORKFLOW_PATH": ".github/workflows/devin-autofix-ci.yml",
     "MAX_CONCURRENT_SESSIONS": 3,
     "DAILY_ACU_BUDGET": 100,
     "MAX_FIX_CYCLES": 3,

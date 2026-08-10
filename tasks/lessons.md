@@ -107,3 +107,30 @@ against the Compose database: that server declines TLS politely and the connecti
 the deployed one accepts and then resets, which is not recoverable. Both passed locally. A green
 suite was evidence about our code, not about the connection — say so in the test rather than letting
 the tick imply more.
+
+## A fixture that carries the design's assumption cannot test it
+
+Every CI fixture in this repository put **one** check suite on a head SHA. Under that shape, reading
+a `check_suite.completed` conclusion as the CI verdict is correct — so 1,800 tests were green while
+the pipeline did both of these on its first live run:
+
+- reported CI green off `Hold Label Check`, a workflow that checks for a `hold` label, thirteen
+  seconds after the pull request opened and three and a quarter minutes before the suite that judges
+  the diff had finished;
+- spent a fix cycle resuming Devin against `Dependency Review`, which fails on every pull request in
+  that fork for a repository-settings reason, with a resume message built from that workflow's log.
+
+`taxpon/superset` puts 27 suites on a SHA. The number is not the point. The point is that the
+fixture was built from the same sentence of `docs/04-state-machine.md` as the code, so the suite
+could only ever confirm that the two agreed with each other.
+
+This is the third entry here with that shape — the Devin request bodies asserted against our own
+design document, the mutation tests importing the original tree, and now this. The tell differs
+every time and the structure does not: **the test and the code share a premise, so the premise is
+the one thing the test cannot see.**
+
+**Rule:** when a fixture stands for something outside the system, take its shape from outside — one
+real `gh api` call, pasted in with the command that produced it. Then write down the premise it
+encodes ("one suite per SHA", "one failing run per commit"); if you cannot name the premise you have
+not found it yet. A fixture containing exactly one of anything deserves a second look, because
+cardinality is where this hides.

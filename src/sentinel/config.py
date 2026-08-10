@@ -241,6 +241,13 @@ class TargetSettings(ConfigurationGroup):
     target_repo: str = Field(default="taxpon/superset", min_length=1)
     target_base_branch: str = Field(default="master", min_length=1)
     autofix_label: str = Field(default="devin:autofix", min_length=1)
+    # The two names of the fork's own CI, which `sentinel.github.checks` reads the signal from and
+    # `get_failing_job` fetches a log out of. Both are facts about the workflow in
+    # `docs/fork-ci/devin-autofix-ci.yml`
+    # rather than deployment choices, and both are settings because the fork is not ours to pin: a
+    # renamed job or a moved file must be a variable to change, not a release.
+    ci_required_check_name: str = Field(default="devin-autofix-ci", min_length=1)
+    ci_workflow_path: str = Field(default=".github/workflows/devin-autofix-ci.yml", min_length=1)
 
 
 class GitHubSettings(TargetSettings):

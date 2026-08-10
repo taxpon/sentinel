@@ -1,4 +1,4 @@
-"""What a claimed job does — the four job kinds of `docs/06-event-pipeline.md#jobs-and-claiming`.
+"""What a claimed job does — the five job kinds of `docs/06-event-pipeline.md#jobs-and-claiming`.
 
 Everything else in Sentinel observes or decides. This is the module that acts: it is the only place
 that creates a Devin session, resumes one, or writes to the target repository on a remediation's
@@ -11,6 +11,12 @@ what a job *is*.
 | `resume_session` | The review-fix loop: gather the failure, `POST /v3/…/messages`, go `RUNNING` |
 | `escalate` | Apply `needs-human`, comment on the issue with the reason and the session link |
 | `sync_acu` | Refresh `acu_ledger` from the consumption endpoint |
+| `evaluate_ci` | Read every check run on the pull request's head, and apply the verdict |
+
+`evaluate_ci` is the odd one out: it changes nothing outside Sentinel. It exists because the ingress
+path may make no outbound call (`docs/adr/2026-08-07-respond-202-before-external-calls.md`) and the
+CI verdict cannot be read from a webhook payload
+(`docs/adr/2026-08-10-ci-green-is-the-aggregate-of-the-check-runs.md`).
 
 **Sentinel never merges** — there is no route for it in `sentinel.github.client` and no handler for
 it here (`docs/adr/2026-08-07-humans-approve-every-merge.md`).
@@ -103,14 +109,17 @@ from sentinel.devin.playbooks import (
     cycle_tag,
 )
 from sentinel.devin.schemas import Consumption, Session, Unavailable
+from sentinel.github.checks import CIVerdict, foreign_failures, verdict
 from sentinel.github.client import GitHubClient, ReviewComment
 from sentinel.models import AcuLedger, Remediation, RemediationEvent
 from sentinel.observability.logging import get_logger
 from sentinel.pipeline.state import (
     CYCLE_LIMIT_EXHAUSTED,
+    TERMINAL_STATES,
     State,
     Transition,
     Trigger,
+    automatic_trigger,
     is_legal,
     transition,
 )
@@ -150,9 +159,13 @@ The obligation is recorded in `docs/adr/2026-08-08-cancellation-is-recorded-as-f
 names this task."""
 
 NO_FAILING_JOB: Final = "(GitHub reported no failing job for this commit)"
-"""Stands in for the job name when nothing on the head SHA failed in Actions — a check suite whose
-conclusion came from another app, or a run whose jobs were all cancelled. Written as a parenthetical
-for the same reason `NO_LOG_OUTPUT` is: the absence of evidence is itself worth stating."""
+"""Stands in for the job name when the fork's own workflow has no failing job on the head SHA — its
+run was cancelled, or every job in it was. Written as a parenthetical for the same reason
+`NO_LOG_OUTPUT` is: the absence of evidence is itself worth stating.
+
+It no longer stands in for "some *other* workflow failed". `get_failing_job` is asked for one
+workflow by path, so a `Dependency Review` failure on the fork can never supply the excerpt for a
+diff it never looked at."""
 
 TRANSITION_EVENT: Final = "transition"
 ERROR_EVENT: Final = "error"
@@ -439,7 +452,9 @@ async def _resume_message(context: Context, job: ClaimedJob, plan: _Resume) -> s
             _text(job.payload.get("head_sha"))
             or (await context.github.get_pull_request(plan.pr_number)).head_sha
         )
-        failing = await context.github.get_failing_job(sha)
+        failing = await context.github.get_failing_job(
+            sha, workflow_path=context.settings.ci_workflow_path
+        )
         return ci_failure_message(
             sha=sha,
             job_name=NO_FAILING_JOB if failing is None else failing.name,
@@ -603,6 +618,131 @@ def _render_comment(comment: ReviewComment) -> str:
     return f"{where}\n{comment.body.strip()}"
 
 
+# --- evaluate_ci ----------------------------------------------------------------------------
+
+
+async def evaluate_ci(context: Context, job: ClaimedJob) -> None:
+    """Read what CI now says about the pull request, and apply whichever trigger that implies.
+
+    Enqueued by every `check_suite.completed` delivery, because the conclusion on that delivery is
+    not the verdict: GitHub raises a suite per workflow and the fork carries 46 of them
+    ([ADR](../../../docs/adr/2026-08-10-ci-green-is-the-aggregate-of-the-check-runs.md)). The
+    verdict is `sentinel.github.checks.verdict` over every check run on the head SHA at once, and
+    reading it needs a call to GitHub, which is why this is a job and not part of the ingress path.
+
+    **The SHA comes from the pull request, not from the job payload.** A payload SHA can be stale by
+    the time the job is claimed — Devin pushes a fix, the previous run is cancelled by
+    `concurrency`, and cancelled runs are complete-and-not-failing, which is exactly the shape that
+    reads as green. Asking the pull request for its head is one more call and always answers the
+    question `docs/08-testing.md` actually poses: is CI green *on the pull request*.
+
+    Nothing is committed for a verdict that does not move the remediation. This handler re-reads the
+    same SHA once per completed suite — 18 times over on the first live remediation — and the poller
+    faced the same arithmetic and settled it the same way
+    ([ADR](../../../docs/adr/2026-08-08-the-poller-records-only-what-moves.md)). The deliveries
+    themselves remain in `webhook_delivery`.
+    """
+    pr_number = await _plan_evaluation(context, job)
+    if pr_number is None:
+        return
+
+    gate = context.settings.ci_required_check_name
+    pull_request = await context.github.get_pull_request(pr_number)
+    runs = await context.github.get_check_runs(pull_request.head_sha)
+    outcome = verdict(runs, gate=gate)
+
+    blocked_by = foreign_failures(runs, gate=gate)
+    if blocked_by and outcome is CIVerdict.PENDING:
+        # Not a failure of the change, and deliberately not `CI_FAILED`: these checks have not
+        # judged the diff, and resuming a session over one of them is how the first live
+        # remediation spent a fix cycle on a repository setting. It does hold the pull request out
+        # of `CI_PASSED` indefinitely, which is what `docs/blockers.md#b2` requires the inherited
+        # workflows to be disabled for — so it is said out loud rather than waited out in silence.
+        log.warning(
+            "worker.ci.foreign_failure",
+            head_sha=pull_request.head_sha,
+            checks=list(blocked_by),
+            pr_number=pr_number,
+        )
+
+    await _record_evaluation(context, job, outcome, head_sha=pull_request.head_sha)
+    await _complete(context, job)
+
+
+async def _plan_evaluation(context: Context, job: ClaimedJob) -> int | None:
+    """The pull request number to evaluate, or `None` after retiring a job with nothing to do.
+
+    A remediation that reached a terminal state while the job waited in the queue has nothing left
+    to move, and `transition` would absorb every trigger anyway.
+    """
+    async with context.session_factory() as db:
+        remediation = await load_remediation(db, job)
+        if State(remediation.state) in TERMINAL_STATES:
+            await queue.complete(db, job)
+            await db.commit()
+            log.info("worker.ci.skipped", state=remediation.state, job_id=job.id)
+            return None
+        pr_number = _pull_request_number(remediation)
+        await db.commit()
+        return pr_number
+
+
+async def _record_evaluation(
+    context: Context, job: ClaimedJob, outcome: CIVerdict, *, head_sha: str
+) -> None:
+    """Apply the verdict's trigger, and the review request that entering `CI_PASSED` obliges.
+
+    The remediation is re-read under a row lock rather than carried across the two GitHub calls, so
+    a webhook that moved it in the meantime is not overwritten — and a concurrent evaluation is
+    serialised behind this one, then finds a state its own trigger absorbs from, which is how the
+    duplicate is dropped instead of applied twice.
+    """
+    async with context.session_factory() as db:
+        remediation = await load_remediation(db, job, for_update=True)
+        applied: Trigger | None = outcome.trigger
+        moved = False
+        while applied is not None:
+            result = transition(
+                State(remediation.state),
+                applied,
+                cycle=remediation.cycle,
+                pr_linked=remediation.pr_url is not None,
+                max_fix_cycles=context.settings.max_fix_cycles,
+            )
+            if not result.moved:
+                break
+            moved = True
+            remediation.state = str(result.to_state)
+            if result.to_state is State.CI_PASSED:
+                # `docs/03-data-model.md`: the *first* successful evaluation. The state machine
+                # absorbs a later success from `CI_PASSED` and `IN_REVIEW` but not from `CI_FAILED`,
+                # where a re-run going green is a real move onto a pull request that has been green
+                # before — so the guard, not the transition, is what keeps this the first one.
+                remediation.ci_green_at = remediation.ci_green_at or _now()
+            db.add(_event(remediation, result, {"verdict": outcome.value, "head_sha": head_sha}))
+            if result.to_state is State.CI_FAILED:
+                # The side effect `docs/04-state-machine.md` puts on this transition. The trigger is
+                # named on the payload because `enqueued_on_another_edge` reads it to tell a stale
+                # resume from a live one.
+                await queue.enqueue(
+                    db,
+                    kind=JobKind.RESUME_SESSION,
+                    payload={
+                        "delivery_id": _text(job.payload.get("delivery_id")),
+                        "trigger": Trigger.CHECK_SUITE_FAILED.value,
+                        "head_sha": head_sha,
+                    },
+                    remediation_id=remediation.id,
+                )
+            applied = automatic_trigger(result.to_state)
+        state = remediation.state
+        await db.commit()
+
+    log.info(
+        "worker.ci.evaluated", verdict=outcome.value, head_sha=head_sha, state=state, moved=moved
+    )
+
+
 # --- escalate -------------------------------------------------------------------------------
 
 
@@ -752,6 +892,7 @@ HANDLERS: Final[Mapping[str, Handler]] = {
     JobKind.RESUME_SESSION: resume_session,
     JobKind.ESCALATE: escalate,
     JobKind.SYNC_ACU: sync_acu,
+    JobKind.EVALUATE_CI: evaluate_ci,
 }
 """Every job kind this worker can run, keyed by the string in the column.
 
@@ -761,15 +902,24 @@ claiming it.
 """
 
 
-async def load_remediation(db: AsyncSession, job: ClaimedJob) -> Remediation:
+async def load_remediation(
+    db: AsyncSession, job: ClaimedJob, *, for_update: bool = False
+) -> Remediation:
     """The remediation a job is about, loaded in `db`.
 
     `scalar_one`, because `remediation` is never deleted and the foreign key is enforced: a miss is
     a fault to raise on rather than a branch to write.
+
+    `for_update` takes a row lock for the caller's transaction, which serialises two workers
+    deciding the same remediation's next state. Only `evaluate_ci` needs it: every completed check
+    suite enqueues one, 18 of them concluded on the first live remediation, and two claimed at once
+    would otherwise read the same state, reach different verdicts and have the later commit win —
+    leaving the column disagreeing with the `remediation_event` rows the other one wrote.
     """
     if job.remediation_id is None:
         raise MalformedJob(f"job {job.id} of kind {job.kind!r} names no remediation")
-    result = await db.execute(select(Remediation).where(Remediation.id == job.remediation_id))
+    statement = select(Remediation).where(Remediation.id == job.remediation_id)
+    result = await db.execute(statement.with_for_update() if for_update else statement)
     return result.scalar_one()
 
 

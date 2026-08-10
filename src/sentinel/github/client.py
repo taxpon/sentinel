@@ -204,10 +204,11 @@ class ReviewComment:
 class CheckRun:
     """One check run on a head SHA.
 
-    There is deliberately no `failed` property. Whether a conclusion means the remediation should
-    move to `CI_FAILED` is the state machine's question, answered from the check *suite* by
-    `sentinel.github.events`; a second, wider notion of failure on this object would be read as the
-    same thing and quietly disagree with it.
+    There is deliberately no `failed` property, though these objects are now what the CI verdict is
+    read from. Whether a *pull request* should move to `CI_FAILED` is not a property of any single
+    run — it depends on which run this is, and on what every other run on the SHA is doing — so
+    `sentinel.github.checks.verdict` answers it over the whole collection and nothing here offers a
+    per-run shortcut that would be mistaken for the same question.
     """
 
     id: int
@@ -503,20 +504,33 @@ class GitHubClient:
         runs = await self._paginate(self._url("check_runs", sha=sha), "check_runs")
         return tuple(_as_check_run(run) for run in runs)
 
-    async def get_failing_job(self, sha: str) -> FailingJob | None:
-        """The failing job of the latest failing workflow run on `sha`, with its log tail.
+    async def get_failing_job(self, sha: str, *, workflow_path: str) -> FailingJob | None:
+        """The failing job of the latest failing run of `workflow_path` on `sha`, with its log tail.
 
-        `None` when nothing failed on this SHA — a check suite whose conclusion came from an app
-        other than Actions, or a run that failed with every job cancelled. It is an answer, not an
-        error: `ci_failure_message` has `NO_LOG_OUTPUT` for exactly this.
+        `None` when that workflow did not fail on this SHA — it was cancelled, it has not run, or it
+        failed with every job cancelled. It is an answer, not an error: `ci_failure_message` has
+        `NO_LOG_OUTPUT` for exactly this.
 
-        Which job is picked is the substance of this method; see
+        **`workflow_path` is not optional, and the reason is a defect.** This used to select over
+        every workflow run on the SHA. `taxpon/superset` carries 46 of them, one of which —
+        `Dependency Review` — fails on every pull request there because the repository has no
+        dependency graph enabled. On the first live remediation that run was the newest failure, so
+        its log became the excerpt a Devin session was resumed with: a two-file frontend diff, and a
+        message asking it to fix a repository setting. A resume message must quote the check that
+        judged the diff, so this asks for that workflow by path and reports nothing rather than
+        substituting somebody else's failure
+        ([ADR](../../../docs/adr/2026-08-10-ci-green-is-the-aggregate-of-the-check-runs.md)).
+
+        `sentinel.github.checks.verdict` only reports `FAILED` when this same workflow's gate job
+        failed, so in the case that reaches here the run is present and the narrowing finds it.
+
+        Which of that run's jobs is picked is the older decision, and unchanged; see
         `docs/adr/2026-08-08-the-ci-excerpt-comes-from-the-earliest-failing-job.md`.
         """
         runs = await self._paginate(
             self._url("workflow_runs"), "workflow_runs", params={"head_sha": sha}
         )
-        failed_runs = [run for run in runs if _failed(run)]
+        failed_runs = [run for run in runs if run.get("path") == workflow_path and _failed(run)]
         if not failed_runs:
             return None
         run = max(failed_runs, key=_newest)

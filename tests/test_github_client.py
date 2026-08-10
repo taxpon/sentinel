@@ -52,6 +52,10 @@ PULLS = f"/repos/{REPO}/pulls"
 ACTIONS = f"/repos/{REPO}/actions"
 
 RUN_ID = 84410727864
+
+WORKFLOW_PATH = ".github/workflows/devin-autofix-ci.yml"
+"""The fork's own workflow. `get_failing_job` selects on this and nothing else, so every run built
+below carries it unless a test is specifically about a run that does not."""
 JOB_ID = 231855142299
 REVIEW_ID = 4882944318
 
@@ -103,7 +107,8 @@ def a_check_run(**overrides: Any) -> dict[str, Any]:
 def a_workflow_run(**overrides: Any) -> dict[str, Any]:
     return {
         "id": RUN_ID,
-        "name": "devin-autofix-ci",
+        "name": "Devin autofix CI",
+        "path": WORKFLOW_PATH,
         "head_sha": HEAD_SHA,
         "status": "completed",
         "conclusion": "failure",
@@ -457,7 +462,7 @@ async def test_get_failing_job_returns_the_log_tail_of_the_failing_job(
     log = "\n".join(f"line {n}" for n in range(1, 151))
     fake_ci(github_api, jobs=[a_job()], log=log)
 
-    job = await github.get_failing_job(HEAD_SHA)
+    job = await github.get_failing_job(HEAD_SHA, workflow_path=WORKFLOW_PATH)
 
     assert job is not None
     assert job.id == JOB_ID
@@ -476,7 +481,7 @@ async def test_the_workflow_runs_are_filtered_to_the_head_sha(
 ) -> None:
     fake_ci(github_api, jobs=[a_job()])
 
-    await github.get_failing_job(HEAD_SHA)
+    await github.get_failing_job(HEAD_SHA, workflow_path=WORKFLOW_PATH)
 
     listed = github_api.sent("GET", f"{ACTIONS}/runs")[0]
     assert listed.url.params["head_sha"] == HEAD_SHA
@@ -497,7 +502,7 @@ async def test_get_failing_job_takes_the_earliest_failing_job_not_the_aggregate(
     )
     fake_ci(github_api, jobs=[aggregate, passed, a_job()])
 
-    job = await github.get_failing_job(HEAD_SHA)
+    job = await github.get_failing_job(HEAD_SHA, workflow_path=WORKFLOW_PATH)
 
     assert job is not None
     assert job.name == "pytest"
@@ -511,7 +516,7 @@ async def test_get_failing_job_takes_the_latest_run_when_a_sha_was_re_run(
     latest = a_workflow_run()
     fake_ci(github_api, runs=[superseded, latest], jobs=[a_job()])
 
-    await github.get_failing_job(HEAD_SHA)
+    await github.get_failing_job(HEAD_SHA, workflow_path=WORKFLOW_PATH)
 
     assert github_api.only("GET", f"{ACTIONS}/runs/{RUN_ID}/jobs")
 
@@ -525,7 +530,7 @@ async def test_a_job_with_no_start_time_does_not_displace_a_real_failure(
     never_started = a_job(id=JOB_ID + 7, name="jest", conclusion="startup_failure", started_at=None)
     fake_ci(github_api, jobs=[never_started, a_job()])
 
-    job = await github.get_failing_job(HEAD_SHA)
+    job = await github.get_failing_job(HEAD_SHA, workflow_path=WORKFLOW_PATH)
 
     assert job is not None
     assert job.name == "pytest"
@@ -538,10 +543,56 @@ async def test_an_unstamped_job_is_still_chosen_when_it_is_the_only_failure(
     never_started = a_job(name="jest", conclusion="startup_failure", started_at=None)
     fake_ci(github_api, jobs=[never_started])
 
-    job = await github.get_failing_job(HEAD_SHA)
+    job = await github.get_failing_job(HEAD_SHA, workflow_path=WORKFLOW_PATH)
 
     assert job is not None
     assert job.name == "jest"
+
+
+async def test_a_failing_run_of_another_workflow_is_not_the_excerpt(
+    github: GitHubClient, github_api: FakeAPI
+) -> None:
+    """The defect this argument exists for, in the shape it actually occurred.
+
+    `taxpon/superset` carries 46 workflows and `Dependency Review` fails on every pull request there
+    because the repository has no dependency graph enabled. On the first live remediation it was the
+    newest failing run on the SHA, so its log became the excerpt a session was resumed with — a
+    two-file frontend diff, and a message asking Devin to fix a repository setting. Selecting the
+    newest failure repo-wide is what did it, and this pins the narrowing that replaced it.
+    """
+    ours = a_workflow_run(id=RUN_ID, conclusion="success")
+    theirs = a_workflow_run(
+        id=RUN_ID + 9, name="Dependency Review", path=".github/workflows/dependency-review.yml"
+    )
+    fake_ci(github_api, runs=[theirs, ours], jobs=[a_job(name="dependency-review")])
+
+    assert await github.get_failing_job(HEAD_SHA, workflow_path=WORKFLOW_PATH) is None
+
+
+async def test_the_excerpt_comes_from_our_workflow_when_both_it_and_another_failed(
+    github: GitHubClient, github_api: FakeAPI
+) -> None:
+    """Both failing is the case a preference could get wrong in the quiet direction: `Dependency
+    Review` is newer, so any rule that ranks before it filters would still pick the wrong log."""
+    theirs = a_workflow_run(
+        id=RUN_ID + 9, name="Dependency Review", path=".github/workflows/dependency-review.yml"
+    )
+    github_api.responds(
+        "GET",
+        f"{ACTIONS}/runs",
+        json={"total_count": 2, "workflow_runs": [theirs, a_workflow_run()]},
+    )
+    github_api.responds(
+        "GET",
+        f"{ACTIONS}/runs/{RUN_ID}/jobs",
+        json={"total_count": 1, "jobs": [a_job(name="jest (scoped)")]},
+    )
+    github_api.responds("GET", f"{ACTIONS}/jobs/{JOB_ID}/logs", text="boom")
+
+    job = await github.get_failing_job(HEAD_SHA, workflow_path=WORKFLOW_PATH)
+
+    assert job is not None
+    assert job.name == "jest (scoped)"
 
 
 async def test_the_newest_run_is_the_highest_id_not_the_one_that_started_first(
@@ -554,7 +605,7 @@ async def test_the_newest_run_is_the_highest_id_not_the_one_that_started_first(
     started_later = a_workflow_run(id=RUN_ID, run_started_at="2026-08-07T16:00:00Z")
     fake_ci(github_api, runs=[started_later, started_first], jobs=[a_job()])
 
-    await github.get_failing_job(HEAD_SHA)
+    await github.get_failing_job(HEAD_SHA, workflow_path=WORKFLOW_PATH)
 
     assert github_api.only("GET", f"{ACTIONS}/runs/{RUN_ID + 5}/jobs")
 
@@ -565,7 +616,7 @@ async def test_a_run_with_no_start_time_is_still_a_candidate(
     unstamped = a_workflow_run(id=RUN_ID + 5, run_started_at=None)
     fake_ci(github_api, runs=[a_workflow_run(), unstamped], jobs=[a_job()])
 
-    await github.get_failing_job(HEAD_SHA)
+    await github.get_failing_job(HEAD_SHA, workflow_path=WORKFLOW_PATH)
 
     assert github_api.only("GET", f"{ACTIONS}/runs/{RUN_ID + 5}/jobs")
 
@@ -584,7 +635,7 @@ async def test_every_failing_conclusion_selects_the_job(
         jobs=[a_job(conclusion=conclusion)],
     )
 
-    job = await github.get_failing_job(HEAD_SHA)
+    job = await github.get_failing_job(HEAD_SHA, workflow_path=WORKFLOW_PATH)
 
     assert job is not None
     assert job.name == "pytest"
@@ -599,7 +650,7 @@ async def test_no_other_conclusion_selects_the_job(
     # The spec maps these to no transition, so there is nothing to resume a session about.
     fake_ci(github_api, jobs=[a_job(conclusion=conclusion)])
 
-    assert await github.get_failing_job(HEAD_SHA) is None
+    assert await github.get_failing_job(HEAD_SHA, workflow_path=WORKFLOW_PATH) is None
 
 
 @pytest.mark.parametrize(
@@ -616,7 +667,7 @@ async def test_a_log_github_no_longer_has_leaves_the_failure_intact(
     fake_ci(github_api, jobs=[a_job()])
     github_api.responds("GET", f"{ACTIONS}/jobs/{JOB_ID}/logs", status, json=body)
 
-    job = await github.get_failing_job(HEAD_SHA)
+    job = await github.get_failing_job(HEAD_SHA, workflow_path=WORKFLOW_PATH)
 
     assert job is not None
     assert job.name == "pytest"
@@ -642,7 +693,7 @@ async def test_get_failing_job_is_none_when_nothing_failed(
     # An answer rather than an error: `ci_failure_message` has `NO_LOG_OUTPUT` for this.
     fake_ci(github_api, runs=runs, jobs=jobs)
 
-    assert await github.get_failing_job(HEAD_SHA) is None
+    assert await github.get_failing_job(HEAD_SHA, workflow_path=WORKFLOW_PATH) is None
     assert github_api.sent("GET", f"{ACTIONS}/jobs/{JOB_ID}/logs") == []
 
 
@@ -658,7 +709,7 @@ async def test_the_log_redirect_off_github_does_not_carry_the_token(
         return_value=httpx.Response(200, text="AssertionError: boom")
     )
 
-    job = await github.get_failing_job(HEAD_SHA)
+    job = await github.get_failing_job(HEAD_SHA, workflow_path=WORKFLOW_PATH)
 
     assert job is not None
     assert job.log_excerpt == "AssertionError: boom"
@@ -1048,7 +1099,7 @@ async def test_no_method_reaches_the_merge_endpoint(
     await github.get_review_comments(PR_NUMBER, REVIEW_ID)
     await github.request_review(PR_NUMBER, reviewers=["taxpon"])
     await github.get_check_runs(HEAD_SHA)
-    await github.get_failing_job(HEAD_SHA)
+    await github.get_failing_job(HEAD_SHA, workflow_path=WORKFLOW_PATH)
     driven = {
         "get_issue",
         "comment_on_issue",
@@ -1077,7 +1128,7 @@ async def test_the_token_is_a_header_and_never_a_url_parameter(
 
     await github.get_issue(ISSUE_NUMBER)
     await github.get_check_runs(HEAD_SHA)
-    await github.get_failing_job(HEAD_SHA)
+    await github.get_failing_job(HEAD_SHA, workflow_path=WORKFLOW_PATH)
 
     for sent in github_api.requests:
         assert sent.headers["authorization"] == f"Bearer {GITHUB_TOKEN}"
