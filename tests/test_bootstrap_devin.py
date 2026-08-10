@@ -1309,7 +1309,7 @@ async def test_a_fault_on_the_probe_claims_no_fallback_and_does_not_exit_zero(
     # The remedy is the one diagnosed from what came back, not a sentence about faults in general.
     assert advice in failure.value.remedy
 
-    # Raised *after* the whole table, not instead of it: the four steps did succeed, and the rows
+    # Raised *after* the whole table, not instead of it: the three steps did succeed, and the rows
     # that were answered are the answer the run was for. Only the exit status changes.
     assert bootstrap_devin.CAPABILITY_HEADING.strip() in out.text
     for name in ("session_metrics", "acu_spend", "playbook_creation", "tag_vocabulary"):
@@ -1571,7 +1571,7 @@ def test_the_listing_starts_without_the_ids_it_exists_to_find(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The chicken and the egg. `DEVIN_PLAYBOOK_IDS` is required of the four steps, of `api`, of
+    """The chicken and the egg. `DEVIN_PLAYBOOK_IDS` is required of the three steps, of `api`, of
     `worker` and of `poller` — and requiring it of the thing that finds it would make this option
     unusable at the only moment anyone wants it. Nothing is patched: which variables the read
     demands is the whole subject."""

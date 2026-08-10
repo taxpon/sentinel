@@ -189,8 +189,8 @@ about the write, not a measurement of it.
 **Mitigation, and what it is now worth.** The vocabulary is registered at bootstrap before any
 session is created — *when the organisation allows it*. Since 2026-08-10 a `403` or `404` on that
 `PUT` is a reported degradation rather than a failed run: step 2 says in one line that the
-vocabulary was **not** registered and that this is unresolved, and steps 3 and 4 go on to create the
-knowledge notes and the nightly sweep. Nothing else depends on the registration having succeeded —
+vocabulary was **not** registered and that this is unresolved, and step 3 goes on to create the
+knowledge notes. Nothing else depends on the registration having succeeded —
 `create_session` sends tags, `handlers.py` adds `cycle:N` on a resume, and the session listing is
 filtered by tag, none of which reads the registered vocabulary. What is unknown is whether Devin
 *accepts* those tags without it.
@@ -201,11 +201,11 @@ session tags against a registered vocabulary, or this organisation's vocabulary 
 or fails `422`, which answers B7 in the affirmative and makes registering the vocabulary a
 prerequisite that this organisation cannot currently satisfy. Record the outcome here either way.
 
-**One weaker signal arrives first.** Step 4 of the same bootstrap run sends
-`POST /schedules` with `sentinel` and `class:scheduled-sweep` on it. So a run that reports step 2 as
-*not registered* and still creates the sweep has had unregistered tags accepted **on a schedule** —
-which is not the same object as a session, and the reference ties the feature to *session* tags. It
-is evidence, not the answer.
+**There used to be a weaker signal, and it has gone.** Step 4 sent `POST /schedules` with `sentinel`
+and `class:scheduled-sweep` on it, so a run that reported step 2 as *not registered* and still
+created the sweep had had unregistered tags accepted on a schedule — evidence, not the answer, since
+a schedule is not a session and the reference ties the feature to *session* tags. That step is
+removed ([B16](#b16)), so the first `POST /sessions` is now the only measurement B7 gets.
 
 ### B14 — The tag path we write is undocumented, and the documented one is enterprise-scoped {#b14}
 

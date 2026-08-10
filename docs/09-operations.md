@@ -374,9 +374,9 @@ for the last one *is* the `.env` record, which is why the preview names what it 
 an enterprise feature — `ManageEnterpriseSettings`, with the session tags feature enabled for the
 enterprise — and this organisation appears not to have it ([B7](./blockers.md#b7)). A `403` or a
 `404` on the registration is therefore reported rather than fatal: step 2 prints one line saying the
-vocabulary was **not** registered, and steps 3 and 4 create the knowledge notes and the nightly
-sweep as normal. Nothing else needs the registration to have succeeded — Sentinel *applies* tags to
-sessions, which is a different call.
+vocabulary was **not** registered, and step 3 creates the knowledge notes as normal. Nothing else
+needs the registration to have succeeded — Sentinel *applies* tags to sessions, which is a different
+call.
 
 Read that line rather than skipping past it. It is not "handled": if Devin does validate session
 tags against a registered vocabulary, the first `POST /sessions` fails `422`, and that is the moment
