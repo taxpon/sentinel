@@ -1,6 +1,6 @@
 """Every metric in `docs/07-observability.md`, against values computed by hand from the fixture.
 
-`docs/08-testing.md` asks for exactly that — "funnel, rates, p50/p90, cycle counts, cost, autonomy
+`docs/08-testing.md` asks for exactly that — "funnel, rates, p50/p90, cycle counts, autonomy
 rate over a fixture event log with hand-computed expected values" — and the reason is worth stating
 where the tests are: these are the figures an engineering leader is asked to trust, so a test that
 asserts whatever the implementation returned would confirm nothing at all. Every expectation below
@@ -22,7 +22,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from factories import a_remediation, a_remediation_event, an_acu_ledger_entry
+from factories import a_remediation, a_remediation_event
 from sentinel.analytics.metrics import (
     DEFAULT_WINDOW,
     IMPACT_ASSUMPTION,
@@ -32,7 +32,6 @@ from sentinel.analytics.metrics import (
     percentile,
     summary,
 )
-from sentinel.config import Settings
 from sentinel.models import RemediationEvent
 
 UTC = datetime.UTC
@@ -45,10 +44,6 @@ WINDOW = Window(
 GENERATED_AT = datetime.datetime(2026, 8, 8, 4, 12, 3, tzinfo=UTC)
 
 WINDOW_JSON = {"from": "2026-08-01T00:00:00Z", "to": "2026-08-08T00:00:00Z"}
-
-# `ACU_UNIT_COST_USD` defaults to 2.25 (`docs/09-operations.md`), which is what the `settings`
-# fixture carries and what every dollar figure below is computed at.
-UNIT_COST = 2.25
 
 
 def at(day: int, hour: int, minute: int = 0) -> datetime.datetime:
@@ -235,18 +230,14 @@ async def seeded(session: AsyncSession) -> AsyncSession:
     return session
 
 
-async def summarise(session: AsyncSession, settings: Settings, **kwargs: Any) -> SummaryJson:
-    return await summary(
-        session, kwargs.pop("window", WINDOW), settings, now=GENERATED_AT, **kwargs
-    )
+async def summarise(session: AsyncSession, **kwargs: Any) -> SummaryJson:
+    return await summary(session, kwargs.pop("window", WINDOW), now=GENERATED_AT, **kwargs)
 
 
 # --- The whole payload ---------------------------------------------------------------------------
 
 
-async def test_summary_matches_the_hand_computed_window(
-    seeded: AsyncSession, settings: Settings
-) -> None:
+async def test_summary_matches_the_hand_computed_window(seeded: AsyncSession) -> None:
     """The complete response body, every figure derived below and none of them from the code.
 
     funnel        labelled 8; session_created 7 (108 never got one); pr_opened 6 (107, 108 did not);
@@ -257,15 +248,13 @@ async def test_summary_matches_the_hand_computed_window(
                   ceil(5.4) = 6th = 3600.
     to_merge      3600, 6480, 9000, 14400 s. n=4: p50 at ceil(2) = 6480, p90 at ceil(3.6) = 14400.
     review        1200, 2880, 5400, 7200 s — merged_at - ci_green_at for the four merges.
-    cost          12 + 8.5 + 5.25 + 6.25 + 4 + 3 + 1 + 0 = 40.0 ACU; 40.0/4 = 10.0 per merged fix;
-                  10.0 x 2.25 = 22.5 USD. No `acu_ledger` rows, so the totals are Sentinel's own.
-    cycles        loop events per remediation: 102 one, 104 two, 106 one, the rest none. Mean over
+    cycles       loop events per remediation: 102 one, 104 two, 106 one, the rest none. Mean over
                   all eight labelled = 4/8 = 0.5.
     throughput    the four merges by the UTC day of `merged_at`; 103 and 104 merged on the same day.
     failures      107 blocked and 108 failed, one each, ordered by reason once the counts tie.
     impact        security 6.0 + flaky-test 3.0 + typing 3.0 + security-dep 2.0 = 14.0 hours.
     """
-    assert await summarise(seeded, settings) == {
+    assert await summarise(seeded) == {
         "window": WINDOW_JSON,
         "funnel": {
             "labelled": 8,
@@ -279,13 +268,6 @@ async def test_summary_matches_the_hand_computed_window(
             "to_pr": {"p50": 1800, "p90": 3600},
             "to_merge": {"p50": 6480, "p90": 14400},
             "review_latency": {"p50": 2880, "p90": 7200},
-        },
-        "cost": {
-            "acus_total": 40.0,
-            "acus_per_merged_fix": 10.0,
-            "usd_per_fix": 22.5,
-            "unit_cost_usd": UNIT_COST,
-            "source": "derived",
         },
         "cycles": {"mean": 0.5, "distribution": {"0": 5, "1": 2, "2": 1}},
         "throughput": [
@@ -307,26 +289,20 @@ async def test_summary_matches_the_hand_computed_window(
     }
 
 
-async def test_the_window_is_half_open_on_labeled_at(
-    seeded: AsyncSession, settings: Settings
-) -> None:
+async def test_the_window_is_half_open_on_labeled_at(seeded: AsyncSession) -> None:
     """The two remediations either side are excluded, and neither is excluded by accident.
 
     Issue 100 is labelled an hour early and merges *inside* the window; issue 109 is labelled at the
-    exact instant the window ends. Widening the interval to either would raise `labelled` to 9 and
-    add 99 or 77 ACUs, so this asserts on the funnel and the ACU total together.
+    exact instant the window ends. Widening the interval to either would raise `labelled` to 9.
     """
-    payload = await summarise(seeded, settings)
+    payload = await summarise(seeded)
     assert payload["funnel"]["labelled"] == 8
-    assert payload["cost"]["acus_total"] == 40.0
 
     shifted = Window(start=WINDOW.start, end=WINDOW.end + datetime.timedelta(microseconds=1))
-    assert (await summarise(seeded, settings, window=shifted))["funnel"]["labelled"] == 9
+    assert (await summarise(seeded, window=shifted))["funnel"]["labelled"] == 9
 
 
-async def test_the_window_owns_its_first_instant_and_not_its_last(
-    session: AsyncSession, settings: Settings
-) -> None:
+async def test_the_window_owns_its_first_instant_and_not_its_last(session: AsyncSession) -> None:
     """A remediation labelled at exactly `start` is in the window; one at exactly `end` is not.
 
     Consecutive windows tile the timeline, so each boundary belongs to exactly one of them. Both
@@ -351,7 +327,7 @@ async def test_the_window_owns_its_first_instant_and_not_its_last(
         ),
     )
 
-    payload = await summarise(session, settings)
+    payload = await summarise(session)
     assert payload["funnel"]["labelled"] == 1
     assert payload["failures"] == [
         {"reason": "labelled_at_the_first_instant", "count": 1, "issues": [110]}
@@ -402,16 +378,25 @@ async def test_a_merge_after_an_escalation_still_counts_as_merged(
     ]
 
 
-async def test_an_empty_window_is_a_complete_payload_of_zeros(
-    session: AsyncSession, settings: Settings
-) -> None:
+async def test_a_zero_length_window_selects_nothing(seeded: AsyncSession) -> None:
+    """`start == end` is half-open over no time at all, so it holds no remediation.
+
+    `parse_window` cannot build such a window, but `Window` is a public dataclass and the API
+    constructs one, so the degenerate case is asserted rather than assumed.
+    """
+    instant = Window(start=WINDOW.start, end=WINDOW.start)
+
+    assert (await summarise(seeded, window=instant))["funnel"]["labelled"] == 0
+
+
+async def test_an_empty_window_is_a_complete_payload_of_zeros(session: AsyncSession) -> None:
     """Nothing labelled: every figure is `0`, and the payload still has every field.
 
     The schema types each figure as a number and the dashboard decides from the funnel whether one
     exists, so `0` here is the representation of "undefined" rather than a measurement. A `null` or
     a `NaN` would reach the panels as a missing field or as `NaN%`.
     """
-    assert await summarise(session, settings) == {
+    assert await summarise(session) == {
         "window": WINDOW_JSON,
         "funnel": {
             "labelled": 0,
@@ -426,13 +411,6 @@ async def test_an_empty_window_is_a_complete_payload_of_zeros(
             "to_merge": {"p50": 0, "p90": 0},
             "review_latency": {"p50": 0, "p90": 0},
         },
-        "cost": {
-            "acus_total": 0.0,
-            "acus_per_merged_fix": 0.0,
-            "usd_per_fix": 0.0,
-            "unit_cost_usd": UNIT_COST,
-            "source": "derived",
-        },
         "cycles": {"mean": 0.0, "distribution": {}},
         "throughput": [],
         "failures": [],
@@ -444,9 +422,7 @@ async def test_an_empty_window_is_a_complete_payload_of_zeros(
     }
 
 
-async def test_a_window_where_nothing_reached_a_pull_request(
-    session: AsyncSession, settings: Settings
-) -> None:
+async def test_a_window_where_nothing_reached_a_pull_request(session: AsyncSession) -> None:
     """Labelled work that stalled: a real 0% success rate, and no durations at all.
 
     This is the case the spec separates success rate from merge rate for. Success is `0/3` — a
@@ -465,7 +441,7 @@ async def test_a_window_where_nothing_reached_a_pull_request(
         ),
     )
 
-    payload = await summarise(session, settings)
+    payload = await summarise(session)
     assert payload["funnel"] == {
         "labelled": 3,
         "session_created": 3,
@@ -519,9 +495,7 @@ def test_percentile_never_returns_a_value_nobody_observed() -> None:
         assert percentile(values, rank) in values
 
 
-async def test_percentiles_over_a_single_merged_remediation(
-    session: AsyncSession, settings: Settings
-) -> None:
+async def test_percentiles_over_a_single_merged_remediation(session: AsyncSession) -> None:
     """One merge in the window: p50 and p90 are both its own duration, not an average of nothing."""
     await seed(
         session,
@@ -538,16 +512,14 @@ async def test_percentiles_over_a_single_merged_remediation(
         ),
     )
 
-    assert (await summarise(session, settings))["durations_seconds"] == {
+    assert (await summarise(session))["durations_seconds"] == {
         "to_pr": {"p50": 1800, "p90": 1800},
         "to_merge": {"p50": 7200, "p90": 7200},
         "review_latency": {"p50": 3600, "p90": 3600},
     }
 
 
-async def test_the_published_percentiles_are_the_50th_and_the_90th(
-    session: AsyncSession, settings: Settings
-) -> None:
+async def test_the_published_percentiles_are_the_50th_and_the_90th(session: AsyncSession) -> None:
     """Ten merges, one to ten minutes: p50 is the 5th observation and p90 the 9th.
 
     Ten is the smallest sample on which the two ranks the schema publishes are distinguishable from
@@ -568,7 +540,7 @@ async def test_the_published_percentiles_are_the_50th_and_the_90th(
         ),
     )
 
-    assert (await summarise(session, settings))["durations_seconds"]["to_merge"] == {
+    assert (await summarise(session))["durations_seconds"]["to_merge"] == {
         "p50": 300,
         "p90": 540,
     }
@@ -577,9 +549,7 @@ async def test_the_published_percentiles_are_the_50th_and_the_90th(
 # --- Fix cycles ----------------------------------------------------------------------------------
 
 
-async def test_fix_cycles_count_rows_that_share_a_created_at(
-    seeded: AsyncSession, settings: Settings
-) -> None:
+async def test_fix_cycles_count_rows_that_share_a_created_at(seeded: AsyncSession) -> None:
     """Issue 104's two loop events carry the same timestamp, and both are counted.
 
     `remediation_event.created_at` is `now()`, which is `transaction_timestamp()`, and
@@ -593,13 +563,13 @@ async def test_fix_cycles_count_rows_that_share_a_created_at(
     ).all()
     assert len(set(timestamps)) == 1, "the fixture no longer produces the tie this test is about"
 
-    payload = await summarise(seeded, settings)
+    payload = await summarise(seeded)
     assert payload["cycles"]["distribution"]["2"] == 1
     assert payload["cycles"]["mean"] == 0.5
 
 
 async def test_fix_cycles_ignore_entries_into_running_that_are_not_loop_edges(
-    session: AsyncSession, settings: Settings
+    session: AsyncSession,
 ) -> None:
     """Only `CI_FAILED` and `CHANGES_REQUESTED` into `RUNNING` count.
 
@@ -622,14 +592,14 @@ async def test_fix_cycles_ignore_entries_into_running_that_are_not_loop_edges(
         ),
     )
 
-    assert (await summarise(session, settings))["cycles"] == {
+    assert (await summarise(session))["cycles"] == {
         "mean": 1.0,
         "distribution": {"1": 2},
     }
 
 
 async def test_fix_cycles_are_averaged_over_every_remediation_not_only_the_merged_ones(
-    session: AsyncSession, settings: Settings
+    session: AsyncSession,
 ) -> None:
     """A remediation that looped three times and was abandoned still counts.
 
@@ -654,15 +624,13 @@ async def test_fix_cycles_are_averaged_over_every_remediation_not_only_the_merge
         ),
     )
 
-    assert (await summarise(session, settings))["cycles"] == {
+    assert (await summarise(session))["cycles"] == {
         "mean": 1.5,
         "distribution": {"0": 1, "3": 1},
     }
 
 
-async def test_the_cycle_distribution_is_keyed_in_numeric_order(
-    session: AsyncSession, settings: Settings
-) -> None:
+async def test_the_cycle_distribution_is_keyed_in_numeric_order(session: AsyncSession) -> None:
     """Ten cycles sorts after two, not between zero and two.
 
     The keys are strings because JSON object keys are, and sorting them as strings would put "10"
@@ -679,133 +647,15 @@ async def test_the_cycle_distribution_is_keyed_in_numeric_order(
         ((512, "CI_FAILED", "RUNNING"),) * 2 + ((513, "CI_FAILED", "RUNNING"),) * 10,
     )
 
-    distribution = (await summarise(session, settings))["cycles"]["distribution"]
+    distribution = (await summarise(session))["cycles"]["distribution"]
     assert list(distribution) == ["0", "2", "10"]
     assert distribution == {"0": 1, "2": 1, "10": 1}
-
-
-# --- Cost ----------------------------------------------------------------------------------------
-
-
-async def test_cost_per_fix_multiplies_before_rounding(
-    session: AsyncSession, settings: Settings
-) -> None:
-    """The spec's own sample figures: 61.4 ACU over five merges at $2.25.
-
-    61.4/5 = 12.28 ACU per merged fix, published rounded to 12.3, and 12.28 x 2.25 = 27.63 USD,
-    published as 27.6. Rounding the ACU figure first and multiplying that would give 27.7 — which
-    is why `docs/07-observability.md` can show 12.3 and 27.6 side by side without contradicting
-    itself.
-    """
-    await seed(
-        session,
-        tuple(
-            {
-                "issue_number": 600 + index,
-                "state": "MERGED",
-                "labeled_at": at(3, 9 + index),
-                "merged_at": at(3, 10 + index),
-                "acus_consumed": Decimal("12.280"),
-            }
-            for index in range(5)
-        ),
-    )
-
-    assert (await summarise(session, settings))["cost"] == {
-        "acus_total": 61.4,
-        "acus_per_merged_fix": 12.3,
-        "usd_per_fix": 27.6,
-        "unit_cost_usd": UNIT_COST,
-        "source": "derived",
-    }
-
-
-async def test_the_unit_cost_comes_from_configuration(
-    seeded: AsyncSession, settings: Settings
-) -> None:
-    """`ACU_UNIT_COST_USD` scales the dollar figure and nothing else.
-
-    10.0 ACU per merged fix at $4.00 is $40.00; the ACU figures are unchanged.
-    """
-    payload = await summarise(seeded, settings.model_copy(update={"acu_unit_cost_usd": 4.0}))
-    assert payload["cost"]["unit_cost_usd"] == 4.0
-    assert payload["cost"]["usd_per_fix"] == 40.0
-    assert payload["cost"]["acus_per_merged_fix"] == 10.0
-    assert payload["cost"]["acus_total"] == 40.0
-
-
-async def test_cost_is_devin_s_when_the_ledger_covers_every_day_of_the_window(
-    seeded: AsyncSession, settings: Settings
-) -> None:
-    """All seven days synced from the consumption API, so the ACU counts are attributable to it."""
-    seeded.add_all(
-        an_acu_ledger_entry(day=datetime.date(2026, 8, day), acus=Decimal("5.000"))
-        for day in range(1, 8)
-    )
-    await seeded.commit()
-
-    assert (await summarise(seeded, settings))["cost"]["source"] == "devin_consumption_api"
-
-
-async def test_cost_is_derived_when_the_ledger_misses_a_day(
-    seeded: AsyncSession, settings: Settings
-) -> None:
-    """One unsynced day and the ledger cannot vouch for the window, whichever day it is.
-
-    The label is the whole point of `cost.source`: a reader must be able to tell a figure Devin
-    reported from one Sentinel worked out for itself.
-    """
-    seeded.add_all(
-        an_acu_ledger_entry(day=datetime.date(2026, 8, day), acus=Decimal("5.000"))
-        for day in (1, 2, 3, 5, 6, 7)
-    )
-    await seeded.commit()
-
-    assert (await summarise(seeded, settings))["cost"]["source"] == "derived"
-
-
-async def test_the_ledger_day_after_the_window_does_not_cover_it(
-    seeded: AsyncSession, settings: Settings
-) -> None:
-    """The window ends at midnight on the 8th, so the 8th is not one of its days — and the 8th
-    being synced does not make up for the 4th not being."""
-    seeded.add_all(
-        an_acu_ledger_entry(day=datetime.date(2026, 8, day), acus=Decimal("5.000"))
-        for day in (1, 2, 3, 5, 6, 7, 8)
-    )
-    await seeded.commit()
-
-    assert (await summarise(seeded, settings))["cost"]["source"] == "derived"
-
-
-async def test_a_window_that_touches_no_day_is_never_vouched_for(
-    seeded: AsyncSession, settings: Settings
-) -> None:
-    """A zero-length window covers no day, so a fully synced ledger still does not cover it.
-
-    "Every day of the window is synced" is vacuously true of a window with no days — which would put
-    Devin's name on figures backed by nothing. `parse_window` cannot build such a window, but
-    `Window` is a public dataclass and the API constructs one, so the emptiness is asserted here
-    rather than assumed.
-    """
-    seeded.add_all(
-        an_acu_ledger_entry(day=datetime.date(2026, 8, day), acus=Decimal("5.000"))
-        for day in range(1, 9)
-    )
-    await seeded.commit()
-
-    instant = Window(start=WINDOW.start, end=WINDOW.start)
-    payload = await summarise(seeded, settings, window=instant)
-    assert payload["funnel"]["labelled"] == 0
-    assert payload["cost"]["source"] == "derived"
 
 
 # --- Failures ------------------------------------------------------------------------------------
 
 
-async def test_failures_are_ordered_by_size_then_reason(
-    session: AsyncSession, settings: Settings
-) -> None:
+async def test_failures_are_ordered_by_size_then_reason(session: AsyncSession) -> None:
     """Largest bucket first, and only `BLOCKED` and `FAILED` rows are in any bucket."""
     await seed(
         session,
@@ -844,29 +694,27 @@ async def test_failures_are_ordered_by_size_then_reason(
         ),
     )
 
-    assert (await summarise(session, settings))["failures"] == [
+    assert (await summarise(session))["failures"] == [
         {"reason": "session_errored", "count": 2, "issues": [702, 703]},
         {"reason": "acu_budget_exhausted", "count": 1, "issues": [704]},
         {"reason": "requires_upstream_decision", "count": 1, "issues": [701]},
     ]
 
 
-async def test_a_failure_with_no_reason_is_shown_not_dropped(
-    session: AsyncSession, settings: Settings
-) -> None:
+async def test_a_failure_with_no_reason_is_shown_not_dropped(session: AsyncSession) -> None:
     """A terminal remediation nobody attributed is its own bucket — the finding, not a gap."""
     await seed(
         session,
         ({"issue_number": 801, "state": "FAILED", "labeled_at": at(3, 9)},),
     )
 
-    assert (await summarise(session, settings))["failures"] == [
+    assert (await summarise(session))["failures"] == [
         {"reason": "unspecified", "count": 1, "issues": [801]}
     ]
 
 
 async def test_a_blocked_remediation_with_an_unrecognised_class_summarises(
-    session: AsyncSession, settings: Settings
+    session: AsyncSession,
 ) -> None:
     """The one row shape that could take out the whole payload rather than one panel.
 
@@ -889,7 +737,7 @@ async def test_a_blocked_remediation_with_an_unrecognised_class_summarises(
         ),
     )
 
-    payload = await summarise(session, settings)
+    payload = await summarise(session)
     assert payload["failures"] == [{"reason": "unknown_issue_class", "count": 1, "issues": [802]}]
     assert payload["impact"]["hours_saved"] == 0.0
     assert payload["throughput"] == []
@@ -898,9 +746,7 @@ async def test_a_blocked_remediation_with_an_unrecognised_class_summarises(
 # --- Throughput ----------------------------------------------------------------------------------
 
 
-async def test_throughput_is_keyed_by_the_day_a_fix_merged(
-    session: AsyncSession, settings: Settings
-) -> None:
+async def test_throughput_is_keyed_by_the_day_a_fix_merged(session: AsyncSession) -> None:
     """Days come from `merged_at`, so a fix merged after the window still lands on its own day.
 
     The window selects on `labeled_at`; the throughput series then reports when those remediations
@@ -937,7 +783,7 @@ async def test_throughput_is_keyed_by_the_day_a_fix_merged(
         ),
     )
 
-    throughput = (await summarise(session, settings))["throughput"]
+    throughput = (await summarise(session))["throughput"]
     assert throughput == [
         {"day": "2026-08-07", "by_class": {"security": 1}},
         {"day": "2026-08-09", "by_class": {"flaky-test": 1, "security": 1}},

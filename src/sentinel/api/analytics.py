@@ -36,7 +36,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sentinel import db
 from sentinel.analytics import metrics
-from sentinel.config import Settings, get_settings
 from sentinel.models import Remediation, RemediationEvent
 
 router = APIRouter(prefix="/api", tags=["analytics"])
@@ -97,9 +96,9 @@ def _window(
     """The window the query string asks for, or `400` naming what was wrong with it.
 
     A dependency rather than a line in the handler so that the interval reaching `metrics.summary()`
-    has been through `parse_window`. `Window` is a public dataclass, and `_cost_source` carries a
-    guard for the degenerate `end <= start` one precisely because a caller could construct it — this
-    module never does.
+    has been through `parse_window`. `Window` is a public dataclass, so a caller could construct a
+    degenerate `end <= start` one — this module never does, and every figure over such a window is
+    computed from the empty set of remediations it selects.
     """
     try:
         return metrics.parse_window(window)
@@ -108,7 +107,6 @@ def _window(
 
 
 SessionDep = Annotated[AsyncSession, Depends(_session)]
-SettingsDep = Annotated[Settings, Depends(get_settings)]
 WindowDep = Annotated[metrics.Window, Depends(_window)]
 
 
@@ -116,11 +114,9 @@ WindowDep = Annotated[metrics.Window, Depends(_window)]
 
 
 @router.get("/analytics/summary")
-async def analytics_summary(
-    session: SessionDep, settings: SettingsDep, window: WindowDep
-) -> metrics.SummaryJson:
+async def analytics_summary(session: SessionDep, window: WindowDep) -> metrics.SummaryJson:
     """Everything the dashboard needs in one response, for the window it asked for."""
-    return await metrics.summary(session, window, settings)
+    return await metrics.summary(session, window)
 
 
 @router.get("/remediations")
