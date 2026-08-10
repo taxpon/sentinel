@@ -36,6 +36,7 @@ from factories import DELIVERY_ID
 from sentinel.config import Settings
 from sentinel.devin import playbooks as pb
 from sentinel.devin.client import (
+    ALLOWED_TAGS,
     CONSUMPTION_DAILY,
     DEFAULT_RETRY,
     ENDPOINTS,
@@ -149,9 +150,9 @@ SPEC_WORKING_STATUSES = set(backticked(_working_phrase.group(1)))
 
 def test_the_spec_tables_were_parsed() -> None:
     """A parsing bug would silently turn every table-driven test below into a no-op."""
-    assert len(SPEC_ENDPOINT_ROWS) == 11
+    assert len(SPEC_ENDPOINT_ROWS) == 12
     assert len(SPEC_CREATE_FIELDS) == 10
-    assert len(SPEC_DEGRADATION_ROWS) == 4
+    assert len(SPEC_DEGRADATION_ROWS) == 5
     assert len(SPEC_STATUSES) == 7
     assert len(SPEC_SWEEP) == 6
     assert SPEC_RETRIES.startswith("exponential backoff")
@@ -174,6 +175,7 @@ SESSION_URL = SESSION.format(org_id=ORG, session_id=SESSION_ID)
 MESSAGES_URL = SESSION_MESSAGES.format(org_id=ORG, session_id=SESSION_ID)
 SESSION_TAGS_URL = SESSION_TAGS.format(org_id=ORG, session_id=SESSION_ID)
 ORG_TAGS_URL = ORGANIZATION_TAGS.format(org_id=ORG)
+ALLOWED_TAGS_URL = ALLOWED_TAGS.format(org_id=ORG)
 KNOWLEDGE_URL = KNOWLEDGE_NOTES.format(org_id=ORG)
 SCHEDULES_URL = SCHEDULES.format(org_id=ORG)
 PLAYBOOKS_URL = PLAYBOOKS.format(org_id=ORG)
@@ -588,6 +590,67 @@ async def test_register_tags_puts_the_whole_vocabulary(
     assert sent.json == {
         "tags": ["sentinel", "repo:", "issue:", "class:", "run:", "cycle:", "outcome:"]
     }
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"tags": ["sentinel", "team:platform"]},
+        {"allowed_tags": ["sentinel", "team:platform"]},
+        ["sentinel", "team:platform"],
+    ],
+)
+async def test_list_tags_reads_the_vocabulary_a_registration_would_replace(
+    client: DevinClient, devin_api: FakeAPI, body: Any
+) -> None:
+    """The read `--dry-run` needs in order to say what the `PUT` above would take away. The
+    envelope is unverified (B8), so the documented `tags` object and a bare array both parse — as
+    they do for every other listing here."""
+    devin_api.responds("GET", ALLOWED_TAGS_URL, 200, body)
+
+    result = await client.list_tags()
+
+    assert result.available
+    assert result.value.tags == ("sentinel", "team:platform")
+    assert devin_api.only("GET", ALLOWED_TAGS_URL).path == ALLOWED_TAGS_URL
+
+
+def test_the_vocabulary_is_read_where_the_reference_documents_it() -> None:
+    """And not where the registration writes. The v3 reference puts every method on the vocabulary
+    under the enterprise-prefixed path and documents nothing under the organisation one, which
+    `docs/05-devin-integration.md` records as open. This is what stops the read drifting onto the
+    unverified path to match the write."""
+    assert ALLOWED_TAGS == "/v3/enterprise/organizations/{org_id}/tags"
+    assert ALLOWED_TAGS != ORGANIZATION_TAGS
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [(403, Unavailability.FORBIDDEN), (404, Unavailability.NOT_FOUND)],
+)
+async def test_reading_the_vocabulary_degrades_rather_than_failing_the_preview(
+    client: DevinClient, devin_api: FakeAPI, status: int, reason: Unavailability
+) -> None:
+    """The likely answer: the documented permission is `ManageEnterpriseSettings`, which a service
+    user scoped to one organisation may not carry. A dry run that stopped here would say nothing
+    about the three steps below it."""
+    devin_api.responds("GET", ALLOWED_TAGS_URL, status, text="no")
+
+    result = await client.list_tags()
+
+    assert isinstance(result, Unavailable)
+    assert result.capability is Capability.TAG_DISCOVERY
+    assert result.reason is reason
+    assert result.status_code == status
+
+
+async def test_a_rejected_token_on_the_vocabulary_read_still_raises(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    devin_api.responds("GET", ALLOWED_TAGS_URL, 401, text="invalid token")
+
+    with pytest.raises(DevinAPIError):
+        await client.list_tags()
 
 
 async def test_create_knowledge_note_returns_the_id_config_needs(

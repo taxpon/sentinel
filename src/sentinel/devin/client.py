@@ -75,6 +75,7 @@ from sentinel.devin.schemas import (
     Session,
     SessionMetrics,
     SessionPage,
+    TagVocabulary,
     Unavailability,
     Unavailable,
 )
@@ -95,6 +96,20 @@ SESSION: Final = f"{SESSIONS}/{{session_id}}"
 SESSION_MESSAGES: Final = f"{SESSION}/messages"
 SESSION_TAGS: Final = f"{SESSION}/tags"
 ORGANIZATION_TAGS: Final = f"{_ORGANIZATION}/tags"
+ALLOWED_TAGS: Final = "/v3/enterprise/organizations/{org_id}/tags"
+"""Where the v3 reference documents an organisation's allowed-tag vocabulary — which is read here
+and is **not** where `ORGANIZATION_TAGS` above writes it.
+
+The two are one resource under two paths, or they are two resources, and no credentials exist to
+find out (B8). What the reference states is the enterprise-prefixed path, for every method it lists
+on the vocabulary — `GET`, `PUT` (replace the full set), `POST` (append), and two `DELETE`s — each
+requiring `ManageEnterpriseSettings`. `register_tags` sends the organisation-scoped path this
+codebase has used since the vocabulary was first specified, and the reference lists no such path.
+
+Reading where the reference says to read is the half of that which changes nothing. Moving the
+write is a change to what `make bootstrap-devin` does to a real organisation, and belongs to
+whoever owns that decision rather than to the preview that surfaced it —
+`scripts/bootstrap_devin.py --dry-run` reports the discrepancy where an operator will see it."""
 KNOWLEDGE_NOTES: Final = f"{_ORGANIZATION}/knowledge/notes"
 SCHEDULES: Final = f"{_ORGANIZATION}/schedules"
 PLAYBOOKS: Final = f"{_ORGANIZATION}/playbooks"
@@ -108,6 +123,7 @@ ENDPOINTS: Final[frozenset[str]] = frozenset(
         SESSION_MESSAGES,
         SESSION_TAGS,
         ORGANIZATION_TAGS,
+        ALLOWED_TAGS,
         KNOWLEDGE_NOTES,
         SCHEDULES,
         PLAYBOOKS,
@@ -459,8 +475,30 @@ class DevinClient:
         Not validated against `validate_tag`: what is registered is the vocabulary itself — the
         namespace tag and the prefixes of `playbooks.TAG_PREFIXES` — and a prefix on its own is not
         a tag that would pass validation.
+
+        A `PUT`, and therefore a **replacement** rather than an addition: the v3 reference calls
+        this "Replace the full set of allowed session tags for an organization" and documents a
+        separate `POST` that appends. Re-running it is harmless, which is the idempotence
+        `scripts/bootstrap_devin.py` claims for it; the *first* run is what can take away tags
+        nobody here chose to remove. `list_tags` is how `--dry-run` names them beforehand.
         """
         await self._request("PUT", ORGANIZATION_TAGS, json={"tags": list(tags)}, path=self._org())
+
+    async def list_tags(self) -> Degradable[TagVocabulary]:
+        """The organisation's allowed session tags, as they are before a registration replaces them.
+
+        Read-only, and read for one caller: `scripts/bootstrap_devin.py --dry-run`, which cannot
+        say what the registration would take away without it.
+
+        Degradable rather than raising, with more reason than the others: the documented permission
+        is `ManageEnterpriseSettings`, which a service user scoped to one organisation may well not
+        carry, and `ALLOWED_TAGS` is not the path the registration writes to. A refusal is an
+        ordinary outcome here rather than a fault, and the preview's answer to it — that the `PUT`
+        may remove tags it cannot name — is worth more than a run that stops.
+        """
+        return await self._degradable(
+            Capability.TAG_DISCOVERY, "GET", ALLOWED_TAGS, TagVocabulary, path=self._org()
+        )
 
     async def create_knowledge_note(
         self, *, name: str, body: str, trigger_description: str | None = None
