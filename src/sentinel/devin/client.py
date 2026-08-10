@@ -505,9 +505,10 @@ class DevinClient:
         """The organisation's playbooks, titled and identified — what `DEVIN_PLAYBOOK_IDS` is
         built from.
 
-        The read beside B6's write. The four playbooks are created by hand in the Devin UI because
-        creating them through the API needs a scope this token may not carry; finding the id of one
-        that already exists is a different permission question, and this is where it is asked.
+        The four playbooks were created by hand in the Devin UI, so their ids exist only there
+        until something reads them back. This is that read, and it works against the live API — the
+        organisation scope carries writes as well, which is what makes B6's premise wrong; creating
+        them by script has simply not been tried.
         `scripts/bootstrap_devin.py --list-playbooks` is the only caller and it creates nothing.
 
         Degradable rather than raising, for the reason the two below are: a refused permission is

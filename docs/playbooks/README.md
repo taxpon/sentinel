@@ -2,10 +2,15 @@
 
 > **Status:** Design · **Answers:** What is in the four Devin playbooks, and how do I change one?
 
-Sentinel creates every session with a `playbook_id` ([05](../05-devin-integration.md)). Playbook
-create/update/delete live under `/v3/enterprise/playbooks/*` and need enterprise scope, which this
-token does not have ([B6](../blockers.md#b6)), so the four playbooks are **created by hand in the
-Devin UI**. That makes these files the only record of what they contain.
+Sentinel creates every session with a `playbook_id` ([05](../05-devin-integration.md)). The four
+playbooks were **created by hand in the Devin UI**, which makes these files the only record of what
+they contain.
+
+By hand because that is what was believed necessary at the time: [B6](../blockers.md#b6) said
+playbook writes were enterprise-scoped. They are not — v3 carries the whole set at organisation
+scope too, and reading them there works against the live API. Creating them by script is therefore
+probably possible and has not been tried, so for now these files and the UI are kept in step by a
+person.
 
 **These files are the source of truth.** Devin holds a copy; this directory holds the original. A
 change here is not live until somebody re-pastes the block into the Devin UI, and a playbook edited
