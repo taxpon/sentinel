@@ -30,7 +30,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from conftest import DEVIN_TOKEN, Configure, FakeAPI
-from factories import ISSUE_CLASS, a_remediation, a_remediation_event
+from factories import ISSUE_CLASS, ISSUE_NUMBER, a_remediation, a_remediation_event
 from sentinel.config import Settings
 from sentinel.devin.client import SESSION, DevinClient
 from sentinel.devin.playbooks import acu_cap_for
@@ -42,6 +42,9 @@ from sentinel.pipeline.state import State, Trigger
 from sentinel.queue import JobKind
 
 SESSION_ID = "devin-7b3f9c2a"
+SECOND_SESSION_ID = "devin-1e4a8d05"
+"""A second remediation's session. Only a test with two of them can see whether a rule is scoped to
+one — the deduplication of the offer note in particular."""
 SESSION_URL = f"https://app.devin.ai/sessions/{SESSION_ID}"
 PR_URL = "https://github.com/taxpon/superset/pull/42889"
 PR_NUMBER = 42889
@@ -757,8 +760,14 @@ async def test_a_finished_session_waiting_for_input_is_not_a_stall(
     seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
 ) -> None:
     """A session that has finished its lap and is waiting to be resumed is the normal state of
-    every remediation sitting in review. Only a session Devin is *running* is stalled by the
-    detail."""
+    every remediation sitting in review.
+
+    **The premise here is the pull request, not the status.** This remediation has one linked, so
+    the rule that decides it is `pull_request_exists` and the status set is never consulted —
+    widening `STALLED_STATUSES` would leave this test passing. That the status set is what excludes
+    `exit` is asserted by `test_only_a_running_session_is_stalled_by_the_detail`, which withholds
+    the pull request so that the status is the only thing in the way.
+    """
     remediation = await seed(state=State.IN_REVIEW.value, pr_url=PR_URL)
     devin_api.responds(
         "GET", session_path, 200, a_session(status="exit", status_detail="waiting_for_user")
@@ -780,13 +789,14 @@ async def test_a_session_being_started_is_not_stalled(
     session_path: str,
     poll: Poll,
 ) -> None:
-    """The false positive that would cost the most. `resuming` is by definition a session the worker
-    has just sent a message to, so a `waiting_for_user` observed on it may be left over from before
-    that message landed — and `status_detail` timing is unverified (B8). Blocking here would end a
-    remediation in the middle of its fix loop, and `BLOCKED` is terminal.
+    """The false positive that would cost the most: a remediation ended in the middle of its fix
+    loop, where `BLOCKED` is terminal and losing it loses the pull request too.
 
-    `claimed` is the same argument from the other end: work has not begun, so nothing has been
-    asked yet.
+    **The premise here is the pull request, not the status.** This remediation is on lap two, so it
+    has one linked and `pull_request_exists` decides before the status set is reached — widening
+    `STALLED_STATUSES` would leave this test passing. The argument about `resuming` being a session
+    the worker has just messaged is asserted by
+    `test_only_a_running_session_is_stalled_by_the_detail`, which withholds the pull request.
     """
     remediation = await seed(state=State.CI_FAILED.value, cycle=1, pr_url=PR_URL)
     devin_api.responds(
@@ -798,6 +808,101 @@ async def test_a_session_being_started_is_not_stalled(
     await session.refresh(remediation)
     assert remediation.state == State.CI_FAILED.value
     assert remediation.blocked_reason is None
+
+
+# What each non-`running` status does with `waiting_for_user` and **no pull request** — the case
+# where the status set is the only thing standing between the observation and `BLOCKED`.
+#
+# `exit` is not "nothing happens": a session Devin has finished with that produced no pull request
+# fails the remediation, which is a different escalation with a different reason. That distinction
+# is the assertion — under a widened `STALLED_STATUSES`, `BLOCKED` is applied before `FAILED` and
+# the reason recorded would be `session_waiting_for_user` instead.
+NOT_STALLED_WITHOUT_A_PULL_REQUEST: dict[SessionStatus, tuple[State, str | None]] = {
+    SessionStatus.CLAIMED: (State.RUNNING, None),
+    SessionStatus.RESUMING: (State.RUNNING, None),
+    SessionStatus.SUSPENDED: (State.RUNNING, None),
+    SessionStatus.EXIT: (State.FAILED, poller.SESSION_ENDED_WITHOUT_PULL_REQUEST),
+}
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [(status, r) for status, r in NOT_STALLED_WITHOUT_A_PULL_REQUEST.items()],
+)
+async def test_only_a_running_session_is_stalled_by_the_detail(
+    status: SessionStatus,
+    expected: tuple[State, str | None],
+    seed: Seed,
+    session: AsyncSession,
+    devin_api: FakeAPI,
+    session_path: str,
+    poll: Poll,
+) -> None:
+    """`STALLED_STATUSES` is `{running}` and nothing else, and this is what says so.
+
+    Every other test of the status set seeds a linked pull request, which since
+    `docs/adr/2026-08-10-an-offer-after-the-pull-request-is-not-a-stall.md` short-circuits the
+    status check entirely — so they would all pass with the set widened to every working and
+    terminal status, and the narrowing they were written for would be asserted by nothing. The test
+    and the code would share the premise, which is the one thing a test cannot see
+    (`tasks/lessons.md`).
+
+    Withholding the pull request is what restores the teeth. Here the status is the only thing
+    between `waiting_for_user` and `BLOCKED`:
+
+    - `claimed` has been picked up and has not begun, so it cannot have asked anything yet;
+    - `resuming` is by definition a session the worker has just sent a message to, so a detail
+      observed on it may predate that message — and its timing is unverified (B8);
+    - `suspended` is idling between laps, which is not a question;
+    - `exit` is Devin finished with the session, which fails the remediation for having nothing to
+      show rather than for waiting.
+    """
+    state, reason = expected
+    remediation = await seed()
+    devin_api.responds(
+        "GET", session_path, 200, a_session(status=status.value, status_detail="waiting_for_user")
+    )
+
+    await poll()
+
+    await session.refresh(remediation)
+    assert remediation.state == state.value
+    assert remediation.blocked_reason == reason
+    assert remediation.blocked_reason != poller.SESSION_WAITING_FOR_USER
+    # Nothing was annotated either: the note belongs to the far side of a pull request.
+    assert poller.OBSERVATION not in [event.kind for event in await events(session)]
+
+
+async def test_the_acu_cap_and_the_question_can_arrive_together(
+    seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
+) -> None:
+    """`blocked_reason` and `failure_reason` now read one `has_pull_request` between them, so the
+    tick where both fire is worth pinning rather than leaving to inference.
+
+    No pull request, waiting on a question, and the ACU cap spent. Both triggers are carried;
+    `observed_triggers` puts `BLOCKED` before `FAILED` so that a session which said *why* it
+    stopped is recorded as blocked rather than as a bare failure, and the reason that reaches the
+    column is therefore `session_waiting_for_user` and never `acu_cap_exhausted`.
+
+    That is the existing precedence and this test does not change it — but the failure-breakdown
+    panel of `docs/07-observability.md` groups on this column, so the run will attribute this
+    remediation to the question rather than to the ceiling it hit. Worth knowing before reading
+    that panel.
+    """
+    remediation = await seed(state=State.RUNNING.value)
+    devin_api.responds(
+        "GET",
+        session_path,
+        200,
+        a_session(status="running", status_detail="waiting_for_user", acus_consumed=float(ACU_CAP)),
+    )
+
+    await poll()
+
+    await session.refresh(remediation)
+    assert remediation.state == State.BLOCKED.value
+    assert remediation.blocked_reason == poller.SESSION_WAITING_FOR_USER
+    assert remediation.acus_consumed == Decimal(str(float(ACU_CAP)))
 
 
 # --- An offer is not a stall ----------------------------------------------------------------------
@@ -829,6 +934,9 @@ async def test_a_question_after_the_pull_request_does_not_escalate(
         ),
     )
 
+    # `Tick.moved` counts transitions, and the note deliberately is not one — so `moved == 0` says
+    # nothing about whether a row was written. Where this test means "nothing was escalated" it
+    # asserts on the rows.
     assert (await poll()).moved == 0
 
     await session.refresh(remediation)
@@ -836,6 +944,7 @@ async def test_a_question_after_the_pull_request_does_not_escalate(
     assert remediation.blocked_reason is None
     assert remediation.closed_at is None
     assert await jobs(session) == []
+    assert [event.kind for event in await events(session)] == [poller.OBSERVATION]
 
 
 async def test_the_question_is_recorded_once_rather_than_every_tick(
@@ -874,6 +983,95 @@ async def test_the_question_is_recorded_once_rather_than_every_tick(
     }
     await session.refresh(remediation)
     assert remediation.state == State.PR_OPENED.value
+
+
+async def test_one_remediations_note_does_not_suppress_anothers(
+    seed: Seed,
+    session: AsyncSession,
+    devin_api: FakeAPI,
+    session_path: str,
+    settings: Settings,
+    poll: Poll,
+) -> None:
+    """The deduplication is per remediation, and only a second remediation can show it.
+
+    Every other test in this section has exactly one, so a query that forgot
+    `remediation_id` would pass all of them — and in production the first remediation to record an
+    offer would silence every later one. Devin has offered something on every session observed, so
+    that is one row in place of eight, in precisely the artefact this feature exists to produce.
+
+    A fixture containing exactly one of anything deserves a second look; `tasks/lessons.md` says
+    cardinality is where this hides.
+    """
+    first = await seed(state=State.PR_OPENED.value, pr_url=PR_URL, pr_number=PR_NUMBER)
+    second = await seed(
+        issue_number=ISSUE_NUMBER + 1,
+        devin_session_id=SECOND_SESSION_ID,
+        state=State.PR_OPENED.value,
+        pr_url=A_LATER_PR_URL,
+        pr_number=PR_NUMBER + 1,
+    )
+    offering = a_session(
+        status="running", status_detail="waiting_for_user", pull_requests=a_pull_request()
+    )
+    devin_api.responds("GET", session_path, 200, offering)
+    devin_api.responds(
+        "GET",
+        SESSION.format(org_id=settings.devin_org_id, session_id=SECOND_SESSION_ID),
+        200,
+        {**offering, "session_id": SECOND_SESSION_ID},
+    )
+
+    for _ in range(2):
+        await poll()
+
+    noted = [
+        event.remediation_id for event in await events(session) if event.kind == poller.OBSERVATION
+    ]
+    assert sorted(noted) == sorted([first.id, second.id]), "one note each, not one between them"
+
+
+async def test_a_note_already_in_the_log_is_not_written_again(
+    seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
+) -> None:
+    """The deduplication reads the database, not the process.
+
+    Polling three times in one process would pass identically against a `set()` of remediation ids
+    held in module scope — and the record makes durability load-bearing, because it is the
+    difference between this and the counter
+    `docs/adr/2026-08-08-a-stalled-session-is-blocked.md` turned down for being "lost on every
+    restart and absent whenever `poll_once` is called directly".
+
+    So the row is put in the log by hand, as a restarted poller would find it, and the assertion is
+    that a poller which has never seen this remediation writes nothing.
+    """
+    remediation = await seed(state=State.PR_OPENED.value, pr_url=PR_URL, pr_number=PR_NUMBER)
+    session.add(
+        a_remediation_event(
+            remediation_id=remediation.id,
+            from_state=State.PR_OPENED.value,
+            to_state=State.PR_OPENED.value,
+            kind=poller.OBSERVATION,
+            detail={
+                "source": poller.SOURCE,
+                "note": poller.SESSION_QUESTION_AFTER_PULL_REQUEST,
+                "cycle": 0,
+            },
+        )
+    )
+    await session.commit()
+    devin_api.responds(
+        "GET",
+        session_path,
+        200,
+        a_session(
+            status="running", status_detail="waiting_for_user", pull_requests=a_pull_request()
+        ),
+    )
+
+    await poll()
+
+    assert len(await events(session)) == 1, "the row that was already there, and no second one"
 
 
 async def test_a_question_on_a_later_fix_cycle_is_recorded_again(
