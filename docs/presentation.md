@@ -13,8 +13,13 @@ the sources below, or say the figure is not in yet.
 ## Placeholders
 
 The runs have not happened: Devin credentials are unobtained
-([B8](./blockers.md#b8)), so no merge count, ACU total, cost or duration exists yet. The script is
-written to be filled, not rewritten.
+([B8](./blockers.md#b8)), so no merge count, rate or duration exists yet. The script is written to
+be filled, not rewritten.
+
+There is no spend figure to fill in at all. Spend reporting was removed — Devin reports consumption
+only in ACUs and this account is not billed in ACUs, so every figure it produced was zero
+([ADR](./adr/2026-08-10-spend-reporting-is-removed-because-the-account-is-not-billed-in-acus.md)).
+Section 5 speaks hours saved instead, and the honest answer to "what did it cost?" is the one below.
 
 ```bash
 curl -s 'localhost:8000/api/analytics/summary?window=7d' | jq
@@ -37,15 +42,10 @@ screen behind you rather than in your head.
 | `{{mttr_p50}}` | `durations_seconds.to_merge.p50` | Median label → merge | 5 |
 | `{{mttr_p90}}` | `durations_seconds.to_merge.p90` | p90 label → merge | 5 |
 | `{{review_latency_p50}}` | `durations_seconds.review_latency.p50` | Median CI-green → merge: the wait on a human | 5 |
-| `{{acus_per_fix}}` | `cost.acus_per_merged_fix` | Unit economics — the number that must fall over time | 5 |
-| `{{usd_per_fix}}` | `cost.usd_per_fix` | `acus_per_fix × unit_cost_usd` | 5 |
 | `{{hours_saved}}` | `impact.hours_saved` | `Σ baseline_hours[class] × merged_in_class` — a stated assumption | 5 |
 | `{{failure_count}}` | `Σ failures[].count` | Terminal `BLOCKED` or `FAILED` | 6 |
 | `{{failure_reasons}}` | `failures[].reason` | Read the two or three largest buckets aloud, by name | 6 |
 | `{{time_to_pr_p50}}` | `durations_seconds.to_pr.p50` | Median label → pull request | Q&A |
-| `{{acus_total}}` | `cost.acus_total` | ACUs spent across the window's remediations | Q&A |
-| `{{acu_unit_cost}}` | `cost.unit_cost_usd` | `ACU_UNIT_COST_USD` — a local contract price, not a Devin figure | Q&A |
-| `{{cost_source}}` | `cost.source` | `devin_consumption_api` or `derived` — provenance of the ACU counts only | Q&A |
 | `{{mean_cycles}}` | `cycles.mean` | Mean fix cycles per remediation | Q&A |
 | `{{zero_cycle_count}}` | `cycles.distribution["0"]` | Remediations that needed no second lap | Q&A |
 
@@ -81,8 +81,8 @@ to ([ADR](./adr/2026-08-08-percentiles-are-nearest-rank-observations.md)).
 An empty funnel stage makes a rate undefined rather than zero, and the dashboard renders `—` with
 the reason rather than printing a `0` that reads as total failure
 ([ADR](./adr/2026-08-08-blank-a-figure-whose-denominator-is-empty.md)). If a tile shows a dash on
-the day, say what the dash means — "nothing merged in this window, so cost per fix is undefined" —
-and move on. Do not narrate a number the panel is refusing to claim.
+the day, say what the dash means — "nothing merged in this window, so there is no median time to
+merge" — and move on. Do not narrate a number the panel is refusing to claim.
 
 ## Budget
 
@@ -101,7 +101,7 @@ Overrunning costs the ending, and the ending is section 6.
 | 2 | Why Devin | 0:38–1:22 | 102 |
 | 3 | What was built | 1:22–2:07 | 105 |
 | 4 | The review-fix loop | 2:07–3:02 | 128 |
-| 5 | What it produced, and what it cost | 3:02–3:57 | 129 |
+| 5 | What it produced, and what it was worth | 3:02–3:57 | 129 |
 | 6 | What did not work | 3:57–4:46 | 115 |
 | 7 | Close | 4:46–4:59 | 29 |
 
@@ -146,8 +146,8 @@ This is the argument the whole talk rests on
 ([01](./01-overview.md#why-devin-specifically)). The four Devin capabilities it depends on —
 autonomous execution in a real VM, resumable sessions, structured output as a contract, and
 per-session ACU accounting — belong in questions, not here. Say them only if asked why this was not
-built on a plain completion API; the fourth is the one that makes cost per fix a measurement instead
-of an estimate.
+built on a plain completion API; the fourth is what the per-class cap and the daily budget guard are
+enforced against.
 
 ## 3. What was built — 1:22–2:07
 
@@ -198,7 +198,7 @@ is [an ADR](./adr/2026-08-07-reuse-resumable-sessions.md), as is
 [giving Devin the objective rather than the steps](./adr/2026-08-07-delegate-task-not-steps.md).
 `MAX_FIX_CYCLES` defaults to 3 and is configuration, not a constant.
 
-## 5. What it produced, and what it cost — 3:02–3:57
+## 5. What it produced, and what it was worth — 3:02–3:57
 
 **On screen:** the KPI row and the funnel panel. Hours saved is *not* on the dashboard — the panel
 list in [07](./07-observability.md#dashboard) names an impact panel, but `dashboard/src/panels/`
@@ -215,17 +215,20 @@ has none and `impact.hours_saved` is rendered nowhere. Read it from step 4 of th
 > Median label to merge, {{mttr_p50}}; p90, {{mttr_p90}}. Of the median, {{review_latency_p50}} was
 > spent waiting for me — the bottleneck, visible and measured.
 >
-> {{acus_per_fix}} ACUs per merged fix, {{usd_per_fix}} at our contract rate. Against stated
-> baselines — six engineer-hours for a security fix, two for a dependency upgrade, three for a flaky
-> test — that is {{hours_saved}} hours. Those baselines are an assumption, labelled as one wherever
-> they appear. The ACU counts are measured; the dollars are our own conversion, never Devin's.
+> Against stated baselines — six engineer-hours for a security fix, two for a dependency upgrade,
+> three for a flaky test — that is {{hours_saved}} hours. That is an assumption, labelled as one
+> wherever it appears.
+>
+> No cost per fix. Devin meters in ACUs; this account is not billed in ACUs, so any figure would be
+> invented rather than measured.
 
 Two things to get right when saying this. The baselines are real constants —
 `SECURITY_FIX` 6.0 hours, `DEP_UPGRADE` 2.0, `FLAKY_TEST` 3.0, `DEPRECATION` 3.0, in
 `src/sentinel/devin/playbooks.py` — but they are assumptions about human effort, not observations,
-and the API returns that caveat in `impact.assumption`. And `cost.source` describes the *ACU* counts
-only; the dollar figure is `ACU_UNIT_COST_USD` from local configuration, so attributing it to Devin
-would be wrong ([ADR](./adr/2026-08-08-cost-panel-labels-acu-and-dollar-provenance-separately.md)).
+and the API returns that caveat in `impact.assumption`. And say the spend paragraph as a decision,
+not an apology: removing a metric that cannot be measured on the system being demonstrated is the
+same discipline as section 6, and a listener who has been shown a wrong number before will recognise
+it ([ADR](./adr/2026-08-10-spend-reporting-is-removed-because-the-account-is-not-billed-in-acus.md)).
 If you want the money line, multiply `{{hours_saved}}` by `{{engineer_hourly_cost}}` out loud and
 name the rate as your assumption — or leave it out, which is safer.
 
@@ -266,8 +269,8 @@ every candidate to name a unit-testable host
 
 **On screen:** the live table, one row expanded to its session and pull request links.
 
-> The interesting artifact is not the patches. It is that the throughput, the failures and the unit
-> cost each land on a session and a diff you can open.
+> The interesting artifact is not the patches. It is that the throughput, the failures and the hours
+> each land on a session and a diff you can open.
 
 ---
 

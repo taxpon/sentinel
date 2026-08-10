@@ -49,8 +49,8 @@ Concretely, Devin supplies four capabilities Sentinel depends on and would other
    self-correct ([04](./04-state-machine.md)).
 3. **Structured output** — a contract for what the agent reports back, which drives the escalation
    path and the dashboard ([05](./05-devin-integration.md)).
-4. **Session-level accounting** — ACU consumption per session, which makes cost-per-fix a real
-   number rather than an estimate.
+4. **Session-level accounting** — ACU consumption per session, which is what a per-class
+   `max_acu_limit` and the daily budget guard are enforced against.
 
 ## The loop
 
@@ -64,7 +64,7 @@ flowchart LR
     E -- yes --> F["Human review"]
     F -- "changes requested" --> C
     F -- approved --> G["Merged"]
-    G --> H["Metrics:<br/>MTTR · cost · autonomy rate"]
+    G --> H["Metrics:<br/>MTTR · autonomy rate · hours saved"]
 ```
 
 The loop is closed on both ends. A vulnerability sweep, run on demand, resolves the target's
@@ -117,6 +117,6 @@ explicit acceptance criterion in [08](./08-testing.md).
 | **Remediation** | One labelled issue and everything that follows from it. The central aggregate ([03](./03-data-model.md)). |
 | **Issue class** | The taxonomy above. Selects playbook, ACU cap and prompt template. |
 | **Cycle** | One pass through the review-fix loop. Cycle 0 is the initial attempt; each CI failure or change request increments it. |
-| **ACU** | Agent Compute Unit — Devin's billing and effort unit. The basis for all cost metrics. |
+| **ACU** | Agent Compute Unit — Devin's billing and effort unit. What the per-class cap and the daily budget guard are enforced against. |
 | **Blocked** | Devin reported `outcome: blocked` in its structured output, or a policy limit was hit. Escalates to a human. |
 | **Autonomy rate** | Share of merged remediations that reached merge with zero fix cycles and zero human messages into the session. |

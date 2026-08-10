@@ -30,8 +30,8 @@ starting a new one that has forgotten everything. `cycle` counts the laps, and i
 session that cannot converge escalates to a human instead of burning budget for ever.
 
 **The bottleneck moves, and is measured.** Delegating implementation shifts the constraint to review
-capacity. Sentinel instruments precisely that: time-to-PR, autonomy rate, fix cycles per merge, and
-cost per merged fix, all from an append-only transition log rather than from a spreadsheet.
+capacity. Sentinel instruments precisely that: time-to-PR, review latency, autonomy rate and fix
+cycles per merge, all from an append-only transition log rather than from a spreadsheet.
 
 ## Architecture
 

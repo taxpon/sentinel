@@ -25,7 +25,7 @@ below says so in as many words.
 | `GET` | `/v3/enterprise/organizations/{org_id}/tags` | Read the vocabulary that registration would replace — `bootstrap_devin.py --dry-run` only | — → `TagsResponse` · `ManageEnterpriseSettings` |
 | `POST` | `/v3/organizations/{org_id}/knowledge/notes` | Seed repository conventions once at bootstrap | `KnowledgeNoteCreateRequest` → `KnowledgeNoteResponse` · `ManageAccountKnowledge` |
 | `GET` | `/v3/organizations/{org_id}/playbooks` | Read back the ids of the hand-made playbooks — `make devin-playbooks` | — → `PaginatedResponse[PlaybookResponse]` · `ManageAccountPlaybooks` |
-| `GET` | `/v3/organizations/{org_id}/consumption/daily` | Daily ACU spend for the budget guard and cost panel | — → `ConsumptionResponse` · `ViewOrgConsumption` |
+| `GET` | `/v3/organizations/{org_id}/consumption/daily` | Daily ACU spend for the budget guard | — → `ConsumptionResponse` · `ViewOrgConsumption` |
 | `GET` | `/v3/enterprise/metrics/sessions` | Merged-PR and ACU aggregates — *enterprise scope, optional* | — → `SessionMetricsResponse` · `ViewAccountMetrics` |
 
 The last row requires enterprise scope and the `ViewAccountMetrics` permission. Sentinel treats it
@@ -428,8 +428,12 @@ defined fallback so that a permission gap degrades a panel rather than breaking 
 | Playbook discovery | `GET /v3/organizations/{org_id}/playbooks` | Open each playbook in the Devin web app and read its id from the page | `PaginatedResponse[PlaybookResponse]`; `playbook_id`, `title` and `access_type` (`enterprise` or `org`) required. Paged by `after` and `first` (default 100, max 200) |
 | Tag vocabulary discovery | `GET /v3/enterprise/organizations/{org_id}/tags` | Read the organisation's allowed tags in the Devin web app before registering, since the registration replaces them | `TagsResponse`: `{"tags": string[]}`, `tags` required |
 
-The dashboard labels any figure served by a fallback, so a reader always knows which numbers came
-from Devin and which Sentinel derived itself.
+Both ACU capabilities now serve the budget guard alone, and no dashboard figure is computed from
+either — spend reporting was removed once it became clear this account is not billed in ACUs
+([07](./07-observability.md#analytics-api)), so no panel has a provenance left to label. The live
+table's ACU column is the one Devin-reported number still on screen, and it is not served by a
+fallback: it is `remediation.acus_consumed`, copied from the session payload by the poller and shown
+as the observation it is.
 
 ## Client behaviour
 
