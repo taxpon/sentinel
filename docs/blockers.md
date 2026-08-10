@@ -37,6 +37,7 @@ A working register, updated throughout implementation.
 | [B11](#b11) | Cost | Superset's test suite is heavy; ACU per session unpredictable | Budget calibration | Open |
 | [B12](#b12) | Delivery | This repository is private | Reviewer access | Open |
 | [B13](#b13) | Delivery | Assignment brief must not leak into a public repository | Publication | Open |
+| [B14](#b14) | Devin API | Tag registration writes an undocumented path, and the documented one is enterprise-scoped | Bootstrap step 2; any organisation shared with anyone else | Open |
 
 ---
 
@@ -165,8 +166,9 @@ system through `DEVIN_PLAYBOOK_IDS`.
 
 ### B7 — Org tag vocabulary may require pre-registration {#b7}
 
-**Evidence.** v3 exposes `PUT /v3/organizations/{org_id}/tags` and per-organisation allowed-tag
-management, implying tags may be validated against a registered vocabulary.
+**Evidence.** v3 exposes per-organisation allowed-tag management, implying tags may be validated
+against a registered vocabulary. **The path this entry cited does not appear in the v3 reference** —
+see [B14](#b14), which is now the harder half of this question.
 
 **Impact.** If enforced, creating a session with an unregistered tag fails with `422` — and tags
 carry the whole audit-trail argument ([05](./05-devin-integration.md)).
@@ -175,6 +177,40 @@ carry the whole audit-trail argument ([05](./05-devin-integration.md)).
 
 **To verify.** After [B8](#b8): create a session with a deliberately unregistered tag and record
 whether it is rejected. Update this entry with the answer.
+
+### B14 — The tag path we write is undocumented, and the documented one is enterprise-scoped {#b14}
+
+**Evidence.** Sentinel registers the vocabulary with `PUT /v3/organizations/{org_id}/tags`. That
+path appears nowhere in the v3 reference. All five methods on an organisation's allowed tags are
+documented at **`/v3/enterprise/organizations/{org_id}/tags`** — quoted from the OpenAPI block on
+[Get Organization Allowed Tags](https://docs.devin.ai/api-reference/v3/tags/organizations-tags.md),
+whose page slug says `organizations-tags` while the spec inside says `enterprise/organizations`.
+They require `ManageEnterpriseSettings`, and *"the session tags feature must be enabled for the
+enterprise"*.
+
+Every other path Sentinel sends — sessions, knowledge notes, schedules, playbooks, consumption —
+appears in the index verbatim. The tag vocabulary is the only one that does not.
+
+**Two questions, and they compound.**
+
+| | If | Then |
+|---|---|---|
+| Path | the organisation-scoped path is not served | bootstrap step 2 fails on the first real run. **This is the harmless outcome** — nothing is removed |
+| Method | it *is* served, as an undocumented alias | `PUT` **replaces** the whole set, so the first run removes every tag the organisation allows that `devin/playbooks.py` does not list |
+
+`POST` appends where `PUT` replaces. Whether Sentinel should own the organisation's vocabulary or
+only add to it is a decision, not a bug: **`PUT` is kept deliberately**, because this organisation is
+Sentinel's alone. On an organisation shared with anyone else, `POST` is the right method and this
+entry is the reason to change it before running.
+
+**Mitigation in place.** `uv run scripts/bootstrap_devin.py --dry-run` reads the *documented* path
+and reports which tags would be kept, added and **removed**, naming the removals individually. Where
+it cannot read — `403` is likely, since the read wants enterprise scope too — it says so and warns
+that the write may remove tags it cannot name. It also states that the path it read is not the path
+step 2 writes, so a removal list is never mistaken for a certainty.
+
+**To resolve.** Run the preview. If the read is refused, check the organisation's allowed tags in
+the Devin web app before running step 2 for real.
 
 ### B8 — Devin credentials not yet obtained {#b8}
 
