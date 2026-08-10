@@ -585,13 +585,12 @@ def test_the_transcribed_check_suite_table_matches_the_spec_document() -> None:
     moves: dict[Trigger, set[str]] = {}
     ignored: dict[Trigger, set[str]] = {}
     for row in spec_table("Check suite events"):
-        text = row[0]
-        if "requested" in text:
-            trigger = Trigger.CHECK_SUITE_REQUESTED
-        elif "success" in text:
-            trigger = Trigger.CHECK_SUITE_SUCCEEDED
-        else:
-            trigger = Trigger.CHECK_SUITE_FAILED
+        # The row names its own trigger. This used to be inferred from words like "success" in the
+        # prose, which silently collapsed two rows onto one trigger the moment the document stopped
+        # describing check suite conclusions and started describing verdicts.
+        [trigger] = [
+            candidate for candidate in NEEDS_A_LINKED_PR if f"`{candidate.value}`" in row[0]
+        ]
         moves[trigger] = set(names_in(row[1]))
         ignored[trigger] = set(names_in(row[2]))
 

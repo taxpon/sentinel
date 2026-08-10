@@ -251,9 +251,15 @@ def a_session_body(**overrides: Any) -> dict[str, Any]:
     return {"session_id": SESSION_ID, "status": "new", "url": SESSION_URL, **overrides}
 
 
+WORKFLOW_PATH = ".github/workflows/devin-autofix-ci.yml"
+
+
 def a_workflow_run(**overrides: Any) -> dict[str, Any]:
     return {
         "id": RUN_ID,
+        # `get_failing_job` selects on the path, so a run without one is a run from some other
+        # workflow — which is exactly what must not supply the excerpt.
+        "path": WORKFLOW_PATH,
         "head_sha": HEAD_SHA,
         "status": "completed",
         "conclusion": "failure",
@@ -1693,6 +1699,280 @@ async def test_a_lost_lease_leaves_the_row_to_the_worker_that_holds_it(
     assert job.locked_by == OTHER_WORKER
     assert job.attempts == 0
     assert (await remediation_row(session_factory, remediation_id)).state == State.QUEUED
+
+
+# -------------------------------------------------------------------------------- evaluate_ci
+
+
+GATE = "devin-autofix-ci"
+
+# Two of the five jobs of the fork's own workflow. `pytest (scoped)` skips on a frontend-only diff,
+# which must not hold the pull request back.
+OUR_WORKFLOW = (("jest (scoped)", "success"), ("pytest (scoped)", "skipped"))
+
+# What concluded first on PR #9, and what Sentinel read as CI green.
+INHERITED = (("check-hold-label", "success"), ("labeler", "success"))
+
+
+def a_check_run_body(name: str, conclusion: str | None, status: str = "completed") -> Any:
+    return {
+        "id": abs(hash((name, conclusion, status))) % 10**10,
+        "name": name,
+        "status": status,
+        "conclusion": conclusion,
+        "html_url": None,
+        "started_at": None,
+        "completed_at": None,
+    }
+
+
+def fake_head_sha(github_api: FakeAPI, *runs: Any) -> None:
+    """The two routes `evaluate_ci` reads: the pull request, then the check runs on its head."""
+    bodies = [run if isinstance(run, dict) else a_check_run_body(*run) for run in runs]
+    github_api.responds(
+        "GET", f"{PULLS}/{PR_NUMBER}", json=a_pull_request(head={"sha": HEAD_SHA, "ref": "fix"})
+    )
+    github_api.responds(
+        "GET",
+        f"/repos/{REPO}/commits/{HEAD_SHA}/check-runs",
+        json={"total_count": len(bodies), "check_runs": bodies},
+    )
+
+
+async def an_evaluation_job(
+    seed: Seed, enqueue: Enqueue, *, state: State = State.CI_RUNNING, **overrides: Any
+) -> int:
+    remediation_id = await seed(
+        state=state.value,
+        devin_session_id=SESSION_ID,
+        devin_session_url=SESSION_URL,
+        pr_number=PR_NUMBER,
+        pr_url=PR_URL,
+        **overrides,
+    )
+    await enqueue(JobKind.EVALUATE_CI, {"pr_number": PR_NUMBER}, remediation_id)
+    return remediation_id
+
+
+async def test_a_trivially_green_inherited_workflow_is_not_ci_green(
+    context: Context,
+    seed: Seed,
+    enqueue: Enqueue,
+    claim: Claim,
+    github_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The defect, through the handler.
+
+    On PR #9 `check-hold-label` concluded thirteen seconds after the pull request opened, Sentinel
+    moved to `CI_PASSED` and then straight to `IN_REVIEW`, and the scoped suite that judges the diff
+    had another three and a quarter minutes to run. Nothing here may reach `CI_PASSED`.
+    """
+    remediation_id = await an_evaluation_job(seed, enqueue)
+    fake_head_sha(github_api, *INHERITED)
+
+    await handlers.evaluate_ci(context, await claim())
+
+    remediation = await remediation_row(session_factory, remediation_id)
+    assert remediation.state == State.CI_RUNNING
+    assert remediation.ci_green_at is None
+
+
+async def test_a_failure_outside_our_workflow_does_not_resume_the_session(
+    context: Context,
+    seed: Seed,
+    enqueue: Enqueue,
+    claim: Claim,
+    devin_api: FakeAPI,
+    github_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`Dependency Review` fails on every pull request in the fork because the repository has no
+    dependency graph enabled. It reached Sentinel as `check_suite.completed` with conclusion
+    `failure`, moved the remediation `IN_REVIEW -> CI_FAILED`, and resumed the session five seconds
+    later — a fix cycle spent asking Devin to change a repository setting from a two-file diff.
+
+    It holds the pull request out of `CI_PASSED`, which is honest, and it resumes nothing.
+    """
+    remediation_id = await an_evaluation_job(seed, enqueue, state=State.IN_REVIEW)
+    fake_head_sha(
+        github_api, *INHERITED, *OUR_WORKFLOW, (GATE, "success"), ("dependency-review", "failure")
+    )
+
+    await handlers.evaluate_ci(context, await claim())
+
+    remediation = await remediation_row(session_factory, remediation_id)
+    assert remediation.state == State.IN_REVIEW
+    assert remediation.cycle == 0
+    assert not devin_api.sent("POST", MESSAGES)
+    assert [job.kind for job in await job_rows(session_factory)] == [JobKind.EVALUATE_CI]
+
+
+async def test_the_gate_failing_resumes_the_session(
+    context: Context,
+    seed: Seed,
+    enqueue: Enqueue,
+    claim: Claim,
+    github_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The other half: a rule that never reports failure is as broken as one that never reports
+    success. The resume job names the edge, because `enqueued_on_another_edge` reads it."""
+    remediation_id = await an_evaluation_job(seed, enqueue)
+    fake_head_sha(github_api, *INHERITED, *OUR_WORKFLOW, (GATE, "failure"))
+
+    await handlers.evaluate_ci(context, await claim())
+
+    assert (await remediation_row(session_factory, remediation_id)).state == State.CI_FAILED
+    [_, resume] = await job_rows(session_factory)
+    assert resume.kind == JobKind.RESUME_SESSION
+    assert resume.payload["trigger"] == "check_suite_failed"
+    assert resume.payload["head_sha"] == HEAD_SHA
+
+
+async def test_the_gate_failing_is_reported_without_waiting_for_the_rest(
+    context: Context,
+    seed: Seed,
+    enqueue: Enqueue,
+    claim: Claim,
+    github_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Holding a failure the session can act on until an unrelated Cypress shard finishes is
+    latency spent on nothing."""
+    remediation_id = await an_evaluation_job(seed, enqueue)
+    fake_head_sha(
+        github_api,
+        *OUR_WORKFLOW,
+        (GATE, "failure"),
+        a_check_run_body("cypress-matrix (chrome)", None, status="in_progress"),
+    )
+
+    await handlers.evaluate_ci(context, await claim())
+
+    assert (await remediation_row(session_factory, remediation_id)).state == State.CI_FAILED
+
+
+async def test_a_green_head_sha_passes_ci_and_asks_for_review(
+    context: Context,
+    seed: Seed,
+    enqueue: Enqueue,
+    claim: Claim,
+    github_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Entering `CI_PASSED` obliges the caller to apply `REVIEW_REQUESTED`, and each transition
+    writes its own `remediation_event` — invariant 4 of `docs/04-state-machine.md`."""
+    remediation_id = await an_evaluation_job(seed, enqueue)
+    fake_head_sha(github_api, *INHERITED, *OUR_WORKFLOW, (GATE, "success"))
+
+    await handlers.evaluate_ci(context, await claim())
+
+    remediation = await remediation_row(session_factory, remediation_id)
+    assert remediation.state == State.IN_REVIEW
+    assert remediation.ci_green_at is not None
+    assert [(event.from_state, event.to_state) for event in await event_rows(session_factory)] == [
+        (State.CI_RUNNING, State.CI_PASSED),
+        (State.CI_PASSED, State.IN_REVIEW),
+    ]
+
+
+async def test_a_second_evaluation_of_a_green_pull_request_writes_nothing(
+    context: Context,
+    seed: Seed,
+    enqueue: Enqueue,
+    claim: Claim,
+    github_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Every completed suite enqueues an evaluation, and 18 of them concluded on PR #9. Once the
+    remediation is in review the trigger absorbs, and an absorbed evaluation is not recorded — the
+    delivery rows are the trail, as they are for the poller re-reading the same session."""
+    green = datetime.datetime(2026, 8, 7, 16, 0, tzinfo=datetime.UTC)
+    remediation_id = await an_evaluation_job(
+        seed, enqueue, state=State.IN_REVIEW, ci_green_at=green
+    )
+    fake_head_sha(github_api, *INHERITED, *OUR_WORKFLOW, (GATE, "success"))
+
+    await handlers.evaluate_ci(context, await claim())
+
+    remediation = await remediation_row(session_factory, remediation_id)
+    assert remediation.state == State.IN_REVIEW
+    assert remediation.ci_green_at == green, "the first green, not this one"
+    assert await event_rows(session_factory) == []
+
+
+async def test_the_head_sha_comes_from_the_pull_request_not_the_payload(
+    context: Context,
+    seed: Seed,
+    enqueue: Enqueue,
+    claim: Claim,
+    github_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A payload SHA can be stale by the time the job is claimed: Devin pushes a fix, `concurrency`
+    cancels the previous run, and a cancelled run is complete-and-not-failing — the exact shape an
+    "all clear" rule reads as green. The pull request's own head is the only current answer."""
+    stale = "0" * 40
+    remediation_id = await seed(
+        state=State.CI_RUNNING.value,
+        devin_session_id=SESSION_ID,
+        pr_number=PR_NUMBER,
+        pr_url=PR_URL,
+    )
+    await enqueue(JobKind.EVALUATE_CI, {"pr_number": PR_NUMBER, "head_sha": stale}, remediation_id)
+    fake_head_sha(github_api, *OUR_WORKFLOW, (GATE, "success"))
+
+    await handlers.evaluate_ci(context, await claim())
+
+    assert (await remediation_row(session_factory, remediation_id)).state == State.IN_REVIEW
+    assert github_api.sent("GET", f"/repos/{REPO}/commits/{HEAD_SHA}/check-runs")
+    assert not github_api.sent("GET", f"/repos/{REPO}/commits/{stale}/check-runs")
+
+
+async def test_two_evaluations_of_the_same_head_sha_move_it_once(
+    context: Context,
+    seed: Seed,
+    enqueue: Enqueue,
+    claim: Claim,
+    github_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Every completed suite enqueues an evaluation, so two workers reading one green SHA is the
+    ordinary case rather than a rare race. The second must find a state its trigger absorbs from,
+    and must not re-apply `REVIEW_REQUESTED` — which is illegal from `IN_REVIEW` and would raise."""
+    remediation_id = await an_evaluation_job(seed, enqueue)
+    await enqueue(JobKind.EVALUATE_CI, {"pr_number": PR_NUMBER}, remediation_id)
+    fake_head_sha(github_api, *INHERITED, *OUR_WORKFLOW, (GATE, "success"))
+
+    await handlers.evaluate_ci(context, await claim())
+    await handlers.evaluate_ci(context, await claim())
+
+    assert (await remediation_row(session_factory, remediation_id)).state == State.IN_REVIEW
+    assert [(event.from_state, event.to_state) for event in await event_rows(session_factory)] == [
+        (State.CI_RUNNING, State.CI_PASSED),
+        (State.CI_PASSED, State.IN_REVIEW),
+    ]
+
+
+async def test_an_evaluation_for_a_merged_remediation_calls_nothing(
+    context: Context,
+    seed: Seed,
+    enqueue: Enqueue,
+    claim: Claim,
+    github_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Suites keep concluding after a merge — seven did on PR #9. Each would otherwise buy two
+    GitHub calls to be told the remediation is over."""
+    await an_evaluation_job(seed, enqueue, state=State.MERGED)
+
+    await handlers.evaluate_ci(context, await claim())
+
+    assert not github_api.requests
+    [job] = await job_rows(session_factory)
+    assert job.status == JobStatus.DONE
+    assert await event_rows(session_factory) == []
 
 
 async def test_every_job_kind_has_a_handler() -> None:

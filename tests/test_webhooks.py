@@ -467,20 +467,24 @@ CASES: tuple[Case, ...] = (
         overrides={"action": "requested"},
         result="ignored",
     ),
+    # Both conclusions do the same thing here, and it is not a transition. The conclusion belongs
+    # to one of the fork's 46 workflows, so the ingress hands the question to `evaluate_ci` and the
+    # state is left where it was until a worker has read the whole head SHA.
     Case(
-        "check_suite success passes CI and asks for review",
+        "check_suite success asks for an evaluation",
         "check_suite.completed.success",
-        "IN_REVIEW",
+        "CI_RUNNING",
         seed=linked(state="CI_RUNNING"),
-        result="ignored",
-        events=2,
+        jobs=(JobKind.EVALUATE_CI,),
+        events=0,
     ),
     Case(
-        "check_suite failure resumes",
+        "check_suite failure asks for an evaluation too",
         "check_suite.completed.failure",
-        "CI_FAILED",
+        "CI_RUNNING",
         seed=linked(state="CI_RUNNING"),
-        jobs=(JobKind.RESUME_SESSION,),
+        jobs=(JobKind.EVALUATE_CI,),
+        events=0,
     ),
     Case(
         "issue_comment forwards to the session",
@@ -603,19 +607,21 @@ async def test_the_create_session_job_carries_the_delivery_id(
     assert job.payload["repo"] == REPO
 
 
-async def test_a_resume_job_carries_the_commit_ci_failed_on(
+async def test_an_evaluation_job_carries_the_pull_request_it_is_about(
     client: httpx.AsyncClient, delivery: DeliveryFactory, session: AsyncSession
 ) -> None:
-    """The resume message names the commit CI failed on, and nothing else in the payload can."""
+    """`evaluate_ci` looks the head SHA up for itself — a payload SHA can be stale by the time the
+    job is claimed — but it needs to know which pull request to ask about."""
     await seed(session, **linked(state="CI_RUNNING"))
 
     await post(client, delivery("check_suite.completed.failure"))
 
     job = await one(session, Job)
-    assert job.kind == JobKind.RESUME_SESSION
-    assert job.payload["trigger"] == "check_suite_failed"
-    assert job.payload["head_sha"] == "349a7f639dfb353669c001187706d7fd0112ed2f"
+    assert job.kind == JobKind.EVALUATE_CI
     assert job.payload["pr_number"] == PR_NUMBER
+    assert job.payload["intent"] == "evaluate_ci"
+    # No trigger: nothing was decided here. The worker chooses one from the whole head SHA.
+    assert "trigger" not in job.payload
 
 
 async def test_a_forwarded_comment_carries_no_trigger(
@@ -633,65 +639,85 @@ async def test_a_forwarded_comment_carries_no_trigger(
     assert job.payload["intent"] == "forward_comment"
 
 
-async def test_a_green_check_suite_walks_on_to_review(
-    client: httpx.AsyncClient, delivery: DeliveryFactory, session: AsyncSession
+@pytest.mark.parametrize("conclusion", ["success", "failure"])
+async def test_a_completed_check_suite_moves_nothing_by_itself(
+    conclusion: str,
+    client: httpx.AsyncClient,
+    delivery: DeliveryFactory,
+    session: AsyncSession,
 ) -> None:
-    """Entering `CI_PASSED` obliges the caller to apply `REVIEW_REQUESTED`, and each transition
-    writes its own `remediation_event`."""
+    """The heart of the change. Whatever a suite concluded, the ingress writes no transition and no
+    `remediation_event`: the conclusion is one of the fork's 46 workflows talking, and until a
+    worker has read every check run on the head SHA there is nothing to say about the pull request.
+
+    Sentinel used to move to `CI_PASSED` here — on the first live remediation, off a workflow that
+    checks for a `hold` label, three seconds after the pull request opened.
+    """
     await seed(session, **linked(state="CI_RUNNING"))
 
-    await post(client, delivery("check_suite.completed.success"))
-
-    remediation = await one(session, Remediation)
-    assert remediation.state == "IN_REVIEW"
-    assert remediation.ci_green_at is not None
-    events = await rows(session, RemediationEvent)
-    assert [(event.from_state, event.to_state) for event in events] == [
-        ("CI_RUNNING", "CI_PASSED"),
-        ("CI_PASSED", "IN_REVIEW"),
-    ]
-
-
-async def test_a_second_green_check_suite_in_review_is_absorbed(
-    client: httpx.AsyncClient, delivery: DeliveryFactory, session: AsyncSession
-) -> None:
-    """`REVIEW_REQUESTED` is legal from `CI_PASSED` alone, so the automatic trigger must not fire
-    for a success the state already has — it would raise, and a `5xx` would be redelivered."""
-    green = datetime.datetime(2026, 8, 7, 16, 0, tzinfo=datetime.UTC)
-    await seed(session, **linked(state="IN_REVIEW", ci_green_at=green))
-
-    response = await post(client, delivery("check_suite.completed.success"))
+    response = await post(client, delivery(f"check_suite.completed.{conclusion}"))
 
     assert response.status_code == 202
     remediation = await one(session, Remediation)
-    assert remediation.state == "IN_REVIEW"
-    # The first successful suite, not this one.
-    assert remediation.ci_green_at == green
+    assert remediation.state == "CI_RUNNING"
+    assert remediation.ci_green_at is None
+    assert await count(session, RemediationEvent) == 0
+    job = await one(session, Job)
+    assert job.kind == JobKind.EVALUATE_CI
+
+
+@pytest.mark.parametrize("state", ["BLOCKED", "FAILED"])
+async def test_a_merge_is_stamped_even_where_it_moves_nothing(
+    state: str,
+    client: httpx.AsyncClient,
+    delivery: DeliveryFactory,
+    session: AsyncSession,
+) -> None:
+    """Remediation 1 sat in `BLOCKED` while a human resolved the escalation by merging its pull
+    request. `PR_MERGED` is legal only from `IN_REVIEW`, so a terminal state absorbed it,
+    `merged_at` was never stamped, and the funnel reported `merged: 0` beside a link to a pull
+    request GitHub shows as merged.
+
+    The state is deliberately left alone — flattening it to `MERGED` would erase the escalation,
+    which is a real thing that happened. Only the observation is recorded.
+    """
+    await seed(session, **linked(state=state))
+
+    response = await post(client, delivery("pull_request.closed.merged"))
+
+    assert response.status_code == 202
+    remediation = await one(session, Remediation)
+    assert remediation.state == state, "a merge does not undo an escalation"
+    assert remediation.merged_at is not None, "but it is still a merge, and it is recorded"
     event = await one(session, RemediationEvent)
-    assert (event.from_state, event.to_state) == ("IN_REVIEW", "IN_REVIEW")
-    assert event.detail["absorbed"] is True
-    assert await count(session, Job) == 0
+    assert (event.from_state, event.to_state) == (state, state)
+    assert event.detail["trigger"] == "pr_merged"
 
 
-async def test_a_check_suite_re_run_that_goes_green_keeps_the_first_green_time(
+async def test_a_merge_observed_twice_keeps_the_first_time(
     client: httpx.AsyncClient, delivery: DeliveryFactory, session: AsyncSession
 ) -> None:
-    """`ci_green_at` is the *first* successful suite, and `CI_FAILED -> CI_PASSED` really moves."""
-    green = datetime.datetime(2026, 8, 7, 16, 0, tzinfo=datetime.UTC)
-    await seed(session, **linked(state="CI_FAILED", ci_green_at=green))
+    """`merged_at` is when the pull request was merged, not when the latest delivery about it
+    arrived — MTTR and review latency are both subtractions from it."""
+    merged = datetime.datetime(2026, 8, 7, 16, 0, tzinfo=datetime.UTC)
+    await seed(session, **linked(state="BLOCKED", merged_at=merged))
 
-    await post(client, delivery("check_suite.completed.success"))
+    await post(client, delivery("pull_request.closed.merged"))
 
     remediation = await one(session, Remediation)
-    assert remediation.state == "IN_REVIEW"
-    assert remediation.ci_green_at == green
+    assert remediation.merged_at == merged
 
 
-async def test_a_late_webhook_against_a_terminal_remediation_is_recorded_and_ignored(
+async def test_a_check_suite_completing_after_a_merge_asks_for_nothing(
     client: httpx.AsyncClient, delivery: DeliveryFactory, session: AsyncSession
 ) -> None:
-    """Terminal states are absorbing (`docs/04-state-machine.md`, invariant 1): the event is real
-    and belongs in the log, and nothing else happens."""
+    """Terminal states are absorbing (`docs/04-state-machine.md`, invariant 1). There is no
+    transition to record and nothing an evaluation could change, so no job is enqueued — the
+    delivery's own row is where a suite arriving after a merge is visible.
+
+    Seven suites were still concluding on PR #9 nine minutes after it went to review, and on a
+    merged remediation each of them would otherwise buy two GitHub calls to reach the same answer.
+    """
     await seed(session, **linked(state="MERGED"))
 
     response = await post(client, delivery("check_suite.completed.failure"))
@@ -699,9 +725,8 @@ async def test_a_late_webhook_against_a_terminal_remediation_is_recorded_and_ign
     assert response.status_code == 202
     remediation = await one(session, Remediation)
     assert remediation.state == "MERGED"
-    event = await one(session, RemediationEvent)
-    assert (event.from_state, event.to_state) == ("MERGED", "MERGED")
     assert await count(session, Job) == 0
+    assert await count(session, RemediationEvent) == 0
 
 
 async def test_a_comment_on_a_terminal_remediation_forwards_nothing(
@@ -876,13 +901,19 @@ async def test_a_remediation_walks_from_label_to_merge(
         remediation.pr_url = PR_URL
         await other.commit()
 
+    # Both check suites ask for an evaluation and neither moves the remediation: the verdict is a
+    # worker's to reach (`tests/test_worker.py`), and this test is about the ingress. The states
+    # between are applied directly for the same reason the poller's two steps are.
     await post(client, delivery("check_suite.completed.failure", delivery_id=SECOND_DELIVERY))
-    failed = await one(session, Remediation)
-    assert failed.state == "CI_FAILED"
+    asked = await one(session, Remediation)
+    assert asked.state == "PR_OPENED"
+
+    async with session_factory() as other:
+        remediation = (await other.scalars(select(Remediation))).one()
+        remediation.state = "IN_REVIEW"
+        await other.commit()
 
     await post(client, delivery("check_suite.completed.success", delivery_id=THIRD_DELIVERY))
-    green = await one(session, Remediation)
-    assert green.state == "IN_REVIEW"
 
     await post(
         client,
@@ -893,11 +924,11 @@ async def test_a_remediation_walks_from_label_to_merge(
     assert merged.merged_at is not None
 
     kinds = [job.kind for job in await rows(session, Job)]
-    assert kinds == [JobKind.CREATE_SESSION, JobKind.RESUME_SESSION]
+    assert kinds == [JobKind.CREATE_SESSION, JobKind.EVALUATE_CI, JobKind.EVALUATE_CI]
     assert await count(session, WebhookDelivery) == 4
     assert [row.handler_result for row in await rows(session, WebhookDelivery)] == [
         "enqueued",
         "enqueued",
-        "ignored",
+        "enqueued",
         "ignored",
     ]

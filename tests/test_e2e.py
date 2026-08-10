@@ -90,6 +90,8 @@ PR_URL = f"https://github.com/{REPO}/pull/{PR_NUMBER}"
 DEVIN_PULL_REQUESTS = [{"pr_url": PR_URL, "pr_state": "open"}]
 
 RUN_ID = 84410727864
+WORKFLOW_PATH = ".github/workflows/devin-autofix-ci.yml"
+GATE_NAME = "devin-autofix-ci"
 CI_JOB_ID = 231855142299
 CI_JOB_NAME = "pytest"
 CI_LOG_TAIL = "E   AssertionError: expected ColumnNotFoundException, got SupersetGenericDBError"
@@ -99,6 +101,8 @@ CI_LOG_TAIL = "E   AssertionError: expected ColumnNotFoundException, got Superse
 LABELLED = "0b1c8e40-7d3a-11f1-9c2e-4f6a1d8b3e57"
 CI_FAILED = "1c2d9f51-8e4b-22a2-ad3f-5a7b2e9c4f68"
 CI_PASSED = "2d3ea062-9f5c-33b3-be40-6b8c3fad5a79"
+TRIVIALLY_GREEN = "5a61d395-c28f-66e6-e173-9ebf6cd08dac"
+CI_PENDING = "6b72e4a6-d390-77f7-f284-af0a7de19ebd"
 APPROVED = "3e4fb173-a06d-44c4-cf51-7c9d4abe6b8a"
 MERGED = "4f50c284-b17e-55d5-d062-8dae5bcf7c9b"
 
@@ -221,11 +225,63 @@ def a_session(**overrides: Any) -> httpx.Response:
 def a_workflow_run() -> dict[str, Any]:
     return {
         "id": RUN_ID,
+        "path": WORKFLOW_PATH,
         "head_sha": HEAD_SHA,
         "status": "completed",
         "conclusion": "failure",
         "run_started_at": "2026-08-07T15:11:55Z",
     }
+
+
+def a_check_run(name: str, conclusion: str | None, status: str = "completed") -> dict[str, Any]:
+    return {
+        "id": abs(hash((name, conclusion, status))) % 10**10,
+        "name": name,
+        "status": status,
+        "conclusion": conclusion,
+        "html_url": f"https://github.com/{REPO}/runs/1",
+        "started_at": "2026-08-07T15:12:04Z",
+        "completed_at": None if status != "completed" else "2026-08-07T15:19:41Z",
+    }
+
+
+def the_head_sha_looks_like(github_api: FakeAPI, *runs: dict[str, Any]) -> None:
+    """What `evaluate_ci` reads: the pull request, then every check run on its head.
+
+    Both routes, because the SHA comes from the pull request rather than from the job payload — a
+    payload SHA can be stale by the time the job is claimed.
+    """
+    github_api.responds("GET", f"/repos/{REPO}/pulls/{PR_NUMBER}", json=a_pull_request())
+    github_api.responds(
+        "GET",
+        f"/repos/{REPO}/commits/{HEAD_SHA}/check-runs",
+        json={"total_count": len(runs), "check_runs": list(runs)},
+    )
+
+
+def a_pull_request() -> dict[str, Any]:
+    pull_request = github_payload("pull_request.opened")["pull_request"]
+    return {**pull_request, "number": PR_NUMBER, "head": {**pull_request["head"], "sha": HEAD_SHA}}
+
+
+# The inherited workflows of `taxpon/superset`, which conclude in seconds and say nothing about the
+# diff. On the first live remediation the first of these was what Sentinel called CI green.
+INHERITED_AND_GREEN = [
+    a_check_run("check-hold-label", "success"),
+    a_check_run("labeler", "success"),
+    a_check_run("unit-tests-required", "success"),
+]
+
+
+# Our own workflow, all five jobs. `pytest (scoped)` skips on a frontend-only diff by design.
+def our_workflow(gate: str) -> list[dict[str, Any]]:
+    return [
+        a_check_run("Resolve scope from the diff", "success"),
+        a_check_run("pre-commit (changed files)", "success"),
+        a_check_run("jest (scoped)", "success"),
+        a_check_run("pytest (scoped)", "skipped"),
+        a_check_run(GATE_NAME, gate),
+    ]
 
 
 def a_ci_job() -> dict[str, Any]:
@@ -365,13 +421,34 @@ async def test_what_sentinel_sends_across_a_whole_remediation(
     assert remediation.structured_output is not None
     assert remediation.structured_output["outcome"] == "fixed"
 
+    # --- A trivial inherited workflow concludes first, and it is not CI. ---
+    #
+    # This is the defect the aggregate replaced, in the shape it occurred: on PR #9 the first suite
+    # to conclude was a workflow checking for a `hold` label, thirteen seconds after the pull
+    # request opened, and Sentinel read its `success` as CI green — `CI_PASSED`, then `IN_REVIEW`,
+    # with the scoped suite that judges the diff still three minutes from finishing.
+    the_head_sha_looks_like(github_api, *INHERITED_AND_GREEN)
+    answer = await pipeline.deliver(
+        delivery("check_suite.completed.success", delivery_id=TRIVIALLY_GREEN)
+    )
+    assert (answer["result"], answer["state"]) == ("enqueued", State.PR_OPENED)
+
+    await pipeline.work()
+    remediation = await the_remediation(session_factory)
+    assert remediation.state == State.CI_RUNNING
+    assert remediation.ci_green_at is None
+
     # --- CI fails on the head commit. The suite finds the remediation through `pr_number`. ---
+    the_head_sha_looks_like(github_api, *INHERITED_AND_GREEN, *our_workflow(gate="failure"))
     answer = await pipeline.deliver(
         delivery("check_suite.completed.failure", delivery_id=CI_FAILED)
     )
-    assert (answer["result"], answer["state"]) == ("enqueued", State.CI_FAILED)
+    assert (answer["result"], answer["state"]) == ("enqueued", State.CI_RUNNING)
 
-    [_, resume_job] = await the_jobs(session_factory)
+    await pipeline.work()
+    assert (await the_remediation(session_factory)).state == State.CI_FAILED
+
+    [*_, resume_job] = await the_jobs(session_factory)
     assert resume_job.kind == JobKind.RESUME_SESSION
     assert resume_job.payload["head_sha"] == HEAD_SHA
 
@@ -403,14 +480,38 @@ async def test_what_sentinel_sends_across_a_whole_remediation(
     assert remediation.state == State.RUNNING
     assert remediation.cycle == 1
 
-    # --- CI passes on the fix. Entering `CI_PASSED` fires `REVIEW_REQUESTED` itself, so one
-    # delivery writes two transitions. ---
+    # --- CI passes on the fix, but one inherited check is still running. Not green yet. ---
+    the_head_sha_looks_like(
+        github_api,
+        *INHERITED_AND_GREEN,
+        *our_workflow(gate="success"),
+        a_check_run("cypress-matrix (chrome)", None, status="in_progress"),
+    )
+    await pipeline.deliver(delivery("check_suite.completed.success", delivery_id=CI_PENDING))
+    await pipeline.work()
+
+    # `CI_RUNNING`, not `CI_PASSED`: the gate has passed but the SHA is still owed a check, and
+    # `CI_RUNNING` is what "the pull request has checks outstanding" now means.
+    remediation = await the_remediation(session_factory)
+    assert remediation.state == State.CI_RUNNING
+    assert remediation.ci_green_at is None
+
+    # --- The last check finishes. Entering `CI_PASSED` fires `REVIEW_REQUESTED` itself, so one
+    # evaluation writes two transitions. ---
+    the_head_sha_looks_like(
+        github_api,
+        *INHERITED_AND_GREEN,
+        *our_workflow(gate="success"),
+        a_check_run("cypress-matrix (chrome)", "success"),
+    )
     answer = await pipeline.deliver(
         delivery("check_suite.completed.success", delivery_id=CI_PASSED)
     )
-    assert (answer["result"], answer["state"]) == ("ignored", State.IN_REVIEW)
+    assert (answer["result"], answer["state"]) == ("enqueued", State.CI_RUNNING)
 
+    await pipeline.work()
     remediation = await the_remediation(session_factory)
+    assert remediation.state == State.IN_REVIEW
     assert remediation.ci_green_at is not None
 
     # --- A human approves. Recorded, and nothing moves. ---
@@ -434,10 +535,15 @@ async def test_what_sentinel_sends_across_a_whole_remediation(
         (State.QUEUED, State.SESSION_CREATED, "worker"),
         (State.SESSION_CREATED, State.RUNNING, "poller"),
         (State.RUNNING, State.PR_OPENED, "poller"),
-        (State.PR_OPENED, State.CI_FAILED, "webhook"),
+        # Every CI transition is now the worker's: the ingress reaches no verdict, so it writes no
+        # row. The five deliveries that asked for an evaluation are in `webhook_delivery`, and the
+        # four that changed nothing appear here not at all.
+        (State.PR_OPENED, State.CI_RUNNING, "worker"),
+        (State.CI_RUNNING, State.CI_FAILED, "worker"),
         (State.CI_FAILED, State.RUNNING, "worker"),
-        (State.RUNNING, State.CI_PASSED, "webhook"),
-        (State.CI_PASSED, State.IN_REVIEW, "webhook"),
+        (State.RUNNING, State.CI_RUNNING, "worker"),
+        (State.CI_RUNNING, State.CI_PASSED, "worker"),
+        (State.CI_PASSED, State.IN_REVIEW, "worker"),
         (State.IN_REVIEW, State.MERGED, "webhook"),
     ]
     # The delivery is the correlation id end to end, so a transition a webhook caused names the
@@ -446,7 +552,9 @@ async def test_what_sentinel_sends_across_a_whole_remediation(
         (event.detail or {})["source"] == "webhook" for event in events
     ]
     # The two rows of one transaction: `created_at` cannot order them, which is why `id` does.
-    assert events[6].created_at == events[7].created_at
+    green, review = events[-3], events[-2]
+    assert (green.to_state, review.to_state) == (State.CI_PASSED, State.IN_REVIEW)
+    assert green.created_at == review.created_at
 
     resumed = next(event for event in events if event.from_state == State.CI_FAILED)
     assert (resumed.detail or {})["cycle"] == 1
@@ -454,7 +562,11 @@ async def test_what_sentinel_sends_across_a_whole_remediation(
     # --- Nothing was escalated, and nothing is still owed. ---
     assert [(job.kind, job.status) for job in await the_jobs(session_factory)] == [
         (JobKind.CREATE_SESSION, JobStatus.DONE),
+        (JobKind.EVALUATE_CI, JobStatus.DONE),
+        (JobKind.EVALUATE_CI, JobStatus.DONE),
         (JobKind.RESUME_SESSION, JobStatus.DONE),
+        (JobKind.EVALUATE_CI, JobStatus.DONE),
+        (JobKind.EVALUATE_CI, JobStatus.DONE),
     ]
 
     # --- The dashboard's own account of it. ---
@@ -547,14 +659,18 @@ async def test_a_check_suite_that_arrives_after_the_merge_is_absorbed(
     """A suite queued before the merge can be delivered after it. Nobody is at fault, and
     re-engaging a merged remediation would spend a session on work that is already done.
 
-    Absorbing is not discarding: a `MERGED -> MERGED` row is appended, so a delivery that arrived
-    late is answerable from the log rather than invisible in it. What must not happen is a move, or
-    a job.
+    Nothing at all is written for it. While a conclusion was a verdict, this appended a
+    `MERGED -> MERGED` row; now the ingress reaches no verdict and there is no transition to
+    absorb, so the delivery's own row in `webhook_delivery` is where a late suite is visible. Seven
+    suites were still concluding on PR #9 nine minutes after review was requested, and each would
+    otherwise buy two GitHub calls to be told the remediation is over.
     """
     await a_labelled_remediation(pipeline, delivery, devin_api, github_api)
     devin_api.route("GET", SESSION).mock(return_value=a_session(pull_requests=DEVIN_PULL_REQUESTS))
     await pipeline.poll()
+    the_head_sha_looks_like(github_api, *INHERITED_AND_GREEN, *our_workflow(gate="success"))
     await pipeline.deliver(delivery("check_suite.completed.success", delivery_id=CI_PASSED))
+    await pipeline.work()
     await pipeline.deliver(delivery("pull_request.closed.merged", delivery_id=MERGED))
     assert (await the_remediation(session_factory)).state == State.MERGED
     before = [(event.from_state, event.to_state) for event in await the_events(session_factory)]
@@ -563,8 +679,7 @@ async def test_a_check_suite_that_arrives_after_the_merge_is_absorbed(
     assert (await pipeline.deliver(late))["result"] == "ignored"
 
     assert (await the_remediation(session_factory)).state == State.MERGED
-    assert [(event.from_state, event.to_state) for event in await the_events(session_factory)] == [
-        *before,
-        (State.MERGED, State.MERGED),
-    ]
+    assert [
+        (event.from_state, event.to_state) for event in await the_events(session_factory)
+    ] == before
     assert await worker.run_once(pipeline.context, claimed_by=WORKER_ID) is False

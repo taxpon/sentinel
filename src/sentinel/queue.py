@@ -61,12 +61,16 @@ class JobStatus(StrEnum):
 
 
 class JobKind(StrEnum):
-    """The four kinds of work in `docs/06-event-pipeline.md#jobs-and-claiming`."""
+    """The five kinds of work in `docs/06-event-pipeline.md#jobs-and-claiming`."""
 
     CREATE_SESSION = "create_session"
     RESUME_SESSION = "resume_session"
     ESCALATE = "escalate"
     SYNC_ACU = "sync_acu"
+    # The only kind whose entire purpose is to make a read the ingress path may not make. A
+    # `check_suite.completed` delivery says CI *may* have moved; what it moved to takes a call to
+    # GitHub, and the webhook makes none.
+    EVALUATE_CI = "evaluate_ci"
 
 
 BACKOFF_BASE: Final = datetime.timedelta(seconds=5)

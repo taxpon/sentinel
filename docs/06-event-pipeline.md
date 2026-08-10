@@ -16,8 +16,7 @@ A single GitHub webhook on `taxpon/superset` delivering to `POST /webhooks/githu
 | `pull_request_review` | `submitted`, state `changes_requested` | **Resume the session** with the review |
 | `pull_request_review` | `submitted`, state `approved` | Record review latency |
 | `check_suite` | `requested` | `CI_RUNNING` |
-| `check_suite` | `completed`, conclusion `success` | `CI_PASSED` |
-| `check_suite` | `completed`, conclusion `failure` / `timed_out` | **Resume the session** with the failure |
+| `check_suite` | `completed`, **any** conclusion | Enqueue `evaluate_ci`. The conclusion is one of the fork's 46 workflows talking and is not the CI verdict ([04](./04-state-machine.md#what-ci-green-means)) |
 | `issue_comment` | `created` | If it mentions the bot, forward to the session and count as human intervention |
 | `ping` | — | Acknowledge, take no action |
 
@@ -109,6 +108,7 @@ mid-job does not strand its work.
 | `resume_session` | Gather CI logs or review comments, then `POST /v3/…/messages` |
 | `escalate` | Comment on the issue, apply `needs-human` |
 | `sync_acu` | Refresh `acu_ledger` from the consumption API |
+| `evaluate_ci` | Read every check run on the pull request's head, and apply the verdict |
 
 ## Reliability policy
 

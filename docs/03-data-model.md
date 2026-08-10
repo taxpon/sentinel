@@ -191,6 +191,12 @@ which is what lets one row speak for all of them.
 The columns on `remediation` exist so that the headline durations are a subtraction, not a window
 function over the event log. The event log remains authoritative for anything finer-grained.
 
+**Every funnel stage is counted from its timestamp, never from `state`.** A remediation has reached
+a stage when the column exists. That is what lets `BLOCKED` with a `merged_at` — an escalation that
+a human resolved by merging — count as merged in the funnel *and* still appear in the failure
+breakdown, which is the truth about it in both directions. `merged_at` is stamped from any state for
+exactly this reason ([04](./04-state-machine.md#invariants), invariant 1).
+
 | Metric | Expression |
 |---|---|
 | Time to session | `session_created_at − labeled_at` |
