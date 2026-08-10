@@ -294,8 +294,8 @@ async def test_creates_every_note_with_a_name_a_trigger_and_a_body(
 async def test_records_the_note_ids_in_env(
     devin: DevinClient, settings: Settings, env: Any, env_path: Path, wired: FakeAPI
 ) -> None:
-    """`DEVIN_KNOWLEDGE_IDS` is what every session's `knowledge_ids` comes from, and — since no
-    endpoint lists the notes — the only record that they exist at all."""
+    """`DEVIN_KNOWLEDGE_IDS` is what every session's `knowledge_ids` comes from, and the only
+    record this script consults that the notes exist at all."""
     report = await run(devin, settings, env)
 
     assert json.loads(env_value(env_path, bootstrap_devin.KNOWLEDGE_IDS) or "") == list(NOTE_IDS)

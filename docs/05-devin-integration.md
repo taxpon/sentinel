@@ -9,24 +9,42 @@ Base URL `https://api.devin.ai`, authenticated with a service-user token
 
 ## Endpoints used
 
-| Method | Path | Used for |
-|---|---|---|
-| `POST` | `/v3/organizations/{org_id}/sessions` | Create a remediation session |
-| `GET` | `/v3/organizations/{org_id}/sessions/{devin_id}` | Poller reconciliation — status, ACUs, structured output, PRs |
-| `GET` | `/v3/organizations/{org_id}/sessions` | Backfill and in-flight listing |
-| `POST` | `/v3/organizations/{org_id}/sessions/{devin_id}/messages` | Review-fix loop: feed CI logs and reviewer feedback |
-| `POST` | `/v3/organizations/{org_id}/sessions/{devin_id}/tags` | Append lifecycle tags (`cycle:N`, `outcome:merged`) |
-| `PUT` | `/v3/organizations/{org_id}/tags` | Register the organisation's allowed tag vocabulary at bootstrap |
-| `GET` | `/v3/enterprise/organizations/{org_id}/tags` | Read the vocabulary that registration would replace — `bootstrap_devin.py --dry-run` only |
-| `POST` | `/v3/organizations/{org_id}/knowledge/notes` | Seed repository conventions once at bootstrap |
-| `POST` | `/v3/organizations/{org_id}/schedules` | Nightly vulnerability sweep |
-| `GET` | `/v3/organizations/{org_id}/playbooks` | Read back the ids of the hand-made playbooks — `make devin-playbooks` |
-| `GET` | `/v3/organizations/{org_id}/consumption/daily` | Daily ACU spend for the budget guard and cost panel |
-| `GET` | `/v3/enterprise/metrics/sessions` | Merged-PR and ACU aggregates — *enterprise scope, optional* |
+Every row names the OpenAPI schemas the v3 reference gives for that endpoint, and the permission it
+requires. **Nothing here has been observed live** ([B8](./blockers.md#b8)): the whole table is
+*verified against the reference* and nothing more, and where the reference is silent the section
+below says so in as many words.
+
+| Method | Path | Used for | Request → response schema · permission |
+|---|---|---|---|
+| `POST` | `/v3/organizations/{org_id}/sessions` | Create a remediation session | `SessionCreateRequest` → `SessionResponse` · `ManageOrgSessions` |
+| `GET` | `/v3/organizations/{org_id}/sessions/{devin_id}` | Poller reconciliation — status, ACUs, structured output, PRs | — → `SessionResponse` · `ViewOrgSessions` |
+| `GET` | `/v3/organizations/{org_id}/sessions` | Backfill and in-flight listing | `SessionsQueryParams` → `PaginatedResponse[SessionResponse]` · `ViewOrgSessions` |
+| `POST` | `/v3/organizations/{org_id}/sessions/{devin_id}/messages` | Review-fix loop: feed CI logs and reviewer feedback | `SessionMessageCreateRequest` → `SessionResponse` · `ManageOrgSessions` |
+| `POST` | `/v3/organizations/{org_id}/sessions/{devin_id}/tags` | Append lifecycle tags (`cycle:N`, `outcome:merged`) | `SessionTagsUpdateRequest` → `SessionTagsResponse` · permission not stated |
+| `PUT` | `/v3/organizations/{org_id}/tags` | Register the organisation's allowed tag vocabulary at bootstrap | **undocumented path** — see below |
+| `GET` | `/v3/enterprise/organizations/{org_id}/tags` | Read the vocabulary that registration would replace — `bootstrap_devin.py --dry-run` only | — → `TagsResponse` · `ManageEnterpriseSettings` |
+| `POST` | `/v3/organizations/{org_id}/knowledge/notes` | Seed repository conventions once at bootstrap | `KnowledgeNoteCreateRequest` → `KnowledgeNoteResponse` · `ManageAccountKnowledge` |
+| `POST` | `/v3/organizations/{org_id}/schedules` | Nightly vulnerability sweep | `ScheduleCreateRequest` → `ScheduleResponse` · `ManageOrgSchedules` |
+| `GET` | `/v3/organizations/{org_id}/playbooks` | Read back the ids of the hand-made playbooks — `make devin-playbooks` | — → `PaginatedResponse[PlaybookResponse]` · `ManageAccountPlaybooks` |
+| `GET` | `/v3/organizations/{org_id}/consumption/daily` | Daily ACU spend for the budget guard and cost panel | — → `ConsumptionResponse` · `ViewOrgConsumption` |
+| `GET` | `/v3/enterprise/metrics/sessions` | Merged-PR and ACU aggregates — *enterprise scope, optional* | — → `SessionMetricsResponse` · `ViewAccountMetrics` |
 
 The last row requires enterprise scope and the `ViewAccountMetrics` permission. Sentinel treats it
 as an enhancement, not a dependency — see [Degradation](#degradation) and
 [B5](./blockers.md).
+
+Three things the reference states that are easy to get wrong from the paths alone:
+
+- **The path parameter is `devin_id`, not the session id.** Every per-session row above is
+  documented as `{devin_id}`, described as "Devin session ID (prefix: `devin-`)", with a note that
+  "the `devin_id` is the session ID prefixed with `devin-`". Whether `SessionResponse.session_id`
+  already carries that prefix — in which case the two are the same string — the reference does not
+  say. Sentinel passes `session_id` through unchanged. *Unobserved*, and the first thing a live
+  `GET` settles.
+- **The three listings return `PaginatedResponse[T]`**, whose array is `items` and which also
+  carries `has_next_page` and `end_cursor`. Sentinel reads one page of each and follows no cursor.
+- **Both the enterprise metrics window parameters are required.** `time_before` and `time_after`
+  are the only `required: true` query parameters in this table.
 
 **The two tag rows are not a matched pair, and that is unresolved.** The v3 reference documents the
 allowed-tag vocabulary at `/v3/enterprise/organizations/{org_id}/tags` — `GET` to read it, `PUT` to
@@ -49,33 +67,55 @@ the path nor the method of the registration itself is changed by that preview
 
 ## Creating a session
 
-`POST /v3/organizations/{org_id}/sessions`. Field-by-field mapping from Sentinel state:
+`POST /v3/organizations/{org_id}/sessions`, body `SessionCreateRequest`. Field-by-field mapping
+from Sentinel state, with what the reference says each field is. `prompt` is the schema's **only**
+required field; every other row below is Sentinel choosing to send something.
 
-| Devin field | Sentinel value |
-|---|---|
-| `prompt` | Rendered from the class prompt template (below) |
-| `title` | `[sentinel] #<issue> <issue title>` |
-| `tags` | The tag set below |
-| `repos` | `["taxpon/superset"]` |
-| `playbook_id` | `PLAYBOOK_IDS[issue_class]`, falling back to `PLAYBOOK_IDS[playbook_name]` — four playbooks serve eight classes, so either key resolves ([ADR](./adr/2026-08-08-playbook-ids-keyed-by-class-or-name.md)) |
-| `knowledge_ids` | The bootstrap note ids |
-| `structured_output_schema` | The schema below |
-| `structured_output_required` | `true` |
-| `max_acu_limit` | `ACU_CAPS[issue_class]` |
-| `resumable` | `true` — required for the review-fix loop |
+| Devin field | Sentinel value | Reference |
+|---|---|---|
+| `prompt` | Rendered from the class prompt template (below) | `string`, required |
+| `title` | `[sentinel] #<issue> <issue title>` | `string?` |
+| `tags` | The tag set below | `string[]?` |
+| `repos` | `["taxpon/superset"]` | `string[]?` |
+| `playbook_id` | `PLAYBOOK_IDS[issue_class]`, falling back to `PLAYBOOK_IDS[playbook_name]` — four playbooks serve eight classes, so either key resolves ([ADR](./adr/2026-08-08-playbook-ids-keyed-by-class-or-name.md)) | `string?` |
+| `knowledge_ids` | The bootstrap note ids | `string[]?` |
+| `structured_output_schema` | The schema below | `object?` — JSON Schema draft 7, max 64 KB, no external `$ref` |
+| `structured_output_required` | `true` | `boolean?`, documented as defaulting to true |
+| `max_acu_limit` | `ACU_CAPS[issue_class]` | `integer?` |
+| `resumable` | `true` — required for the review-fix loop | `boolean`, default `true` |
 
 `repos` names the repository but does not grant access to it — Devin clones, pushes and opens the
 pull request under its own GitHub connection, which is not `GITHUB_TOKEN` and is configured in Devin
 rather than here ([B15](./blockers.md#b15)).
 
-Response fields consumed: `session_id`, `url`, `status`, `tags`, `acus_consumed`,
-`pull_requests[]`. On `GET`, additionally `structured_output` and `status_detail` — the latter
-distinguishes `working` from `waiting_for_user`, which is how a stalled session is detected. Their
-observed shape is in [Response shapes](#response-shapes) below; the entries of `pull_requests[]` in
-particular are `pr_url` and `pr_state`, and carry **no pull request number**.
+Sentinel sends no other field. The reference defines twelve more —
+`attachment_urls`, `bypass_approval`, `child_playbook_id`, `create_as_user_id`, `devin_mode`,
+`platform`, `secret_ids`, `session_links`, `session_secrets` among them — and there is **no
+idempotency key of any kind**, which is why [Client behaviour](#client-behaviour) puts idempotency
+in Sentinel's own uniqueness constraint.
+
+`SessionResponse` is the body of the create, the get, the listing's `items` and the message post.
+Its required fields are `session_id`, `url`, `status`, `tags`, `org_id`, `created_at`,
+`updated_at`, `acus_consumed` and `pull_requests`. Sentinel consumes `session_id`, `url`, `status`,
+`tags`, `acus_consumed` and `pull_requests[]`; on `GET` additionally `structured_output` and
+`status_detail`, both of which the reference marks "only populated on get/list endpoints" — so a
+create response carrying neither is correct, not a truncated one. `created_at` and `updated_at` are
+epoch **integers**, and nothing here reads them.
+
+The observed shape of all of this is in [Response shapes](#response-shapes) below; the entries of
+`pull_requests[]` in particular are `pr_url` and `pr_state`, and carry **no pull request number**.
+
+`status_detail` distinguishes `working` from `waiting_for_user`, which is how a stalled session is
+detected. The reference enumerates fifteen values for it, so it is read as an open string and only
+`waiting_for_user` is branched on — a suspension reason Sentinel does not know about must not fail
+a poll.
 
 `status` values the poller maps onto [the state machine](./04-state-machine.md): `new`, `claimed`,
-`running`, `exit`, `error`, `suspended`, `resuming`.
+`running`, `exit`, `error`, `suspended`, `resuming`. That is the whole enum; there is no `blocked`
+status, which is why `blocked` is an outcome of the structured report instead.
+
+`pull_requests[]` is `SessionPullRequest`, whose two required fields are `pr_url` and `pr_state`.
+There is **no PR number** anywhere in the response.
 
 ## Response shapes
 
@@ -112,6 +152,10 @@ The page is `{ items: [...], end_cursor, has_next_page, total }`. One item:
 | `structured_output` | null | Present and null before the session reports |
 | `devin_mode` | string | Not read |
 | `status_detail` | string | A plain string. Which value arrived was not recorded |
+
+That body and the reference's `SessionResponse` agree field for field, with one addition: the live
+listing carried `automation_id`, which the reference does not define. `Session` ignores unknown
+fields, so it cost nothing — but it is the reason that tolerance is there.
 
 Two consequences the rest of this document depends on:
 
@@ -209,6 +253,16 @@ to have sent is what Devin actually received. They are therefore treated as part
 The vocabulary is registered once at bootstrap via `PUT /v3/organizations/{org_id}/tags`; creating a
 session with an unregistered tag may be rejected ([B7](./blockers.md)).
 
+Both tag bodies are the same one-field object. `TagsCreateRequest` and `TagsResponse` are each
+`{"tags": string[]}` with `tags` required, and `SessionTagsUpdateRequest` is the same with a
+**maximum of 50** tags. A session accumulates one `cycle:` tag per fix cycle on top of the six it
+is created with, so `MAX_FIX_CYCLES` would have to grow by an order of magnitude before that
+ceiling is reachable.
+
+Session tags are appended with `POST`, which the reference describes as "append tags to a session
+(deduplicating with existing tags)" — so re-tagging a session it has already tagged is safe. The
+`PUT` beside it replaces the session's whole set and is not used.
+
 ## Prompt construction
 
 The guiding rule: **delegate the task, not the steps.** The prompt states the objective, the
@@ -286,6 +340,22 @@ it, and so the prompt stays short:
 3. PR conventions — title format, required description sections.
 4. Directories that must not be touched (generated assets, vendored code, translations).
 
+`KnowledgeNoteCreateRequest` requires three fields — `name`, `body` and **`trigger`**, the sentence
+saying when Devin should reach for the note — and each of the four above supplies all three.
+`trigger` is easy to read as optional prose and is not: a note posted without it is rejected. The
+response is `KnowledgeNoteResponse`, whose identifier is **`note_id`**; that is what
+`DEVIN_KNOWLEDGE_IDS` records.
+
+**The reference does document a listing.** `GET /v3/organizations/{org_id}/knowledge/notes` —
+"List org-level notes", `ManageAccountKnowledge`, the same permission the create needs — returns
+`PaginatedResponse[KnowledgeNoteResponse]`, and `GET /v3/organizations/{org_id}/schedules` does the
+same for the sweep. Both are outside [the endpoints Sentinel calls](#endpoints-used) and stay
+outside for now, but the claim they were left out on — that nothing can list what the bootstrap
+created, so `.env` is the only record it exists
+([ADR](./adr/2026-08-08-env-is-the-bootstrap-scripts-record.md)) — is not true of the API. Whether
+idempotence should be established by reading the organisation rather than by trusting a file is a
+decision for whoever owns that ADR; this document only records that the option exists.
+
 ## Scheduled sweep
 
 `POST /v3/organizations/{org_id}/schedules` creates a recurring session that closes the loop back
@@ -300,6 +370,14 @@ into the pipeline:
 | `tags` | `sentinel`, `class:scheduled-sweep` |
 | `notify_on` | `failure` |
 
+`ScheduleCreateRequest` requires only `name` and `prompt`; the other four rows are defaults
+Sentinel states rather than assumes. `schedule_type` is `recurring` or `one_time` and a recurring
+schedule is the one that needs `frequency`, a cron expression. `notify_on` is `always`, `failure`
+or `never`.
+
+The response is `ScheduleResponse`, and its identifier is **`scheduled_session_id`** — there is no
+`id` and no `schedule_id` on it. That is what `DEVIN_SCHEDULE_ID` records.
+
 Issues it files re-enter at the top of [the primary flow](./02-architecture.md) — Devin becomes both
 the producer and the consumer of work.
 
@@ -308,13 +386,13 @@ the producer and the consumer of work.
 Some endpoints require enterprise scope, or a permission the service user may not carry. Each has a
 defined fallback so that a permission gap degrades a panel rather than breaking the pipeline:
 
-| Capability | Preferred | Fallback |
-|---|---|---|
-| Aggregate session and merged-PR metrics | `GET /v3/enterprise/metrics/sessions` | Compute from Sentinel's own `remediation` table |
-| ACU spend | `GET /v3/organizations/{org_id}/consumption/daily` | Sum `acus_consumed` across sessions |
-| Playbook creation | `POST /v3/enterprise/playbooks` | Create playbooks in the Devin UI and supply the ids via `PLAYBOOK_IDS` env config |
-| Playbook discovery | `GET /v3/organizations/{org_id}/playbooks` | Open each playbook in the Devin web app and read its id from the page |
-| Tag vocabulary discovery | `GET /v3/enterprise/organizations/{org_id}/tags` | Read the organisation's allowed tags in the Devin web app before registering, since the registration replaces them |
+| Capability | Preferred | Fallback | Shape |
+|---|---|---|---|
+| Aggregate session and merged-PR metrics | `GET /v3/enterprise/metrics/sessions` | Compute from Sentinel's own `remediation` table | `SessionMetricsResponse`: `sessions_with_merged_prs_count`, `avg_acus_per_session`, `sessions_created_count`, all required. `time_before` and `time_after` are **required** epoch parameters — the caller states the window |
+| ACU spend | `GET /v3/organizations/{org_id}/consumption/daily` | Sum `acus_consumed` across sessions | `ConsumptionResponse`: `total_acus`, and the days under **`consumption_by_date`**, each `{date, acus, acus_by_product}`. `date` is an epoch integer, at the billing-day boundary of midnight Pacific — 08:00 UTC |
+| Playbook creation | `POST /v3/enterprise/playbooks` | Create playbooks in the Devin UI and supply the ids via `PLAYBOOK_IDS` env config | Not called. `POST /v3/organizations/{org_id}/playbooks` also exists, which is why B6's premise is wrong |
+| Playbook discovery | `GET /v3/organizations/{org_id}/playbooks` | Open each playbook in the Devin web app and read its id from the page | `PaginatedResponse[PlaybookResponse]`; `playbook_id`, `title` and `access_type` (`enterprise` or `org`) required. Paged by `after` and `first` (default 100, max 200) |
+| Tag vocabulary discovery | `GET /v3/enterprise/organizations/{org_id}/tags` | Read the organisation's allowed tags in the Devin web app before registering, since the registration replaces them | `TagsResponse`: `{"tags": string[]}`, `tags` required |
 
 The dashboard labels any figure served by a fallback, so a reader always knows which numbers came
 from Devin and which Sentinel derived itself.
@@ -324,6 +402,11 @@ from Devin and which Sentinel derived itself.
 - **Retries**: exponential backoff with jitter on `429` and `5xx`; `4xx` other than `429` fails the
   job immediately with the response body recorded in `remediation_event.detail`.
 - **Timeouts**: 30 s connect/read; session creation is never on a webhook request path.
-- **Idempotency**: enforced by Sentinel's `UNIQUE (repo, issue_number)`, not by a Devin-side key.
+- **Idempotency**: enforced by Sentinel's `UNIQUE (repo, issue_number)`, not by a Devin-side key —
+  `SessionCreateRequest` defines no idempotency key, so there is no Devin-side one to use.
+- **Errors**: every `4xx` and `429` is `ProblemDetail` (RFC 9457) — `title` and `status` required,
+  `detail` retained from the legacy body, and `errors` carrying field-level failures on `422` only.
+  The client stores the body as text rather than parsing it, so a rejection is diagnosable from
+  `remediation_event.detail` without depending on that shape.
 - **Logging**: every call logs method, path, status, latency and the `run:<delivery_id>` correlation
   id. Tokens are never logged.

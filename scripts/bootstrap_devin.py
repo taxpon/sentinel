@@ -837,9 +837,15 @@ async def _seed_knowledge(writer: Writer) -> str:
     """Create whichever of the four notes `.env` does not already record the id of.
 
     `DEVIN_KNOWLEDGE_IDS` is positional — the *n*-th id belongs to the *n*-th entry of `NOTES` — so
-    a run that stopped after two notes resumes at the third instead of creating four more. No v3
-    endpoint lists an organisation's knowledge notes, so this record is the only thing standing
-    between a second run and a fifth note.
+    a run that stopped after two notes resumes at the third instead of creating four more. This
+    record is the only thing this script consults before creating a fifth note.
+
+    It was believed to be the only thing that *could* be consulted. That is not so: the v3
+    reference documents `GET /v3/organizations/{org_id}/knowledge/notes`, which lists an
+    organisation's notes under the same `ManageAccountKnowledge` permission the creation needs.
+    Reading the organisation instead of the file would make idempotence a fact rather than a
+    bookkeeping convention, and it would change what this script does — so it is left to whoever
+    owns `docs/adr/2026-08-08-env-is-the-bootstrap-scripts-record.md` rather than taken here.
 
     The record is written after *each* creation rather than once at the end: an id that was not
     recorded belongs to a note nobody can find again, and the point of the record is that a failure
