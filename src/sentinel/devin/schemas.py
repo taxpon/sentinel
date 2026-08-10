@@ -29,6 +29,7 @@ the spec names but does not specify field by field.
 from __future__ import annotations
 
 import datetime as dt
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -133,14 +134,54 @@ class StructuredOutput(BaseModel):
     confidence: float | None = Field(default=None, ge=0, le=1)
 
 
+_PULL_REQUEST_NUMBER: Final = re.compile(r"/pull/(?P<number>\d+)(?:[/?#]|$)")
+"""The number in a GitHub pull request URL, `https://…/{owner}/{repo}/pull/{number}`.
+
+The host is deliberately not matched. What identifies a pull request is the `/pull/<n>` path
+segment, which a GitHub Enterprise install spells the same way; pinning `github.com` would reject a
+URL that is perfectly readable for no gain.
+"""
+
+
+def pull_request_number(url: str) -> int | None:
+    """The pull request number carried by `url`, or `None` if it carries none."""
+    match = _PULL_REQUEST_NUMBER.search(url)
+    return None if match is None else int(match["number"])
+
+
 class PullRequest(BaseModel):
-    """One entry of `pull_requests[]`. Only `url` is consumed — it is what links the remediation to
-    the pull request and what the dashboard's live table links out to."""
+    """One entry of `pull_requests[]`, as observed against the live API on 2026-08-10: `pr_url` and
+    `pr_state`, and nothing else. `pr_url` is what links the remediation to the pull request and
+    what the dashboard's live table links out to; `pr_state` is not modelled because nothing reads
+    it.
+
+    **`url` is not accepted as an alias.** `_unwrap` below tolerates several list envelopes because
+    the spec names none and no call had been made — the tolerance stands in for a fact nobody had.
+    Here the fact exists: the field is `pr_url`. An alias would buy nothing today and would hide a
+    rename tomorrow, because the body would keep parsing under the name the API had stopped sending
+    and no one would learn it had moved.
+    """
 
     model_config = ConfigDict(frozen=True)
 
-    url: str
-    number: int | None = None
+    pr_url: str
+
+    @property
+    def number(self) -> int | None:
+        """The pull request number, derived from `pr_url`.
+
+        v3 sends no number anywhere in the session body, and `webhooks._criterion` resolves every
+        check-suite and review delivery by `remediation.pr_number` — a null there resolves the whole
+        review-fix loop to no remediation, and each delivery is recorded as ignored. So the number
+        has to come from the URL.
+
+        A property rather than a validated field, so that a URL this cannot read fails one
+        remediation rather than the parse of the whole session: `DevinResponseError` sends the
+        remediation to `SESSION_UNREADABLE` and then `FAILED`, which would discard a pull request
+        that really exists over the shape of the link to it. The poller logs the miss and records it
+        on the remediation's own event instead.
+        """
+        return pull_request_number(self.pr_url)
 
 
 def _zero_if_null(value: Any) -> Any:
@@ -153,7 +194,10 @@ class Session(BaseModel):
     """A Devin session as v3 returns it, on creation and on every poll.
 
     Extra fields are ignored rather than rejected: the response carries more than the spec's
-    "fields consumed" list, and a field added upstream must not fail a poll.
+    "fields consumed" list, and a field added upstream must not fail a poll. That is not
+    hypothetical — the listing observed on 2026-08-10 carried thirteen fields nothing here reads,
+    including `created_at` and `updated_at` as **integers**, which is why neither is modelled as a
+    timestamp.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -177,14 +221,16 @@ class Session(BaseModel):
     def pull_request_url(self) -> str | None:
         """The first pull request Devin opened, if any. The link is write-once in the state
         machine, so a later one is recorded as an event and otherwise ignored."""
-        return self.pull_requests[0].url if self.pull_requests else None
+        return self.pull_requests[0].pr_url if self.pull_requests else None
 
 
 def _unwrap(payload: Any, *keys: str) -> Any:
     """A list payload that may arrive bare or wrapped under one of `keys`.
 
-    *Unverified* (B8): the spec names the listing endpoints but not their envelope, and guessing
-    one of the two would fail on the first real call for a reason nobody could read off a traceback.
+    The spec names the listing endpoints but not their envelope, and guessing one of the two would
+    fail on the first real call for a reason nobody could read off a traceback. That tolerance paid
+    for itself on 2026-08-10: the session listing arrived under `items`, which was not the first
+    guess. The other listings remain unobserved (B8).
     """
     if isinstance(payload, Mapping):
         for key in keys:
@@ -194,7 +240,12 @@ def _unwrap(payload: Any, *keys: str) -> Any:
 
 
 class SessionPage(BaseModel):
-    """The body of `GET /v3/organizations/{org_id}/sessions`."""
+    """The body of `GET /v3/organizations/{org_id}/sessions`.
+
+    Observed on 2026-08-10: the envelope is `items`, beside `end_cursor`, `has_next_page` and
+    `total`. The three pagination keys are read by nothing and so modelled by nothing — see
+    `DevinClient.list_sessions`, which returns one page.
+    """
 
     model_config = ConfigDict(frozen=True)
 
