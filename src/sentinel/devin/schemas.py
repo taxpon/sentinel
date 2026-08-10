@@ -248,6 +248,49 @@ class KnowledgeNote(BaseModel):
     name: str | None = None
 
 
+class Playbook(BaseModel):
+    """One playbook of the organisation, as the listing endpoint returns it.
+
+    Only what an operator filling in `DEVIN_PLAYBOOK_IDS` needs: the id the create-session call
+    takes, the title it was given in the Devin UI, and which scope it was created at. `body` is
+    deliberately not read — the four texts in `docs/playbooks/` are the record of what a playbook
+    says, and printing bodies would bury the ids the listing exists to surface.
+
+    The v3 reference spells the id `playbook_id`; `id` is accepted alongside it because every other
+    bootstrap response here returns its id under one name or the other and none of them has been
+    seen for real (B8).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    playbook_id: str = Field(validation_alias=AliasChoices("playbook_id", "id"))
+    title: str
+    access_type: str | None = None
+
+
+class PlaybookPage(BaseModel):
+    """The body of `GET /v3/organizations/{org_id}/playbooks`.
+
+    `has_next_page` is carried rather than followed. The endpoint paginates and the listing asks for
+    one page: an operator looking up four ids is told when there are more playbooks than that and
+    sent to the web app for the rest, which is cheaper than a cursor loop nothing else needs.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    playbooks: tuple[Playbook, ...]
+    has_next_page: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_bare_list(cls, payload: Any) -> Any:
+        page = payload if isinstance(payload, Mapping) else {}
+        return {
+            "playbooks": _unwrap(payload, "items", "playbooks", "data"),
+            "has_next_page": page.get("has_next_page") or False,
+        }
+
+
 class Schedule(BaseModel):
     """The nightly vulnerability sweep, created once at bootstrap.
 
@@ -331,15 +374,20 @@ class SessionMetrics(BaseModel):
 class Capability(StrEnum):
     """The rows of the degradation table in `docs/05-devin-integration.md`.
 
-    All three, including the one no client method serves: `PLAYBOOK_CREATION` is configuration
+    All four, including the one no client method serves: `PLAYBOOK_CREATION` is configuration
     rather than a runtime call — the four playbooks are created in the Devin UI and their ids
     supplied through `DEVIN_PLAYBOOK_IDS` (B6) — but the bootstrap script reports on the same
     vocabulary the dashboard labels figures with, and two vocabularies would drift.
+
+    `PLAYBOOK_DISCOVERY` is the *read* beside that write: creating a playbook is unavailable, but
+    finding the id of one somebody created by hand may not be, and that is what
+    `make devin-playbooks` asks.
     """
 
     SESSION_METRICS = "session_metrics"
     ACU_SPEND = "acu_spend"
     PLAYBOOK_CREATION = "playbook_creation"
+    PLAYBOOK_DISCOVERY = "playbook_discovery"
 
     @property
     def fallback(self) -> str:
@@ -352,6 +400,9 @@ FALLBACKS: Final[Mapping[Capability, str]] = {
     Capability.ACU_SPEND: "Sum `acus_consumed` across sessions",
     Capability.PLAYBOOK_CREATION: (
         "Create playbooks in the Devin UI and supply the ids via `PLAYBOOK_IDS` env config"
+    ),
+    Capability.PLAYBOOK_DISCOVERY: (
+        "Open each playbook in the Devin web app and read its id from the page"
     ),
 }
 

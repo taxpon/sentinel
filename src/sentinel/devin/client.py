@@ -3,8 +3,8 @@
 Every path is a `/v3/...` path: v1 and v2 are not reachable from here, which
 `docs/adr/2026-08-07-devin-v3-only.md` requires and a test over `ENDPOINTS` asserts. The endpoints
 are the table in `docs/05-devin-integration.md#endpoints-used`, no more and no fewer — the worker
-and the poller use the first six, `make bootstrap-devin` the next three, and the dashboard the
-last.
+and the poller use the first six, `make bootstrap-devin` the next three, `make devin-playbooks` the
+playbook listing, and the dashboard the last.
 
 What this module decides, so that no caller has to:
 
@@ -70,6 +70,7 @@ from sentinel.devin.schemas import (
     CreateSessionRequest,
     Degradable,
     KnowledgeNote,
+    PlaybookPage,
     Schedule,
     Session,
     SessionMetrics,
@@ -96,6 +97,7 @@ SESSION_TAGS: Final = f"{SESSION}/tags"
 ORGANIZATION_TAGS: Final = f"{_ORGANIZATION}/tags"
 KNOWLEDGE_NOTES: Final = f"{_ORGANIZATION}/knowledge/notes"
 SCHEDULES: Final = f"{_ORGANIZATION}/schedules"
+PLAYBOOKS: Final = f"{_ORGANIZATION}/playbooks"
 CONSUMPTION_DAILY: Final = f"{_ORGANIZATION}/consumption/daily"
 ENTERPRISE_SESSION_METRICS: Final = "/v3/enterprise/metrics/sessions"
 
@@ -108,6 +110,7 @@ ENDPOINTS: Final[frozenset[str]] = frozenset(
         ORGANIZATION_TAGS,
         KNOWLEDGE_NOTES,
         SCHEDULES,
+        PLAYBOOKS,
         CONSUMPTION_DAILY,
         ENTERPRISE_SESSION_METRICS,
     }
@@ -497,6 +500,27 @@ class DevinClient:
         return self._parse(Schedule, payload, "POST", SCHEDULES)
 
     # --- Degradable ------------------------------------------------------------------------------
+
+    async def list_playbooks(self) -> Degradable[PlaybookPage]:
+        """The organisation's playbooks, titled and identified — what `DEVIN_PLAYBOOK_IDS` is
+        built from.
+
+        The read beside B6's write. The four playbooks are created by hand in the Devin UI because
+        creating them through the API needs a scope this token may not carry; finding the id of one
+        that already exists is a different permission question, and this is where it is asked.
+        `scripts/bootstrap_devin.py --list-playbooks` is the only caller and it creates nothing.
+
+        Degradable rather than raising, for the reason the two below are: a refused permission is
+        answered by reading the ids off the playbook pages in the web app, not by failing.
+
+        One page. The endpoint takes `after` and `first` (default 100) and neither is sent, so an
+        organisation with more playbooks than one page reports `has_next_page` and the rest are
+        found in the web app — a cursor loop for a one-off lookup of four ids is machinery nothing
+        else in Sentinel would use.
+        """
+        return await self._degradable(
+            Capability.PLAYBOOK_DISCOVERY, "GET", PLAYBOOKS, PlaybookPage, path=self._org()
+        )
 
     async def daily_consumption(self) -> Degradable[Consumption]:
         """Daily ACU spend, for the budget guard and the cost panel.

@@ -19,6 +19,7 @@ Base URL `https://api.devin.ai`, authenticated with a service-user token
 | `PUT` | `/v3/organizations/{org_id}/tags` | Register the organisation's allowed tag vocabulary at bootstrap |
 | `POST` | `/v3/organizations/{org_id}/knowledge/notes` | Seed repository conventions once at bootstrap |
 | `POST` | `/v3/organizations/{org_id}/schedules` | Nightly vulnerability sweep |
+| `GET` | `/v3/organizations/{org_id}/playbooks` | Read back the ids of the hand-made playbooks — `make devin-playbooks` |
 | `GET` | `/v3/organizations/{org_id}/consumption/daily` | Daily ACU spend for the budget guard and cost panel |
 | `GET` | `/v3/enterprise/metrics/sessions` | Merged-PR and ACU aggregates — *enterprise scope, optional* |
 
@@ -68,6 +69,11 @@ Baselines are stated assumptions, labelled as such on the dashboard — not meas
 The playbooks themselves are created by hand in the Devin UI ([B6](./blockers.md#b6)), so the texts
 in [`playbooks/`](./playbooks/README.md) are the only record of what they contain and the source
 they are pasted from.
+
+Their ids are read back with `make devin-playbooks`, which lists the organisation's
+playbooks as title and id and prints the `DEVIN_PLAYBOOK_IDS` to paste into `.env`. It creates,
+updates and deletes nothing — it exists because the write path does not, and because the id a
+session is created with is not something the UI puts in front of whoever made the playbook.
 
 ## Structured output
 
@@ -222,14 +228,15 @@ the producer and the consumer of work.
 
 ## Degradation
 
-Some endpoints require enterprise scope, which Sentinel may not hold. Each has a defined fallback so
-that a permission gap degrades a panel rather than breaking the pipeline:
+Some endpoints require enterprise scope, or a permission the service user may not carry. Each has a
+defined fallback so that a permission gap degrades a panel rather than breaking the pipeline:
 
 | Capability | Preferred | Fallback |
 |---|---|---|
 | Aggregate session and merged-PR metrics | `GET /v3/enterprise/metrics/sessions` | Compute from Sentinel's own `remediation` table |
 | ACU spend | `GET /v3/organizations/{org_id}/consumption/daily` | Sum `acus_consumed` across sessions |
 | Playbook creation | `POST /v3/enterprise/playbooks` | Create playbooks in the Devin UI and supply the ids via `PLAYBOOK_IDS` env config |
+| Playbook discovery | `GET /v3/organizations/{org_id}/playbooks` | Open each playbook in the Devin web app and read its id from the page |
 
 The dashboard labels any figure served by a fallback, so a reader always knows which numbers came
 from Devin and which Sentinel derived itself.

@@ -42,6 +42,7 @@ from sentinel.devin.client import (
     ENTERPRISE_SESSION_METRICS,
     KNOWLEDGE_NOTES,
     ORGANIZATION_TAGS,
+    PLAYBOOKS,
     SCHEDULES,
     SESSION,
     SESSION_MESSAGES,
@@ -148,9 +149,9 @@ SPEC_WORKING_STATUSES = set(backticked(_working_phrase.group(1)))
 
 def test_the_spec_tables_were_parsed() -> None:
     """A parsing bug would silently turn every table-driven test below into a no-op."""
-    assert len(SPEC_ENDPOINT_ROWS) == 10
+    assert len(SPEC_ENDPOINT_ROWS) == 11
     assert len(SPEC_CREATE_FIELDS) == 10
-    assert len(SPEC_DEGRADATION_ROWS) == 3
+    assert len(SPEC_DEGRADATION_ROWS) == 4
     assert len(SPEC_STATUSES) == 7
     assert len(SPEC_SWEEP) == 6
     assert SPEC_RETRIES.startswith("exponential backoff")
@@ -175,6 +176,7 @@ SESSION_TAGS_URL = SESSION_TAGS.format(org_id=ORG, session_id=SESSION_ID)
 ORG_TAGS_URL = ORGANIZATION_TAGS.format(org_id=ORG)
 KNOWLEDGE_URL = KNOWLEDGE_NOTES.format(org_id=ORG)
 SCHEDULES_URL = SCHEDULES.format(org_id=ORG)
+PLAYBOOKS_URL = PLAYBOOKS.format(org_id=ORG)
 CONSUMPTION_URL = CONSUMPTION_DAILY.format(org_id=ORG)
 
 ISSUE: dict[str, Any] = {
@@ -1019,6 +1021,109 @@ async def test_a_body_we_cannot_read_degrades_rather_than_raising(
     assert result.reason is Unavailability.UNREADABLE
     assert result.status_code is None
     assert result.fallback == capability.fallback
+
+
+async def test_listing_playbooks_reads_the_title_and_the_id(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """The one call that answers "which id do I put in `DEVIN_PLAYBOOK_IDS`?" (B6). The response is
+    the v3 reference's `PaginatedResponse[PlaybookResponse]`, whose body field is deliberately not
+    modelled: the playbook texts live in `docs/playbooks/`."""
+    devin_api.responds(
+        "GET",
+        PLAYBOOKS_URL,
+        200,
+        {
+            "items": [
+                {
+                    "playbook_id": "playbook-1a2b",
+                    "title": "security-fix",
+                    "body": "## Overview\n…",
+                    "access_type": "org",
+                }
+            ],
+            "has_next_page": False,
+            "total": 1,
+        },
+    )
+
+    result = await client.list_playbooks()
+
+    assert result.available
+    page = result.value
+    assert [(book.title, book.playbook_id) for book in page.playbooks] == [
+        ("security-fix", "playbook-1a2b")
+    ]
+    assert page.playbooks[0].access_type == "org"
+    assert not page.has_next_page
+    # Read-only, and the whole reason this endpoint is reachable at all: B6 is about the write.
+    assert [request.method for request in devin_api.sent(path=PLAYBOOKS_URL)] == ["GET"]
+
+
+async def test_listing_playbooks_carries_the_flag_that_there_are_more(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """One page is asked for, so `has_next_page` is what tells an operator the list is partial
+    rather than the list being silently short."""
+    devin_api.responds(
+        "GET",
+        PLAYBOOKS_URL,
+        200,
+        {"items": [{"playbook_id": "pb-1", "title": "security-fix"}], "has_next_page": True},
+    )
+
+    result = await client.list_playbooks()
+
+    assert result.available
+    assert result.value.has_next_page
+
+
+@pytest.mark.parametrize("envelope", ["items", "playbooks", "data", None])
+async def test_listing_playbooks_parses_whichever_envelope_arrives(
+    client: DevinClient, devin_api: FakeAPI, envelope: str | None
+) -> None:
+    """The reference says `items`; nothing has been seen for real (B8), and the sibling listings
+    here hedge the same way."""
+    books = [{"playbook_id": "pb-1", "title": "security-fix"}]
+    devin_api.responds("GET", PLAYBOOKS_URL, 200, books if envelope is None else {envelope: books})
+
+    result = await client.list_playbooks()
+
+    assert result.available
+    assert result.value.playbooks[0].playbook_id == "pb-1"
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [(403, Unavailability.FORBIDDEN), (404, Unavailability.NOT_FOUND)],
+)
+async def test_listing_playbooks_degrades_when_the_permission_is_missing(
+    client: DevinClient, devin_api: FakeAPI, status: int, reason: Unavailability
+) -> None:
+    """The expected answer if the service user does not carry the playbook permission. It is an
+    answer, so it degrades to the fallback rather than failing the caller."""
+    devin_api.responds("GET", PLAYBOOKS_URL, status, text="no")
+
+    result = await client.list_playbooks()
+
+    assert isinstance(result, Unavailable)
+    assert result.capability is Capability.PLAYBOOK_DISCOVERY
+    assert result.reason is reason
+    assert result.status_code == status
+    assert result.fallback == (
+        "Open each playbook in the Devin web app and read its id from the page"
+    )
+
+
+async def test_a_rejected_token_on_the_playbook_listing_still_raises(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """`401` is not a missing permission, and answering it with "read them in the web app" would
+    send an operator hunting for pages their token cannot open either."""
+    devin_api.responds("GET", PLAYBOOKS_URL, 401, text="invalid token")
+
+    with pytest.raises(DevinAPIError):
+        await client.list_playbooks()
 
 
 async def test_a_session_we_cannot_read_still_raises(

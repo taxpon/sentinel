@@ -56,7 +56,11 @@ writes nothing, needs no more than it takes to read
 - `make bootstrap-github` — `GITHUB_TOKEN`, `GITHUB_WEBHOOK_SECRET` (the value it gives the hook);
 - `uv run scripts/bootstrap_github.py --dry-run` — `GITHUB_TOKEN`;
 - `uv run scripts/file_remediation_issues.py`, with or without `--apply` — `GITHUB_TOKEN`;
-- `make bootstrap-devin` — `DEVIN_API_TOKEN`, `DEVIN_ORG_ID`, `DEVIN_PLAYBOOK_IDS`.
+- `make bootstrap-devin` — `DEVIN_API_TOKEN`, `DEVIN_ORG_ID`, `DEVIN_PLAYBOOK_IDS`;
+- `make devin-playbooks` — `DEVIN_API_TOKEN`, `DEVIN_ORG_ID`, and deliberately not
+  `DEVIN_PLAYBOOK_IDS`: this is the read that *finds* it, and demanding it first would make the
+  lookup unusable at the one moment anyone wants it
+  ([ADR](./adr/2026-08-10-playbook-ids-are-read-back-from-the-organisation-scoped-listing.md)).
 
 Nothing else about a script's configuration differs: the optional variables of those groups take
 the defaults documented above, `.env` is read exactly as a service reads it, and a variable of the
@@ -302,6 +306,19 @@ a fork are not registered until the first run, so open one throwaway pull reques
 before relying on CI ([B2](./blockers.md)).
 
 ### 2. Devin organisation
+
+First the four playbooks, by hand in the Devin UI ([B6](./blockers.md#b6)), with the names and the
+bodies in [`playbooks/`](./playbooks/README.md). Then their ids, which `make bootstrap-devin` needs
+and the UI does not put in front of you:
+
+```bash
+make devin-playbooks
+```
+
+It lists the organisation's playbooks as title and id and prints the `DEVIN_PLAYBOOK_IDS` to paste
+into `.env`. It creates nothing and writes to no file. If the service user does not carry the
+playbook permission it says so in one line and exits 0; read the ids from the playbook pages in the
+web app instead.
 
 ```bash
 make bootstrap-devin
