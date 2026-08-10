@@ -224,6 +224,35 @@ scheduled sweep, the demo. Also gates [B5](#b5), [B6](#b6) and [B7](#b7).
 suite (Devin is faked with `respx`), the analytics layer and the dashboard all develop without
 credentials ([08](./08-testing.md)). This blocker gates the runs, not the build.
 
+**Response shapes: one endpoint is now verified, 2026-08-10.** Anything in the code or the specs
+marked *unverified (B8)* means the field names were taken from prose rather than from a call. One
+call has now been made.
+
+| | |
+|---|---|
+| `GET /v3/organizations/{org_id}/sessions` | **Verified.** `200`. Full field list recorded in [05](./05-devin-integration.md#response-shapes) |
+| `POST /v3/organizations/{org_id}/sessions` | Not called. The create-session *request* body is still unverified against a real `201` |
+| `POST …/sessions/{id}/messages` | Not called |
+| `POST …/sessions/{id}/tags`, `PUT /v3/organizations/{org_id}/tags` | Not called — and see [B14](#b14) |
+| `POST …/knowledge/notes` | Not called |
+| `POST …/schedules` | Not called |
+| `GET …/consumption/daily` | Not called |
+| `GET /v3/enterprise/metrics/sessions` | Not called — see [B5](#b5) |
+| `GET /v3/organizations/{org_id}/playbooks` | Verified separately, see [B6](#b6) |
+
+**What the verified call actually established, and what it did not.** Field *names* and *types* were
+recorded; field *values* were not. So the seven `status` values and the `waiting_for_user`
+`status_detail` remain unconfirmed — `status_detail` is a plain string, and whether it ever carries
+`waiting_for_user` has not been seen. `SessionStatus` still rejects an eighth status, which is the
+intended behaviour: an unknown status means our reading of the API is wrong and should fail loudly.
+
+**Two mismatches it found, one of them silent.** `pull_requests[].url` is really `pr_url`, which
+failed the parse outright and would have stalled every remediation holding a pull request. Worse,
+`pull_requests[].number` does not exist at all: it had parsed to `None` without complaint, and
+`pr_number` is what resolves a check suite or a review to its remediation — so the review-fix loop
+would have engaged for nothing, silently, while the traceback pointed elsewhere. Both are fixed; the
+number is now derived from `pr_url`.
+
 ### B9 — Public URL required for webhook delivery {#b9}
 
 **Impact.** GitHub must reach the API. Free `cloudflared`/`ngrok` URLs change on restart, and a

@@ -429,9 +429,10 @@ class DevinClient:
         organisation's own. Filters are checked against the registered vocabulary rather than the
         session rule: `class:scheduled-sweep` is a legitimate thing to search for.
 
-        *Unverified* (B8): there is no pagination. The spec documents neither a cursor nor a page
-        size, so a `limit` is passed through and one page is returned; a backfill over an
-        organisation with more sessions than that would silently see only the first page.
+        There is no pagination here. The spec documents neither a cursor nor a page size, but the
+        body observed on 2026-08-10 carries `end_cursor`, `has_next_page` and `total` beside the
+        items — so the endpoint does paginate and this reads the first page only. A backfill over an
+        organisation with more sessions than one page silently sees a prefix of them.
         """
         params: dict[str, Any] = {}
         if tags:

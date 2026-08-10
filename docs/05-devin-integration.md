@@ -66,10 +66,63 @@ the path nor the method of the registration itself is changed by that preview
 
 Response fields consumed: `session_id`, `url`, `status`, `tags`, `acus_consumed`,
 `pull_requests[]`. On `GET`, additionally `structured_output` and `status_detail` — the latter
-distinguishes `working` from `waiting_for_user`, which is how a stalled session is detected.
+distinguishes `working` from `waiting_for_user`, which is how a stalled session is detected. Their
+observed shape is in [Response shapes](#response-shapes) below; the entries of `pull_requests[]` in
+particular are `pr_url` and `pr_state`, and carry **no pull request number**.
 
 `status` values the poller maps onto [the state machine](./04-state-machine.md): `new`, `claimed`,
 `running`, `exit`, `error`, `suspended`, `resuming`.
+
+## Response shapes
+
+`GET /v3/organizations/{org_id}/sessions` was called against the live API on **2026-08-10** and
+answered `200`. It is the only response shape in this document that has been seen rather than
+inferred, and it did not match what the code had been written against — see
+[B8](./blockers.md#b8) for exactly what that verified and what it did not.
+
+The page is `{ items: [...], end_cursor, has_next_page, total }`. One item:
+
+| Field | Type | Note |
+|---|---|---|
+| `session_id` | string | |
+| `url` | string | The Devin web app link, recorded as `devin_session_url` |
+| `status` | string | The seven values above. Which value arrived was not recorded |
+| `title` | string | |
+| `tags` | array of string | |
+| `playbook_id` | null | Arrived null on the observed session |
+| `user_id` | string | Not read |
+| `org_id` | string | Not read |
+| `created_at` | **integer** | An epoch, not an ISO-8601 string. Not read |
+| `updated_at` | **integer** | As above |
+| `is_archived` | boolean | Not read |
+| `acus_consumed` | number | |
+| `pull_requests[].pr_url` | string | **Not `url`.** The field the poller links from |
+| `pull_requests[].pr_state` | string | New; not read — see below |
+| `parent_session_id` | null | Not read |
+| `child_session_ids` | array | Not read |
+| `service_user_id` | null | Not read |
+| `category` | string | Not read |
+| `subcategory` | string | Not read |
+| `origin` | string | Not read |
+| `automation_id` | null | Not read |
+| `structured_output` | null | Present and null before the session reports |
+| `devin_mode` | string | Not read |
+| `status_detail` | string | A plain string. Which value arrived was not recorded |
+
+Two consequences the rest of this document depends on:
+
+**There is no pull request number, anywhere in the session body.** Sentinel's `remediation.pr_number`
+is what resolves a `check_suite` or `pull_request_review` delivery to a remediation
+([06](./06-event-pipeline.md)), so the number is parsed out of `pr_url` — the `/pull/{number}` path
+segment — by `devin/schemas.py`. A URL it cannot read leaves `pr_number` null, which makes that
+remediation unreachable from GitHub; the poller records the URL it could not read on the
+remediation's own event rather than inventing a number.
+
+**The listing paginates.** `end_cursor` and `has_next_page` are not in the specification and nothing
+follows them: `list_sessions` reads one page, so a backfill over an organisation with more sessions
+than a page sees a prefix. `pr_state` is likewise carried by the API and read by nothing — a merge
+observed there would reach Sentinel a poll ahead of the `pull_request.closed` webhook, but the
+webhook is authoritative today and nothing is built on it.
 
 ## Playbooks and ACU caps
 

@@ -134,6 +134,23 @@ SESSION_WAITING_FOR_USER: Final = "session_waiting_for_user"
 """`blocked_reason` for a session stalled on a question. See
 `docs/adr/2026-08-08-a-stalled-session-is-blocked.md`."""
 
+PR_NUMBER_UNRESOLVED: Final = "pr_number_unresolved"
+"""Recorded in `remediation_event.detail`, against the URL it was derived from, on every transition
+of a remediation linked to a pull request whose number could not be read off that URL.
+
+v3 reports no pull request number (verified 2026-08-10), so `PullRequest.number` parses it out of
+`pr_url`; a URL it cannot read leaves `pr_number` null. That is not a cosmetic gap.
+`webhooks._criterion` resolves every check-suite and review delivery by `pr_number`, so a null one
+makes the remediation unreachable from GitHub: CI failures and reviews resolve to no remediation,
+are recorded as ignored, and the fix loop never engages — silently, from a remediation that looks
+healthy in `PR_OPENED`.
+
+On the event rather than in the log alone, and read off the row rather than passed in. The log line
+beside it (`poller.pull_request.unnumbered`) is only found by someone who already suspects this;
+the event is attached to the remediation that will stall and appears in the timeline anyone
+debugging it opens first. Reading it off the row states the condition itself — linked, unnumbered —
+so it keeps being reported for as long as it is true rather than only on the tick that linked it."""
+
 DEVIN_REPORTED_BLOCKED: Final = "devin_reported_blocked"
 """`blocked_reason` for a report whose outcome is `blocked` but which left `blocked_reason` unset.
 The failure-breakdown panel groups on this column, and a null would drop the row from its own
@@ -289,9 +306,11 @@ async def apply(
     if result.to_state is State.PR_OPENED and pull_request is not None:
         # Write-once, and this is the only place any of the three is written: the state machine
         # absorbs a second `PR_OPENED`, so a later poll never reaches this line.
-        remediation.pr_url = pull_request.url
+        remediation.pr_url = pull_request.pr_url
         remediation.pr_number = pull_request.number
         remediation.pr_opened_at = _now()
+        if pull_request.number is None:
+            log.warning("poller.pull_request.unnumbered", pr_url=pull_request.pr_url)
     if result.to_state in ESCALATED_STATES:
         remediation.blocked_reason = reason or result.reason
         remediation.closed_at = _now()
@@ -496,6 +515,8 @@ def _event(remediation: Remediation, result: Transition, reason: str | None) -> 
         "devin_status": remediation.devin_status,
         "reason": reason or result.reason,
     }
+    if remediation.pr_url is not None and remediation.pr_number is None:
+        detail[PR_NUMBER_UNRESOLVED] = remediation.pr_url
     return RemediationEvent(
         remediation_id=remediation.id,
         from_state=result.from_state,
