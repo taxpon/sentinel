@@ -125,8 +125,8 @@ interface PanelBoundaryProps {
 
 /**
  * One boundary per panel. The shell mounts components written by three tasks it cannot see, so a
- * render that throws must cost that panel and nothing else: a broken cost panel should not take
- * down the header, the freshness indicator and the eight panels that were working.
+ * render that throws must cost that panel and nothing else: one broken panel should not take down
+ * the header, the freshness indicator and every other panel that was working.
  */
 class PanelBoundary extends Component<PanelBoundaryProps, { failed: boolean }> {
   state = { failed: false }

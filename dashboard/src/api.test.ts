@@ -11,7 +11,6 @@ import {
   formatDurationSeconds,
   formatNumber,
   formatPercent,
-  formatUsd,
   freshness,
   isEmptySummary,
   parseSummary,
@@ -59,9 +58,9 @@ describe('parseSummary', () => {
   })
 
   it('names the fields a wrong-shaped payload is missing', () => {
-    const { cost: _cost, cycles: _cycles, ...partial } = summaryFixture
+    const { rates: _rates, cycles: _cycles, ...partial } = summaryFixture
 
-    expect(() => parseSummary(partial)).toThrow(/missing cost, cycles/)
+    expect(() => parseSummary(partial)).toThrow(/missing rates, cycles/)
   })
 
   it('rejects a body that is not a JSON object at all', () => {
@@ -468,13 +467,8 @@ describe('formatting', () => {
     expect(formatDurationSeconds(0)).toBe('0s')
   })
 
-  it('formats currency to the cent', () => {
-    expect(formatUsd(summaryFixture.cost.usd_per_fix)).toBe('$27.60')
-    expect(formatUsd(0)).toBe('$0.00')
-  })
-
   it('never renders NaN or Infinity, which an empty window produces', () => {
-    for (const format of [formatPercent, formatUsd, formatNumber, formatDurationSeconds]) {
+    for (const format of [formatPercent, formatNumber, formatDurationSeconds]) {
       expect(format(Number.NaN)).toBe(NO_VALUE)
       expect(format(Number.POSITIVE_INFINITY)).toBe(NO_VALUE)
     }

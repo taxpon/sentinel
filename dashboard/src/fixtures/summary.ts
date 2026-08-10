@@ -15,13 +15,6 @@ export const summaryFixture: AnalyticsSummary = {
     to_merge: { p50: 6480, p90: 14400 },
     review_latency: { p50: 2700, p90: 7200 },
   },
-  cost: {
-    acus_total: 61.4,
-    acus_per_merged_fix: 12.3,
-    usd_per_fix: 27.6,
-    unit_cost_usd: 2.25,
-    source: 'devin_consumption_api',
-  },
   cycles: { mean: 0.8, distribution: { '0': 3, '1': 1, '2': 1 } },
   throughput: [{ day: '2026-08-06', by_class: { security: 1, 'flaky-test': 1 } }],
   failures: [{ reason: 'requires_upstream_decision', count: 1, issues: [37] }],
@@ -41,13 +34,6 @@ export const emptySummaryFixture: AnalyticsSummary = {
     to_pr: { p50: 0, p90: 0 },
     to_merge: { p50: 0, p90: 0 },
     review_latency: { p50: 0, p90: 0 },
-  },
-  cost: {
-    acus_total: 0,
-    acus_per_merged_fix: 0,
-    usd_per_fix: 0,
-    unit_cost_usd: 2.25,
-    source: 'derived',
   },
   cycles: { mean: 0, distribution: {} },
   throughput: [],
@@ -199,10 +185,10 @@ export const remediationTimelineFixture: RemediationEvent[] = [
 ]
 
 /**
- * A window in which work started and cost real ACUs, but nothing merged. Every merge-relative
- * figure — MTTR, review latency, autonomy rate, ACU and cost per fix — divides by `merged`, so the
- * API sends a zero that a panel must not render as a measurement: "$0.00 per fix" next to 24 ACUs
- * of spend, or "0% autonomous", are the two most expensive wrong numbers on this dashboard.
+ * A window in which work started but nothing merged. Every merge-relative figure — MTTR, review
+ * latency, autonomy rate — divides by `merged`, so the API sends a zero that a panel must not
+ * render as a measurement: "0% autonomous" says the pipeline failed rather than that it was never
+ * asked to do anything.
  */
 export const unmergedSummaryFixture: AnalyticsSummary = {
   window: { from: '2026-08-01T00:00:00Z', to: '2026-08-08T00:00:00Z' },
@@ -212,13 +198,6 @@ export const unmergedSummaryFixture: AnalyticsSummary = {
     to_pr: { p50: 2400, p90: 3000 },
     to_merge: { p50: 0, p90: 0 },
     review_latency: { p50: 0, p90: 0 },
-  },
-  cost: {
-    acus_total: 24.5,
-    acus_per_merged_fix: 0,
-    usd_per_fix: 0,
-    unit_cost_usd: 2.25,
-    source: 'derived',
   },
   cycles: { mean: 1.5, distribution: { '1': 2, '2': 2 } },
   throughput: [],
@@ -232,9 +211,8 @@ export const unmergedSummaryFixture: AnalyticsSummary = {
 
 /**
  * A busier window (T31). Added because one payload cannot show a formatting or an ordering defect:
- * this one has durations that cross into days, a cost figure the API says is `derived`, and a
- * `throughput` series whose days arrive out of order and whose issue classes differ from day to
- * day. Every figure is internally consistent — `rates` match `funnel`, and the throughput counts
+ * this one has durations that cross into days and a `throughput` series whose days arrive out of
+ * order and whose issue classes differ from day to day. Every figure is internally consistent — `rates` match `funnel`, and the throughput counts
  * sum to `funnel.merged` — so a panel can be asserted against the formulas in
  * docs/07-observability.md rather than against itself.
  */
@@ -246,13 +224,6 @@ export const busyWindowSummaryFixture: AnalyticsSummary = {
     to_pr: { p50: 900, p90: 5400 },
     to_merge: { p50: 93600, p90: 172800 },
     review_latency: { p50: 45, p90: 3600 },
-  },
-  cost: {
-    acus_total: 240.5,
-    acus_per_merged_fix: 26.7,
-    usd_per_fix: 60.08,
-    unit_cost_usd: 2.25,
-    source: 'derived',
   },
   cycles: { mean: 1.4, distribution: { '0': 4, '1': 3, '2': 2 } },
   throughput: [

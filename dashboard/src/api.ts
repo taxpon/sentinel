@@ -47,20 +47,6 @@ export interface Durations {
   review_latency: Percentiles
 }
 
-/**
- * Whether the cost figures came from Devin or were derived by Sentinel from the unit cost. The
- * cost panel must label this; see docs/07-observability.md and docs/05-devin-integration.md.
- */
-export type CostSource = 'devin_consumption_api' | 'derived'
-
-export interface Cost {
-  acus_total: number
-  acus_per_merged_fix: number
-  usd_per_fix: number
-  unit_cost_usd: number
-  source: CostSource
-}
-
 export interface Cycles {
   mean: number
   /** Keyed by cycle count as a string, because it arrives as a JSON object key. */
@@ -90,7 +76,6 @@ export interface AnalyticsSummary {
   funnel: Funnel
   rates: Rates
   durations_seconds: Durations
-  cost: Cost
   cycles: Cycles
   throughput: ThroughputDay[]
   failures: FailureBucket[]
@@ -180,7 +165,6 @@ const SUMMARY_KEYS = [
   'funnel',
   'rates',
   'durations_seconds',
-  'cost',
   'cycles',
   'throughput',
   'failures',
@@ -446,11 +430,6 @@ export const NO_VALUE = '—'
 export function formatPercent(value: number, fractionDigits = 0): string {
   if (!Number.isFinite(value)) return NO_VALUE
   return `${(value * 100).toFixed(fractionDigits)}%`
-}
-
-export function formatUsd(value: number): string {
-  if (!Number.isFinite(value)) return NO_VALUE
-  return `$${value.toFixed(2)}`
 }
 
 export function formatNumber(value: number, fractionDigits = 1): string {

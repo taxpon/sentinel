@@ -398,13 +398,12 @@ tasks:
     ui: true
 
   - id: T32
-    title: Dashboard — durations, cost, autonomy and failures
+    title: Dashboard — durations, autonomy and failures
     wave: 3
     area: dashboard
     spec: docs/07-observability.md#dashboard
     owns:
       - dashboard/src/panels/Durations.tsx
-      - dashboard/src/panels/Cost.tsx
       - dashboard/src/panels/Autonomy.tsx
       - dashboard/src/panels/Failures.tsx
     shared_append_only:  # see the shared-files table in docs/implementation-plan.md

@@ -42,15 +42,13 @@ import re
 from collections import Counter, defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
-from decimal import Decimal
-from typing import Final, Literal, TypedDict
+from typing import Final, TypedDict
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sentinel.config import Settings
 from sentinel.devin.playbooks import baseline_hours_for
-from sentinel.models import AcuLedger, Remediation, RemediationEvent
+from sentinel.models import Remediation, RemediationEvent
 from sentinel.pipeline.state import State
 
 # --- The response schema -------------------------------------------------------------------------
@@ -85,18 +83,6 @@ class DurationsJson(TypedDict):
     review_latency: PercentilesJson
 
 
-CostSource = Literal["devin_consumption_api", "derived"]
-"""Whether Devin's own consumption figures cover the window, or Sentinel derived the ACU totals."""
-
-
-class CostJson(TypedDict):
-    acus_total: float
-    acus_per_merged_fix: float
-    usd_per_fix: float
-    unit_cost_usd: float
-    source: CostSource
-
-
 class CyclesJson(TypedDict):
     mean: float
     distribution: dict[str, int]
@@ -123,7 +109,6 @@ class SummaryJson(TypedDict):
     funnel: FunnelJson
     rates: RatesJson
     durations_seconds: DurationsJson
-    cost: CostJson
     cycles: CyclesJson
     throughput: list[ThroughputDayJson]
     failures: list[FailureBucketJson]
@@ -174,11 +159,8 @@ TIMESTAMP_FORMAT: Final = "%Y-%m-%dT%H:%M:%SZ"
 RATE_DIGITS: Final = 3
 """Rates are fractions the dashboard renders as whole percents; three digits is a tenth of one."""
 
-ACU_DIGITS: Final = 3
-"""`numeric(10,3)`. Rounding the window's ACU total at the column's own precision loses nothing."""
-
 DISPLAY_DIGITS: Final = 1
-"""Per-fix and per-remediation figures, rounded once here so that no two panels disagree."""
+"""Per-remediation figures, rounded once here so that no two panels disagree."""
 
 
 # --- The window ----------------------------------------------------------------------------------
@@ -237,14 +219,12 @@ def percentile(values: Sequence[float], rank: int) -> float:
 async def summary(
     session: AsyncSession,
     window: Window,
-    settings: Settings,
     *,
     now: datetime.datetime | None = None,
 ) -> SummaryJson:
     """The whole `GET /api/analytics/summary` body for `window`."""
     remediations = await _remediations_in(session, window)
     fix_cycles = await _fix_cycle_counts(session, [row.id for row in remediations])
-    ledger_days = await _ledger_days(session, window)
 
     # Paired with the timestamp that selected it, so that the merged-only figures below are typed as
     # having one rather than re-testing for null at every use.
@@ -263,7 +243,6 @@ async def summary(
         "funnel": funnel,
         "rates": _rates(funnel, merged),
         "durations_seconds": _durations(remediations),
-        "cost": _cost(remediations, funnel["merged"], settings, ledger_days, window),
         "cycles": _cycles(remediations, fix_cycles),
         "throughput": _throughput(merged),
         "failures": _failures(remediations),
@@ -312,22 +291,6 @@ async def _fix_cycle_counts(session: AsyncSession, ids: Sequence[int]) -> Counte
         )
     )
     return Counter(event.remediation_id for event in events)
-
-
-async def _ledger_days(session: AsyncSession, window: Window) -> set[datetime.date]:
-    """Which days of the window `acu_ledger` holds a row for.
-
-    Existence, not freshness: `synced_at` is deliberately not read here. How stale the ledger is is
-    the budget guard's and `/healthz`'s question, and answering it here would put a second, quieter
-    definition of "current enough" behind a cost figure.
-    """
-    days = _window_days(window)
-    if not days:
-        return set()
-    rows = await session.scalars(
-        select(AcuLedger.day).where(AcuLedger.day >= days[0], AcuLedger.day <= days[-1])
-    )
-    return set(rows)
 
 
 # --- Figures -------------------------------------------------------------------------------------
@@ -383,44 +346,6 @@ def _durations(remediations: Sequence[Remediation]) -> DurationsJson:
     }
 
 
-def _cost(
-    remediations: Sequence[Remediation],
-    merged: int,
-    settings: Settings,
-    ledger_days: set[datetime.date],
-    window: Window,
-) -> CostJson:
-    """ACU spend, ACUs per merged fix, and the dollar conversion of the second.
-
-    Both per-fix figures are taken from the unrounded total and rounded once, so `usd_per_fix` is
-    the cost of the ACUs actually spent rather than the product of two already-rounded numbers.
-    """
-    total = sum((row.acus_consumed for row in remediations), Decimal(0))
-    per_fix = float(total) / merged if merged else 0.0
-    return {
-        "acus_total": float(round(total, ACU_DIGITS)),
-        "acus_per_merged_fix": round(per_fix, DISPLAY_DIGITS),
-        "usd_per_fix": round(per_fix * settings.acu_unit_cost_usd, DISPLAY_DIGITS),
-        "unit_cost_usd": settings.acu_unit_cost_usd,
-        "source": _cost_source(window, ledger_days),
-    }
-
-
-def _cost_source(window: Window, ledger_days: set[datetime.date]) -> CostSource:
-    """Whether Devin's consumption figures cover every day of the window.
-
-    A ledger missing a day cannot vouch for the window, so the totals are labelled as Sentinel's own
-    — which is what `docs/05-devin-integration.md#degradation` asks the dashboard to say.
-
-    A window that touches no day at all is `derived` too, and the emptiness has to be tested for
-    rather than left to the subset: `set() <= anything` is vacuously true, which would put Devin's
-    name on a window backed by no ledger rows whatever. `parse_window` cannot produce such a window,
-    but `Window` is a public dataclass and the API constructs one.
-    """
-    days = _window_days(window)
-    return "devin_consumption_api" if days and set(days) <= ledger_days else "derived"
-
-
 def _cycles(remediations: Sequence[Remediation], fix_cycles: Counter[int]) -> CyclesJson:
     """Mean fix cycles per remediation, and the distribution behind the mean.
 
@@ -473,7 +398,7 @@ def _impact(merged: MergedRemediations) -> ImpactJson:
     invariant: a class with no playbook never merges. `docs/04-state-machine.md` routes an
     unrecognised class `QUEUED -> BLOCKED` at session creation, which is a terminal state, and only
     merged remediations are summed here. The invariant is worth naming because the blast radius is
-    the whole payload — one unmergeable row would take out all nine panels, not the impact one.
+    the whole payload — one unmergeable row would take out every panel, not the impact one.
     """
     hours = sum(baseline_hours_for(row.issue_class) for row, _ in merged)
     return {"hours_saved": round(hours, DISPLAY_DIGITS), "assumption": IMPACT_ASSUMPTION}
@@ -493,15 +418,6 @@ def _percentiles(seconds: Sequence[float]) -> PercentilesJson:
 
 def _seconds(later: datetime.datetime, earlier: datetime.datetime) -> float:
     return (later - earlier).total_seconds()
-
-
-def _window_days(window: Window) -> list[datetime.date]:
-    """The UTC dates the half-open window touches. An end at midnight does not touch that day."""
-    if window.end <= window.start:
-        return []
-    first = window.start.astimezone(datetime.UTC).date()
-    last = (window.end - datetime.timedelta(microseconds=1)).astimezone(datetime.UTC).date()
-    return [first + datetime.timedelta(days=offset) for offset in range((last - first).days + 1)]
 
 
 def _now(now: datetime.datetime | None) -> datetime.datetime:

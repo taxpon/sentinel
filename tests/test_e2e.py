@@ -106,7 +106,7 @@ CI_PENDING = "6b72e4a6-d390-77f7-f284-af0a7de19ebd"
 APPROVED = "3e4fb173-a06d-44c4-cf51-7c9d4abe6b8a"
 MERGED = "4f50c284-b17e-55d5-d062-8dae5bcf7c9b"
 
-# What the session has cost by each observation. The second is what the cost panel reports, because
+# What the session has spent by each observation. The second is what the live table shows, because
 # the poller reconciles `acus_consumed` on every tick and the remediation merges from there.
 ACUS_WHILE_WORKING = 2.0
 ACUS_AT_PULL_REQUEST = 6.5
@@ -585,14 +585,6 @@ async def test_what_sentinel_sends_across_a_whole_remediation(
     # walkthrough produces is 0, and that is the figure being asserted rather than an absence.
     assert summary["rates"] == {"success": 1.0, "merge": 1.0, "autonomy": 0.0}
     assert summary["cycles"] == {"mean": 1.0, "distribution": {"1": 1}}
-    assert summary["cost"] == {
-        "acus_total": ACUS_AT_PULL_REQUEST,
-        "acus_per_merged_fix": ACUS_AT_PULL_REQUEST,
-        "usd_per_fix": 14.6,
-        "unit_cost_usd": 2.25,
-        # No `acu_ledger` row covers the window, so the totals are labelled as Sentinel's own.
-        "source": "derived",
-    }
     assert summary["failures"] == []
     assert summary["impact"]["hours_saved"] == baseline_hours_for(ISSUE_CLASS)
     today = datetime.datetime.now(datetime.UTC).date().isoformat()
@@ -604,6 +596,13 @@ async def test_what_sentinel_sends_across_a_whole_remediation(
     assert set(durations) == {"to_pr", "to_merge", "review_latency"}
     for name, percentiles in durations.items():
         assert 0 <= percentiles["p50"] <= percentiles["p90"] < 60, name
+
+    # The live table's own row. `acus_consumed` is asserted here rather than through the summary,
+    # which no longer reports spend: it is the one figure in the walkthrough that Devin supplied,
+    # and the poller reconciling it on every tick is what carries the pull-request figure over the
+    # working one.
+    rows = (await pipeline.client.get("/api/remediations")).json()
+    assert [row["acus_consumed"] for row in rows] == [ACUS_AT_PULL_REQUEST]
 
 
 # --- What arrives when it should not ------------------------------------------------------------

@@ -109,7 +109,7 @@ h2 {
 }
 
 /* The region, which holds one panel per module like every other slot. The KPI panel is a single
-   module owned by T31, so the four-across grid belongs inside it — see .kpi-tiles below. */
+   module owned by T31, so the tile grid belongs inside it — see .kpi-tiles below. */
 .kpi-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -120,6 +120,13 @@ h2 {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--gap);
+}
+
+/* An odd number of chart panels would leave the last one beside an empty half-row. Panels are
+   discovered from src/panels/, so the count changes when a file is added or removed — it is not a
+   number this stylesheet can hold. Let a lone last panel take the full width instead. */
+.chart-grid > :last-child:nth-child(odd) {
+  grid-column: 1 / -1;
 }
 
 .table-region {
@@ -143,11 +150,11 @@ h2 {
   margin-bottom: 6px;
 }
 
-/* The four KPI tiles, on one row so they are above the fold at 1440x900. Used by T31 inside the
+/* The three KPI tiles, on one row so they are above the fold at 1440x900. Used by T31 inside the
    KPI panel; here because the row is a layout constraint from the spec, not a panel detail. */
 .kpi-tiles {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: var(--gap);
 }
 

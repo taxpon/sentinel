@@ -1,6 +1,6 @@
 ---
 title: The cost panel labels the provenance of its ACUs and of its dollars separately
-status: accepted
+status: deprecated
 date: 2026-08-08
 type: architecture
 areas: [dashboard, analytics, devin]

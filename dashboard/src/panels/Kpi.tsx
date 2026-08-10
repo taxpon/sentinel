@@ -1,18 +1,20 @@
-// The KPI row: the four figures docs/07-observability.md puts above the fold — success rate, merge
-// rate, MTTR p50 and cost per fix. One module, four tiles: App.tsx mounts one <section> per panel
-// module and theme.css gives the kpi region a single column, so the four-across grid (.kpi-tiles)
-// belongs inside this panel rather than in four sibling modules.
+// The KPI row: the three figures docs/07-observability.md puts above the fold — success rate, merge
+// rate and MTTR p50. One module, three tiles: App.tsx mounts one <section> per panel module and
+// theme.css gives the kpi region a single column, so the tile grid (.kpi-tiles) belongs inside this
+// panel rather than in three sibling modules.
+//
+// A fourth tile reported cost per fix. It was removed with the rest of the spend reporting: Devin
+// reports consumption in ACUs, this account is not billed in ACUs, and the figure was therefore
+// structurally zero — see docs/07-observability.md#analytics-api. Every figure left here is
+// computed from Sentinel's own timestamps.
 
 import type { CSSProperties } from 'react'
 import {
   NO_VALUE,
   formatDurationSeconds,
-  formatNumber,
   formatPercent,
-  formatUsd,
   showData,
   type AnalyticsSummary,
-  type CostSource,
   type PanelProps,
   type PanelSlot,
 } from '../api'
@@ -34,22 +36,10 @@ interface TileProps {
   label: string
   value: string
   caption: string
-  /** A second line, where one figure needs two sentences to be read honestly. */
-  note?: string
 }
 
 /**
- * Where the *ACU count* came from. `cost.source` describes nothing else: the dollars are always
- * `acus × ACU_UNIT_COST_USD`, and docs/09-operations.md has that constant set from the reader's own
- * contract, so no dollar figure on this dashboard is ever Devin's. The label therefore attaches to
- * the ACU line, and the tile states the conversion separately.
- */
-function sourceLabel(source: CostSource): string {
-  return source === 'devin_consumption_api' ? 'from Devin' : 'derived by Sentinel'
-}
-
-/**
- * The four tiles, in the order the spec lists them.
+ * The three tiles, in the order the spec lists them.
  *
  * Each value is the figure the API computed; the funnel decides only whether that figure exists.
  * Every metric here is a ratio or a percentile over a funnel stage, so a stage of zero makes the
@@ -58,7 +48,7 @@ function sourceLabel(source: CostSource): string {
  * docs/adr/2026-08-08-an-undefined-figure-is-an-em-dash.md.
  */
 function tiles(summary: AnalyticsSummary): TileProps[] {
-  const { funnel, rates, durations_seconds, cost } = summary
+  const { funnel, rates, durations_seconds } = summary
 
   return [
     {
@@ -88,30 +78,15 @@ function tiles(summary: AnalyticsSummary): TileProps[] {
           ? `p90 ${formatDurationSeconds(durations_seconds.to_merge.p90)}`
           : 'nothing merged yet',
     },
-    {
-      // ACU per merged fix × ACU_UNIT_COST_USD, as sent: acus_per_merged_fix is already rounded for
-      // display, so multiplying it here would be less accurate than the figure the API derived.
-      label: 'Cost per fix',
-      value: funnel.merged > 0 ? formatUsd(cost.usd_per_fix) : NO_VALUE,
-      caption:
-        funnel.merged > 0
-          ? `${formatNumber(cost.acus_per_merged_fix)} ACU per fix ${sourceLabel(cost.source)}`
-          : 'nothing merged yet',
-      note:
-        funnel.merged > 0
-          ? `priced locally at ${formatUsd(cost.unit_cost_usd)} per ACU`
-          : undefined,
-    },
   ]
 }
 
-function Tile({ label, value, caption, note }: TileProps) {
+function Tile({ label, value, caption }: TileProps) {
   return (
     <div className="kpi-tile" role="group" aria-label={label}>
       <p style={LABEL}>{label}</p>
       <p style={VALUE}>{value}</p>
       <p style={CAPTION}>{caption}</p>
-      {note === undefined ? null : <p style={CAPTION}>{note}</p>}
     </div>
   )
 }

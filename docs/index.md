@@ -7,7 +7,7 @@ an issue on [`taxpon/superset`](https://github.com/taxpon/superset); Sentinel ve
 webhook, opens an autonomous Devin session scoped to that issue, and drives the resulting pull
 request to a merge — re-engaging the *same* session when CI fails or a reviewer requests changes.
 Every state transition is recorded, so the system can answer the question an engineering leader
-actually asks: *is this working, how fast, at what cost, and where does it fail?*
+actually asks: *is this working, how fast, what is it worth, and where does it fail?*
 
 ## Reading order
 

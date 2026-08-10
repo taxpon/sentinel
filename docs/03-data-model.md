@@ -158,8 +158,7 @@ Index: `(status, run_after)`.
 
 ## `acu_ledger`
 
-Daily ACU consumption, synced from Devin's consumption API. Backs the budget guard and the cost
-panel.
+Daily ACU consumption, synced from Devin's consumption API. Backs the budget guard.
 
 | Column | Type | Notes |
 |---|---|---|

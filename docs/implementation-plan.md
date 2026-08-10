@@ -191,7 +191,7 @@ T30 does not wait for T25.
 |---|---|---|---|
 | T30 | Dashboard scaffold | `dashboard/` config, `src/api.ts`, `src/theme.css` | T01 |
 | T31 | KPI row, funnel, throughput | `dashboard/src/panels/{Kpi,Funnel,Throughput}.tsx` | T30 |
-| T32 | Durations, cost, autonomy, failures | `dashboard/src/panels/{Durations,Cost,Autonomy,Failures}.tsx` | T30 |
+| T32 | Durations, autonomy, failures | `dashboard/src/panels/{Durations,Autonomy,Failures}.tsx` | T30 |
 | T33 | Live remediation table and timeline | `dashboard/src/panels/{LiveTable,Timeline}.tsx` | T30 |
 | T34 | End-to-end test including the review-fix loop | `tests/test_e2e.py` | T23, T24, T26 |
 

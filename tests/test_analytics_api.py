@@ -28,7 +28,7 @@ from fastapi.exceptions import ResponseValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from conftest import ClientFactory
-from factories import a_remediation, a_remediation_event, an_acu_ledger_entry
+from factories import a_remediation, a_remediation_event
 from sentinel import db
 from sentinel.api import analytics
 from sentinel.config import Settings, get_settings
@@ -68,13 +68,6 @@ SUMMARY_FIXTURE: dict[str, Any] = {
         "to_merge": {"p50": 6480, "p90": 14400},
         "review_latency": {"p50": 2700, "p90": 7200},
     },
-    "cost": {
-        "acus_total": 61.4,
-        "acus_per_merged_fix": 12.3,
-        "usd_per_fix": 27.6,
-        "unit_cost_usd": 2.25,
-        "source": "devin_consumption_api",
-    },
     "cycles": {"mean": 0.8, "distribution": {"0": 3, "1": 1, "2": 1}},
     "throughput": [{"day": "2026-08-06", "by_class": {"security": 1, "flaky-test": 1}}],
     "failures": [{"reason": "requires_upstream_decision", "count": 1, "issues": [37]}],
@@ -90,13 +83,6 @@ EMPTY_SUMMARY_FIXTURE: dict[str, Any] = {
         "to_pr": {"p50": 0, "p90": 0},
         "to_merge": {"p50": 0, "p90": 0},
         "review_latency": {"p50": 0, "p90": 0},
-    },
-    "cost": {
-        "acus_total": 0,
-        "acus_per_merged_fix": 0,
-        "usd_per_fix": 0,
-        "unit_cost_usd": 2.25,
-        "source": "derived",
     },
     "cycles": {"mean": 0, "distribution": {}},
     "throughput": [],
@@ -342,8 +328,8 @@ async def test_summary_serves_the_figures_the_metrics_module_computed(
 ) -> None:
     """The seeded window, figure by figure — so the endpoint cannot be serving a constant.
 
-    The window is what makes these the numbers: the thirtieth-day remediation merged 99 ACUs' worth
-    of work and appears in none of them.
+    The window is what makes these the numbers: the thirtieth-day remediation appears in none of
+    them.
     """
     await seed(session)
 
@@ -357,12 +343,6 @@ async def test_summary_serves_the_figures_the_metrics_module_computed(
         "merged": 2,
     }
     assert body["rates"] == {"success": 0.4, "merge": 0.667, "autonomy": 0.5}
-    assert body["cost"]["acus_total"] == 26.0
-    assert body["cost"]["acus_per_merged_fix"] == 13.0
-    # 13.0 ACUs at $2.25 is $29.25, published at the one decimal place every per-fix figure is
-    # rounded to — once, in the metrics module, so that no two panels disagree.
-    assert body["cost"]["usd_per_fix"] == 29.2
-    assert body["cost"]["unit_cost_usd"] == 2.25
     assert body["cycles"] == {"mean": 0.2, "distribution": {"0": 4, "1": 1}}
     assert body["failures"] == [
         {"reason": "requires_upstream_decision", "count": 1, "issues": [104]}
@@ -388,23 +368,6 @@ async def test_summary_durations_are_the_seconds_between_the_seeded_timestamps(
         "to_merge": {"p50": 4 * 3600, "p90": 8 * 3600},
         "review_latency": {"p50": 1 * 3600, "p90": 2 * 3600},
     }
-
-
-async def test_cost_is_labelled_devin_s_only_when_the_ledger_covers_every_day(
-    client: httpx.AsyncClient, session: AsyncSession
-) -> None:
-    """`cost.source` is provenance the cost panel renders; an unsynced day makes it `derived`."""
-    await seed(session)
-    assert (await get_summary(client))["cost"]["source"] == "derived"
-
-    covered = NOW.date() - datetime.timedelta(days=DEFAULT_WINDOW_DAYS)
-    session.add_all(
-        an_acu_ledger_entry(day=covered + datetime.timedelta(days=offset))
-        for offset in range(DEFAULT_WINDOW_DAYS + 1)
-    )
-    await session.commit()
-
-    assert (await get_summary(client))["cost"]["source"] == "devin_consumption_api"
 
 
 # ------------------------------------------------------------------------------ the empty window
@@ -434,13 +397,6 @@ async def test_an_empty_database_answers_with_a_complete_payload_of_zeros(
         "to_pr": {"p50": 0, "p90": 0},
         "to_merge": {"p50": 0, "p90": 0},
         "review_latency": {"p50": 0, "p90": 0},
-    }
-    assert body["cost"] == {
-        "acus_total": 0.0,
-        "acus_per_merged_fix": 0.0,
-        "usd_per_fix": 0.0,
-        "unit_cost_usd": 2.25,
-        "source": "derived",
     }
     assert body["cycles"] == {"mean": 0.0, "distribution": {}}
     assert body["throughput"] == []
@@ -514,8 +470,8 @@ async def test_a_malformed_window_is_a_client_error_naming_the_parameter(
 
 
 async def test_a_window_of_no_time_at_all_is_rejected(client: httpx.AsyncClient) -> None:
-    """`Window` is a public dataclass and `_cost_source` guards against a degenerate one; the API
-    never builds one, because `0d` never reaches `Window` at all."""
+    """`Window` is a public dataclass, so a degenerate one is constructible; the API never builds
+    one, because `0d` never reaches `Window` at all."""
     response = await client.get(SUMMARY_URL, params={"window": "0d"})
 
     assert response.status_code == 400, response.text

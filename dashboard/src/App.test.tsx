@@ -139,22 +139,22 @@ describe('the shell', () => {
 
     const exploding: PanelModule = {
       default: () => {
-        throw new Error('cannot read acus_per_merged_fix of undefined')
+        throw new Error('cannot read mean of undefined')
       },
       slot: 'chart',
-      title: 'Cost',
+      title: 'Autonomy',
     }
 
     await renderApp({
       fetcher: resolving(),
       panels: {
-        './panels/Cost.tsx': exploding,
+        './panels/Autonomy.tsx': exploding,
         './panels/Funnel.tsx': panel('Funnel', 'chart'),
         './panels/Kpi.tsx': panel('KPI', 'kpi'),
       },
     })
 
-    expect(screen.getByText('Cost panel failed.')).toBeInTheDocument()
+    expect(screen.getByText('Autonomy panel failed.')).toBeInTheDocument()
     // Everything the reader needs to tell whether the pipeline is running is still there.
     expect(screen.getByRole('heading', { level: 1, name: 'Sentinel' })).toBeInTheDocument()
     expect(document.querySelector('.freshness')).toHaveTextContent('updated 0s ago')
