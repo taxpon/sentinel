@@ -211,24 +211,48 @@ def validate_tag(tag: str) -> str:
     return tag
 
 
+def session_identity(*, repo: str, issue_number: int) -> list[str]:
+    """The tags that say **which remediation** a session belongs to — and nothing else about it.
+
+    This is Sentinel's idempotency key for session creation, and it is a key because the database
+    already treats it as one: `remediation` is `UNIQUE (repo, issue_number)`
+    (`docs/adr/2026-08-07-two-layer-deduplication.md`), so one repository and one issue number name
+    one remediation for the lifetime of the deployment, and a remediation has at most one session —
+    the review-fix loop resumes the session it has rather than creating another
+    (`docs/adr/2026-08-07-reuse-resumable-sessions.md`).
+
+    Deliberately **not** `run:<delivery_id>`. That tag identifies the webhook delivery a session was
+    created for, which is narrower: two deliveries about one issue would carry two run ids and match
+    nothing of each other's, so a lookup keyed on it would miss a session a *previous* job had
+    created and lost. The three tags here are the same for every attempt, by every worker, for ever.
+
+    Returned in the order `session_tags` sends them, and consumed by it, so the tags a lookup
+    searches for cannot drift from the tags a creation writes.
+    """
+    return [validate_tag(tag) for tag in (NAMESPACE_TAG, f"repo:{repo}", f"issue:{issue_number}")]
+
+
 def session_tags(
     *, repo: str, issue_number: int, issue_class: str | IssueClass, delivery_id: str
 ) -> list[str]:
     """The tag set every session is created with, in the order the spec tabulates it.
+
+    The first three are `session_identity` — what the adopt-or-create lookup searches on — and the
+    two below them describe this particular attempt.
 
     An unhandled class raises `UnknownIssueClass` here too, rather than surfacing as a rejected
     `class:` tag: it is the same condition the worker already routes to `BLOCKED`, and one edge of
     the state machine should not need two exceptions caught to implement it.
     """
     return [
-        validate_tag(tag)
-        for tag in (
-            NAMESPACE_TAG,
-            f"repo:{repo}",
-            f"issue:{issue_number}",
-            f"class:{parse_issue_class(str(issue_class))}",
-            f"run:{delivery_id}",
-        )
+        *session_identity(repo=repo, issue_number=issue_number),
+        *(
+            validate_tag(tag)
+            for tag in (
+                f"class:{parse_issue_class(str(issue_class))}",
+                f"run:{delivery_id}",
+            )
+        ),
     ]
 
 

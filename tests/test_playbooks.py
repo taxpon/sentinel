@@ -246,6 +246,50 @@ def test_session_tags_are_the_creation_time_tags_in_spec_order() -> None:
     ]
 
 
+def test_the_identity_tags_are_the_first_of_the_tags_a_session_is_created_with() -> None:
+    """Sentinel's idempotency key, and the reason `create_session` can look before it posts.
+
+    `session_identity` is what the adopt-or-create lookup filters on and `session_tags` is what a
+    creation writes. If the first stopped being a prefix of the second, the lookup would search for
+    a combination no session carries, find nothing every time, and go back to creating a session
+    per attempt — silently, because nothing else would fail.
+    """
+    created = pb.session_tags(
+        repo="taxpon/superset",
+        issue_number=42,
+        issue_class=pb.IssueClass.SECURITY,
+        delivery_id="8f1c2d3e-4b5a",
+    )
+    identity = pb.session_identity(repo="taxpon/superset", issue_number=42)
+
+    assert identity == ["sentinel", "repo:taxpon/superset", "issue:42"]
+    assert created[: len(identity)] == identity
+
+
+def test_the_identity_tags_name_one_remediation_and_not_one_attempt() -> None:
+    """Two deliveries about one issue carry different `run:` tags and the same identity.
+
+    That is the whole difference between adopting the session a *previous* job created and missing
+    it — which is the duplicate arriving a minute later rather than a second later.
+    """
+    first = pb.session_tags(
+        repo="taxpon/superset", issue_number=42, issue_class="security", delivery_id="one"
+    )
+    second = pb.session_tags(
+        repo="taxpon/superset", issue_number=42, issue_class="security", delivery_id="two"
+    )
+    identity = set(pb.session_identity(repo="taxpon/superset", issue_number=42))
+
+    assert first != second
+    assert identity <= set(first) and identity <= set(second)
+
+
+def test_the_identity_tags_are_all_in_the_registered_vocabulary() -> None:
+    """They are sent as a listing filter, so an unregistered one would be a 422 on the lookup —
+    which is now the call a creation depends on."""
+    assert [pb.validate_tag(tag) for tag in pb.session_identity(repo="a/b", issue_number=1)]
+
+
 def test_the_exported_vocabulary_is_what_validation_enforces() -> None:
     """`make bootstrap-devin` registers `NAMESPACE_TAG` and `TAG_PREFIXES` with
     `PUT /v3/organizations/{org_id}/tags`. If the bootstrap script could register a list that
