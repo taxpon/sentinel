@@ -36,9 +36,17 @@ the rule the team lead approved and is flagged in the report; see the ADR's alte
 - [x] `docs/blockers.md` B2, `docs/fork-ci/README.md` step 2 as a prerequisite, with PR #9 recorded
 - [x] ADR + its row in `docs/02-architecture.md`
 - [x] `tasks/lessons.md` — the single-suite test double
-- [x] `make ci` — ruff and mypy clean
+- [x] `make ci` — 1902 passed, ruff and mypy clean
+
+## Second addition: a merge is recorded from any state
+
+- [x] `webhooks.py` — `merged_at` stamped from `Trigger.PR_MERGED`, outside the `moved` branch
+- [x] Funnel checked rather than assumed: `metrics.summary` already counts from `merged_at`, so the
+      column was the bug and the query was not
+- [x] Tests — `BLOCKED` and `FAILED` receive a merge; funnel, MTTR and throughput all count it
+- [x] `docs/04` invariant 1, `docs/03` funnel definition, ADR + its `docs/02` row
 - [x] Layer 1 verified done on the fork (1 active, 45 `disabled_manually`); B2, `docs/08`,
-      fork-ci step 2 and the CI ADR record it as done
+      fork-ci step 2 and the CI ADR updated from "outstanding" to "done"
 
 ## Review
 

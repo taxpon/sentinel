@@ -358,6 +358,50 @@ async def test_the_window_owns_its_first_instant_and_not_its_last(
     ]
 
 
+async def test_a_merge_after_an_escalation_still_counts_as_merged(
+    session: AsyncSession, settings: Settings
+) -> None:
+    """The funnel counts merges from `merged_at`, not from `state`, and this is the case that makes
+    the difference load-bearing rather than incidental.
+
+    Remediation 1 escalated to `BLOCKED` and a human resolved it by merging the pull request. The
+    state stays `BLOCKED` — the escalation happened, and flattening it away would be a second lie —
+    but the merge happened too, and a funnel reading `merged: 0` beside a link to a merged pull
+    request is a row contradicting the thing it links to.
+    """
+    merged_at = WINDOW.start + datetime.timedelta(hours=3)
+    await seed(
+        session,
+        (
+            {
+                "issue_number": 120,
+                "issue_class": "flaky-test",
+                "state": "BLOCKED",
+                "labeled_at": WINDOW.start,
+                "blocked_reason": "devin_reported_blocked",
+                "pr_number": 9,
+                "pr_url": "https://github.com/taxpon/superset/pull/9",
+                "pr_opened_at": WINDOW.start + datetime.timedelta(hours=1),
+                "merged_at": merged_at,
+            },
+        ),
+    )
+
+    payload = await summarise(session, settings)
+
+    assert payload["funnel"]["merged"] == 1
+    assert payload["funnel"]["pr_opened"] == 1
+    # A merge everywhere a merge is counted, not only in the funnel.
+    assert payload["durations_seconds"]["to_merge"]["p50"] == 3 * 60 * 60
+    assert payload["throughput"] == [
+        {"day": merged_at.date().isoformat(), "by_class": {"flaky-test": 1}}
+    ]
+    # And the escalation is still visible: recording the merge did not erase why a human was needed.
+    assert payload["failures"] == [
+        {"reason": "devin_reported_blocked", "count": 1, "issues": [120]}
+    ]
+
+
 async def test_an_empty_window_is_a_complete_payload_of_zeros(
     session: AsyncSession, settings: Settings
 ) -> None:

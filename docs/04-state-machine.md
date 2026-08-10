@@ -212,11 +212,24 @@ line-by-line would defeat the purpose and is explicitly avoided ([05](./05-devin
 
 ## Invariants
 
-1. **Terminal states are absorbing.** No transition leaves `MERGED`, `BLOCKED` or `FAILED`, and a
-   webhook arriving after one is recorded and otherwise ignored: in `remediation_event` where it
-   carried a trigger, and in `webhook_delivery` alone where it did not. A `check_suite.completed`
-   after a merge is the second kind — it asks for an evaluation rather than carrying a verdict, and
-   a terminal remediation is not evaluated at all.
+1. **Terminal states are absorbing — for work, not for observation.** No transition leaves `MERGED`,
+   `BLOCKED` or `FAILED`, and a webhook arriving after one is recorded and otherwise ignored: in
+   `remediation_event` where it carried a trigger, and in `webhook_delivery` alone where it did not.
+   A `check_suite.completed` after a merge is the second kind — it asks for an evaluation rather
+   than carrying a verdict, and a terminal remediation is not evaluated at all.
+
+   **`merged_at` is the exception, and is stamped from any state.** A merge is a fact about the pull
+   request rather than a state the remediation entered, and the two come apart whenever a human
+   resolves an escalation by merging: `PR_MERGED` is legal only from `IN_REVIEW`, so a `BLOCKED`
+   remediation absorbs it. Remediation 1 ended exactly there — its last event is
+   `BLOCKED -> BLOCKED pr_merged`, `merged_at` stayed null, and the funnel read `merged: 0` beside a
+   link to a pull request GitHub shows as merged. **No row may contradict the pull request it links
+   to**, so the column is written whether or not the state moves.
+
+   The state is deliberately left alone. Flattening `BLOCKED` to `MERGED` would erase the
+   escalation, which also happened, and the failure breakdown in [07](./07-observability.md) would
+   lose the row that a human's involvement is the whole point of. `BLOCKED` with a `merged_at` is
+   not a contradiction — it is what "escalated, and then a person merged it" looks like.
 2. **One session per remediation.** Guaranteed by `UNIQUE (repo, issue_number)` plus
    `INSERT … ON CONFLICT DO NOTHING` ([03](./03-data-model.md)).
 3. **`cycle` only increases,** and only on a transition into `RUNNING` from `CI_FAILED` or

@@ -666,6 +666,48 @@ async def test_a_completed_check_suite_moves_nothing_by_itself(
     assert job.kind == JobKind.EVALUATE_CI
 
 
+@pytest.mark.parametrize("state", ["BLOCKED", "FAILED"])
+async def test_a_merge_is_stamped_even_where_it_moves_nothing(
+    state: str,
+    client: httpx.AsyncClient,
+    delivery: DeliveryFactory,
+    session: AsyncSession,
+) -> None:
+    """Remediation 1 sat in `BLOCKED` while a human resolved the escalation by merging its pull
+    request. `PR_MERGED` is legal only from `IN_REVIEW`, so a terminal state absorbed it,
+    `merged_at` was never stamped, and the funnel reported `merged: 0` beside a link to a pull
+    request GitHub shows as merged.
+
+    The state is deliberately left alone — flattening it to `MERGED` would erase the escalation,
+    which is a real thing that happened. Only the observation is recorded.
+    """
+    await seed(session, **linked(state=state))
+
+    response = await post(client, delivery("pull_request.closed.merged"))
+
+    assert response.status_code == 202
+    remediation = await one(session, Remediation)
+    assert remediation.state == state, "a merge does not undo an escalation"
+    assert remediation.merged_at is not None, "but it is still a merge, and it is recorded"
+    event = await one(session, RemediationEvent)
+    assert (event.from_state, event.to_state) == (state, state)
+    assert event.detail["trigger"] == "pr_merged"
+
+
+async def test_a_merge_observed_twice_keeps_the_first_time(
+    client: httpx.AsyncClient, delivery: DeliveryFactory, session: AsyncSession
+) -> None:
+    """`merged_at` is when the pull request was merged, not when the latest delivery about it
+    arrived — MTTR and review latency are both subtractions from it."""
+    merged = datetime.datetime(2026, 8, 7, 16, 0, tzinfo=datetime.UTC)
+    await seed(session, **linked(state="BLOCKED", merged_at=merged))
+
+    await post(client, delivery("pull_request.closed.merged"))
+
+    remediation = await one(session, Remediation)
+    assert remediation.merged_at == merged
+
+
 async def test_a_check_suite_completing_after_a_merge_asks_for_nothing(
     client: httpx.AsyncClient, delivery: DeliveryFactory, session: AsyncSession
 ) -> None:

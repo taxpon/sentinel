@@ -482,6 +482,16 @@ async def _write(
         remediation.cycle = result.cycle
         _stamp(remediation, result.to_state, reason, now)
 
+    # Outside the `moved` branch on purpose, and the only column that is. Every other timestamp
+    # records a state the remediation entered; `merged_at` records something that happened to the
+    # pull request, and that stays true when the remediation is somewhere a merge cannot move it
+    # from. Remediation 1 sat in `BLOCKED` while a human resolved the escalation by merging its
+    # pull request: the trigger absorbed, nothing was stamped, and the funnel read `merged: 0`
+    # against a merge anybody could see on GitHub. Being terminal for *work* was allowed to mean
+    # terminal for *observation* — see `docs/04-state-machine.md`, invariant 1.
+    if result.trigger is Trigger.PR_MERGED:
+        remediation.merged_at = remediation.merged_at or now
+
     session.add(
         RemediationEvent(
             remediation_id=remediation.id,
@@ -529,11 +539,12 @@ def _stamp(
     `CI_PASSED` and `IN_REVIEW` — but not from `CI_FAILED`, where a re-run that goes green is a real
     move onto a pull request that has been green before. The guard is what keeps the column the
     first one.
+
+    **`merged_at` is not here**, though `MERGED` is a state. It is stamped by the caller from the
+    trigger instead, because a merge is observed whether or not it moves anything.
     """
     if to_state is State.CI_PASSED:
         remediation.ci_green_at = remediation.ci_green_at or now
-    elif to_state is State.MERGED:
-        remediation.merged_at = now
     elif to_state is State.FAILED:
         # The column, not only the event. `docs/07-observability.md` computes the failure breakdown
         # as a count grouped by `blocked_reason` over `state in (BLOCKED, FAILED)`, so a reason that
