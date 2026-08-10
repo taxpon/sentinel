@@ -29,8 +29,8 @@ import pytest
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from conftest import DEVIN_TOKEN, FakeAPI
-from factories import ISSUE_CLASS, a_remediation
+from conftest import DEVIN_TOKEN, Configure, FakeAPI
+from factories import ISSUE_CLASS, a_remediation, a_remediation_event
 from sentinel.config import Settings
 from sentinel.devin.client import SESSION, DevinClient
 from sentinel.devin.playbooks import acu_cap_for
@@ -868,11 +868,158 @@ async def test_the_question_is_recorded_once_rather_than_every_tick(
     assert note.detail == {
         "source": poller.SOURCE,
         "note": poller.SESSION_QUESTION_AFTER_PULL_REQUEST,
+        "cycle": 0,
         "devin_session_id": SESSION_ID,
         "devin_status": SessionStatus.RUNNING.value,
     }
     await session.refresh(remediation)
     assert remediation.state == State.PR_OPENED.value
+
+
+async def test_a_question_on_a_later_fix_cycle_is_recorded_again(
+    seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
+) -> None:
+    """ "Once" is per fix cycle, and that is the difference between an annotation and a gag.
+
+    `pr_url` is write-once and never cleared, so the condition that suppresses the escalation stays
+    true for the rest of the remediation's life. Keyed on the remediation alone, an offer recorded
+    on cycle 0 would swallow a *different* question asked on cycle 1 — one raised part-way through
+    a fix, where the session may genuinely be stuck — and with the escalation gone by design that
+    question would produce no state change, no row and no metric at all.
+
+    The remediation here is on lap two of the fix loop — `CI_FAILED`, `cycle: 1`, pull request long
+    since linked — which is where this change is most consequential and where the old rule would
+    have ended it. It already carries the cycle-0 note.
+    """
+    remediation = await seed(
+        state=State.CI_FAILED.value, cycle=1, pr_url=PR_URL, pr_number=PR_NUMBER
+    )
+    session.add(
+        a_remediation_event(
+            remediation_id=remediation.id,
+            from_state=State.PR_OPENED.value,
+            to_state=State.PR_OPENED.value,
+            kind=poller.OBSERVATION,
+            detail={
+                "source": poller.SOURCE,
+                "note": poller.SESSION_QUESTION_AFTER_PULL_REQUEST,
+                "cycle": 0,
+            },
+        )
+    )
+    await session.commit()
+    devin_api.responds(
+        "GET",
+        session_path,
+        200,
+        a_session(
+            status="running", status_detail="waiting_for_user", pull_requests=a_pull_request()
+        ),
+    )
+
+    for _ in range(2):
+        await poll()
+
+    await session.refresh(remediation)
+    assert remediation.state == State.CI_FAILED.value
+    assert remediation.blocked_reason is None
+    cycles = [(event.detail or {}).get("cycle") for event in await events(session)]
+    assert cycles == [0, 1], "the later question is its own row, and still only one of it"
+
+
+async def test_a_database_fault_writing_the_note_does_not_take_the_transition_with_it(
+    seed: Seed,
+    session: AsyncSession,
+    devin_api: FakeAPI,
+    session_path: str,
+    poll: Poll,
+    capture: Configure,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The note is an annotation and must never be able to veto a state transition.
+
+    It is written in the same transaction as the transitions, before the commit, so an exception
+    escaping it would roll back the whole reconciliation — `PR_OPENED`, `pr_url`, `pr_number`,
+    `pr_opened_at`. `poll_once` would log and carry on, the next tick would see the same session
+    and fail in exactly the same place, and it would do that for ever while the heartbeat and
+    `poller_lag_seconds` stayed green, because `_beat` runs whatever the rows did.
+
+    The failure injected here is a real one — a statement against a table that does not exist —
+    rather than a raise from a mock, because that is what has to be survived: it poisons the
+    transaction, and only unwinding to the `SAVEPOINT` leaves the session able to commit at all.
+    """
+    logs = capture()
+    remediation = await seed(state=State.RUNNING.value)
+
+    async def explode(db: AsyncSession, remediation_id: int, cycle: int) -> bool:
+        await db.execute(text("SELECT 1 FROM a_table_that_does_not_exist"))
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(poller, "_already_noted", explode)
+    devin_api.responds(
+        "GET",
+        session_path,
+        200,
+        a_session(
+            status="running", status_detail="waiting_for_user", pull_requests=a_pull_request()
+        ),
+    )
+
+    assert (await poll()) == poller.Tick(polled=1, moved=1, unreachable=0, failed=0)
+
+    await session.refresh(remediation)
+    assert remediation.state == State.PR_OPENED.value
+    assert (remediation.pr_url, remediation.pr_number) == (PR_URL, PR_NUMBER)
+    assert remediation.pr_opened_at is not None
+    # The transition is in the log and the note is not, which is the whole trade.
+    assert [event.kind for event in await events(session)] == ["transition"]
+    # And the tick says so: the transition, then the question, then the failure to record it.
+    assert [
+        record["event"] for record in logs.records if record["event"].startswith("poller.")
+    ] == [
+        "poller.remediation.moved",
+        "poller.session.question_after_pull_request",
+        "poller.session.question_unrecorded",
+        "poller.tick",
+    ]
+
+
+async def test_the_question_is_logged_on_every_tick_it_is_seen(
+    seed: Seed,
+    session: AsyncSession,
+    devin_api: FakeAPI,
+    session_path: str,
+    poll: Poll,
+    capture: Configure,
+) -> None:
+    """Deduplicating the row must not deduplicate the signal.
+
+    The row is written once per fix cycle, so on every tick after the first there is nothing in the
+    database to say the session is still waiting. The log line is what remains, and it is emitted
+    before the deduplication and regardless of whether a row follows — so the condition is never
+    entirely silent, whether it was already recorded or could not be recorded at all.
+    """
+    logs = capture()
+    await seed(state=State.PR_OPENED.value, pr_url=PR_URL, pr_number=PR_NUMBER)
+    devin_api.responds(
+        "GET",
+        session_path,
+        200,
+        a_session(
+            status="running", status_detail="waiting_for_user", pull_requests=a_pull_request()
+        ),
+    )
+
+    for _ in range(3):
+        await poll()
+
+    asked = [
+        record
+        for record in logs.records
+        if record["event"] == "poller.session.question_after_pull_request"
+    ]
+    assert [record["cycle"] for record in asked] == [0, 0, 0]
+    assert len(await events(session)) == 1, "three lines, one row"
 
 
 async def test_a_question_arriving_with_the_first_pull_request_links_it_and_records_the_question(
@@ -906,12 +1053,16 @@ async def test_a_question_arriving_with_the_first_pull_request_links_it_and_reco
     ]
 
 
-async def test_a_blocked_report_still_escalates_with_a_pull_request_open(
+async def test_a_blocked_report_escalates_and_is_not_also_annotated(
     seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
 ) -> None:
     """Only the `waiting_for_user` reading is conditional on the pull request. `outcome: blocked`
-    is Devin saying outright that it cannot go on, which is the cause `docs/04-state-machine.md`
-    tabulates and which a pull request does not answer."""
+    is Devin saying outright that it cannot go on, which a pull request does not answer.
+
+    And the tick that escalates writes no note. The note is the *alternative* to an escalation, so
+    a `BLOCKED -> BLOCKED` observation row beside the transition would assert both readings of one
+    observation — which is not what `docs/04-state-machine.md` says.
+    """
     remediation = await seed(state=State.PR_OPENED.value, pr_url=PR_URL, pr_number=PR_NUMBER)
     devin_api.responds(
         "GET",
@@ -930,6 +1081,7 @@ async def test_a_blocked_report_still_escalates_with_a_pull_request_open(
     await session.refresh(remediation)
     assert remediation.state == State.BLOCKED.value
     assert remediation.blocked_reason == "needs a key"
+    assert [event.kind for event in await events(session)] == ["transition"]
 
 
 # --- What Devin will not answer -------------------------------------------------------------------

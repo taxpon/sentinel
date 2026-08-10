@@ -33,10 +33,11 @@ reports them and GitHub never hears about them
 **The pull request is what tells a stall from an offer.** `status_detail: waiting_for_user` covers
 both a session that cannot go on without an answer and one that has delivered its pull request and
 is offering to do something further. Before a pull request exists the first reading is the only one
-available and the remediation escalates; after it, the session is finished with what it was asked
-for and the remediation carries on through CI and review, with the question recorded once as an
-observation rather than as an escalation
-(`docs/adr/2026-08-10-an-offer-after-the-pull-request-is-not-a-stall.md`).
+available and the remediation escalates; after it, the remediation carries on through CI and review
+and the question is recorded once per fix cycle as an observation rather than as an escalation. The
+test is the existence of a pull request, which is a good proxy for "the work was delivered" and not
+the same statement — what that costs is set out in the Consequences of
+`docs/adr/2026-08-10-an-offer-after-the-pull-request-is-not-a-stall.md`.
 
 **Reconciliation is idempotent**, because it runs every tick and almost every tick sees exactly what
 the last one saw. Two rules make it so, and between them they cover every trigger:
@@ -70,6 +71,7 @@ from typing import Any, Final
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sentinel.config import Settings, get_settings
@@ -106,6 +108,10 @@ resuming the session, with a cycle increment this observation knows nothing abou
 
 ESCALATED_STATES: Final[frozenset[State]] = frozenset({State.BLOCKED, State.FAILED})
 """The two terminal states `docs/04-state-machine.md` escalates rather than ends at."""
+
+ESCALATING_TRIGGERS: Final[frozenset[Trigger]] = frozenset({Trigger.BLOCKED, Trigger.FAILED})
+"""The triggers that lead to `ESCALATED_STATES`. An observation carrying one is not annotated —
+`SESSION_QUESTION_AFTER_PULL_REQUEST` is the *alternative* to an escalation, not a companion."""
 
 SOURCE: Final = "poller"
 """Recorded on every event this module writes. A poller transition carries no
@@ -158,9 +164,14 @@ seen waiting on a human.
 
 Devin ends a session by offering to do something further — run the app end to end, take a related
 fix — and asking sets `status_detail: waiting_for_user` on a session it has otherwise finished. That
-is not an escalation, so nothing else would record that it happened. Written **once** per
-remediation: the condition persists, and the poller re-reads the same session every
-`POLL_INTERVAL_SECONDS`, so a row per tick would say the same thing a few hundred times."""
+is not an escalation, so nothing else would record that it happened. Written **once per fix cycle**:
+the condition persists, and the poller re-reads the same session every `POLL_INTERVAL_SECONDS`, so a
+row per tick would say the same thing a few hundred times — but a question asked on a later lap is a
+different question and gets its own row.
+
+The condition tested is only that a pull request exists, so "an offer" is the *likeliest* reading of
+it rather than the only one; what the ADR's Consequences accept losing is the genuinely stuck
+session on the far side of that line."""
 
 PR_NUMBER_UNRESOLVED: Final = "pr_number_unresolved"
 """Recorded in `remediation_event.detail`, against the URL it was derived from, on every transition
@@ -237,17 +248,23 @@ def waiting_on_a_human(session: Session) -> bool:
 def blocked_reason(session: Session, *, has_pull_request: bool) -> str | None:
     """Why this observation says the remediation cannot proceed, or `None` if it does not.
 
-    Two causes, both of which `docs/04-state-machine.md` escalates. Devin reporting
-    `outcome: blocked` is the one the spec tabulates, and it escalates whatever else is true — it is
-    Devin saying outright that it cannot go on.
+    Two causes, both tabulated by `docs/04-state-machine.md`. `outcome: blocked` in the structured
+    report escalates whatever else is true — it is Devin saying outright that it cannot go on.
 
     The other is a session in one of `STALLED_STATUSES` reporting `waiting_for_user`, **and only
     while no pull request exists**. Before the pull request the session is stuck on a question
     nothing in an unattended pipeline will answer, and without this it would look busy for ever.
-    After it, the work asked for has been delivered and the question is about something further —
-    Devin routinely ends a session by offering one — so escalating would end a remediation that is
-    finished, and `BLOCKED` is terminal
-    (`docs/adr/2026-08-10-an-offer-after-the-pull-request-is-not-a-stall.md`).
+    After it, escalating would end a remediation whose work has been delivered, and `BLOCKED` is
+    terminal — the reading, and what it accepts losing, are in
+    `docs/adr/2026-08-10-an-offer-after-the-pull-request-is-not-a-stall.md`. Note that the condition
+    is the existence of a pull request and nothing finer: from the second fix cycle onwards it also
+    covers a session part-way through a fix, which has delivered nothing new and could be stuck.
+
+    **The waiting branch is checked first, and that is a real precedence.** A pre-pull-request
+    session that is both waiting *and* reporting `outcome: blocked` is stored as
+    `session_waiting_for_user`, so Devin's own reason is discarded — and the failure-breakdown panel
+    of `docs/07-observability.md` groups on exactly that column. It escalates either way and to the
+    same state, so what is lost is the label rather than the response.
 
     Which statuses count matters as much as the detail: a `suspended` or `exit` session idling
     between fix cycles also waits for input, and that is the normal state of every remediation in
@@ -398,7 +415,11 @@ async def reconcile(
     Columns first — status, ACUs, the structured report — then the triggers the observation carries,
     then the one thing worth recording that is not a trigger. All three are idempotent: an unchanged
     column is not written, a trigger that moves nothing returns nothing, and the note is written at
-    most once per remediation.
+    most once per fix cycle.
+
+    An observation that escalates is not annotated. `docs/04-state-machine.md` frames the note as
+    the *alternative* to an escalation — a session reporting `outcome: blocked` while it happens to
+    be waiting is blocked, and a row saying both would contradict the spec.
     """
     _reconcile_columns(remediation, session)
     pull_request = session.pull_requests[0] if session.pull_requests else None
@@ -411,9 +432,14 @@ async def reconcile(
         )
         if result is not None:
             moved.append(result)
+    escalating = any(trigger in ESCALATING_TRIGGERS for trigger, _ in observed)
     # After the triggers, so that the tick which links the pull request records the link first and
     # the question against the state that link produced.
-    if waiting_on_a_human(session) and pull_request_exists(session, pr_linked=pr_linked):
+    if (
+        not escalating
+        and waiting_on_a_human(session)
+        and pull_request_exists(session, pr_linked=pr_linked)
+    ):
         await _note_question(db, remediation)
     return tuple(moved)
 
@@ -587,7 +613,7 @@ def _event(remediation: Remediation, result: Transition, reason: str | None) -> 
 
 
 async def _note_question(db: AsyncSession, remediation: Remediation) -> None:
-    """Record, once, that the session asked something after its pull request was open.
+    """Record, once per fix cycle, that the session asked something after its pull request opened.
 
     Nothing else records it. The question moves no state — that is the whole point of
     `docs/adr/2026-08-10-an-offer-after-the-pull-request-is-not-a-stall.md` — so without this row
@@ -599,32 +625,68 @@ async def _note_question(db: AsyncSession, remediation: Remediation) -> None:
     holds, and a counter in the poller's memory would be lost on every restart and absent whenever
     `poll_once` is called directly. "Has this been recorded" does not have that problem: the
     append-only log already answers it, durably and from any process.
+
+    **Keyed on the cycle, not on the remediation.** `pr_url` is write-once and never cleared, so
+    the condition that suppresses the escalation stays true for the rest of the remediation's life.
+    Without the cycle in the key, an offer recorded on cycle 0 would swallow a *different* question
+    asked on cycle 1 — one raised part-way through a fix, which is the case where the session may
+    genuinely be stuck — and that question would then produce no state change, no row and no metric.
+
+    **The log line is unconditional, and precedes the guard.** It is emitted on every tick the
+    condition holds, whether or not a row follows, so the one thing this function must never be is
+    entirely silent: neither the dedup nor a failed write can leave the condition unobservable.
     """
-    if await _already_noted(db, remediation.id):
-        return
-    db.add(
-        RemediationEvent(
-            remediation_id=remediation.id,
-            from_state=remediation.state,
-            to_state=remediation.state,
-            kind=OBSERVATION,
-            detail={
-                "source": SOURCE,
-                "note": SESSION_QUESTION_AFTER_PULL_REQUEST,
-                "devin_session_id": remediation.devin_session_id,
-                "devin_status": remediation.devin_status,
-            },
-        )
+    log.info(
+        "poller.session.question_after_pull_request",
+        state=remediation.state,
+        cycle=remediation.cycle,
     )
-    log.info("poller.session.question_after_pull_request", state=remediation.state)
+    # The transitions go to the database before the savepoint mark. Rolling back to a savepoint
+    # undoes everything after it, and an autoflush inside the block below would put the transition
+    # rows there — so a failure writing this note would silently discard them while the ORM went on
+    # believing they were persisted. `begin_nested` flushes for us (SQLAlchemy `orm/session.py`,
+    # `_take_snapshot`), but resting the note's isolation on that would make it an implementation
+    # detail of the library rather than something this function states. A failure here is a failure
+    # of the reconciliation and still propagates, exactly as it did when `commit()` flushed it.
+    await db.flush()
+    # A savepoint, so a database fault writing the note cannot take the transitions down with it.
+    # This runs inside `_reconcile_one`'s transaction: an exception escaping would roll back the
+    # whole reconciliation — `PR_OPENED`, `pr_url`, `pr_number`, `pr_opened_at` — `poll_once` would
+    # log and continue, and the next tick would see the same session and fail identically, for ever,
+    # while the heartbeat and `poller_lag_seconds` stayed green. The transitions are load-bearing
+    # and this row is an annotation; the savepoint is what makes that structural rather than a
+    # convention. `SQLAlchemyError` and not `Exception`: every database fault arrives as one, while
+    # a fault in building the row is our bug and should be seen.
+    try:
+        async with db.begin_nested():
+            if await _already_noted(db, remediation.id, remediation.cycle):
+                return
+            db.add(
+                RemediationEvent(
+                    remediation_id=remediation.id,
+                    from_state=remediation.state,
+                    to_state=remediation.state,
+                    kind=OBSERVATION,
+                    detail={
+                        "source": SOURCE,
+                        "note": SESSION_QUESTION_AFTER_PULL_REQUEST,
+                        "cycle": remediation.cycle,
+                        "devin_session_id": remediation.devin_session_id,
+                        "devin_status": remediation.devin_status,
+                    },
+                )
+            )
+    except SQLAlchemyError as exc:
+        log.warning("poller.session.question_unrecorded", error=str(exc))
 
 
-async def _already_noted(db: AsyncSession, remediation_id: int) -> bool:
-    """Whether this remediation's log already carries the note.
+async def _already_noted(db: AsyncSession, remediation_id: int, cycle: int) -> bool:
+    """Whether this remediation's log already carries the note for `cycle`.
 
-    Indexed by `(remediation_id, created_at)`, and asked only on the ticks where the condition
-    holds — which is every tick once it does, so the query is the price of not writing a row every
-    twenty seconds for the rest of the remediation's life.
+    The `(remediation_id, created_at)` index serves the leading column, so this reads the handful of
+    events one remediation has rather than the table. It is asked only on the ticks where the
+    condition holds — which is not every tick for ever: a resume moves the status out of
+    `STALLED_STATUSES`, and a terminal state drops the remediation out of `POLLED_STATES`.
     """
     found = await db.scalar(
         select(RemediationEvent.id)
@@ -632,6 +694,7 @@ async def _already_noted(db: AsyncSession, remediation_id: int) -> bool:
             RemediationEvent.remediation_id == remediation_id,
             RemediationEvent.kind == OBSERVATION,
             RemediationEvent.detail["note"].astext == SESSION_QUESTION_AFTER_PULL_REQUEST,
+            RemediationEvent.detail["cycle"].as_integer() == cycle,
         )
         .limit(1)
     )
