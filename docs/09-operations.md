@@ -189,9 +189,25 @@ with a message naming it, rather than connecting less verified than was asked fo
 the URL, and if you need client certificates or a non-default `application_name`, raise it rather
 than working around it here. No message quotes the URL: it contains the Postgres password.
 
+**Do not delete `sslmode` from the URL to make an error go away.** Which value your provider writes
+is not incidental, and an absent parameter is not a neutral one:
+
+| Provider | Writes | Because |
+|---|---|---|
+| Fly (`fly postgres attach`) | `sslmode=disable` | Postgres is reached over the private 6PN network, which is already encrypted |
+| Neon, RDS, Supabase | `sslmode=require` | Postgres is reached over the public internet |
+| *(nothing in the URL)* | — | asyncpg then chooses `prefer` for a TCP connection — it **attempts** TLS. Silence means "try", not "do not" |
+
+Both directions matter and only one of them is reproducible locally. Deleting `sslmode=disable` on
+Fly leaves asyncpg attempting TLS against an endpoint that resets the handshake, which fails the
+release command outright; deleting `sslmode=require` anywhere else would connect unencrypted to a
+database on the public internet, and succeed while doing it. This is why the parameter is
+translated rather than dropped.
+
 **If the release command fails with `connect() got an unexpected keyword argument`**, the URL
 carries a libpq parameter this list has missed. Read the keyword it names against
-`asyncpg.connect`'s signature.
+`asyncpg.connect`'s signature. **If it fails with `ConnectionResetError` inside `start_tls`**, the
+URL has lost its `sslmode=disable` — put it back rather than removing more.
 
 ### 3. Secrets
 

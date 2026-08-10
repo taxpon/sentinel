@@ -352,8 +352,12 @@ def test_sslmode_is_translated_to_the_asyncpg_spelling_keeping_its_value(
     # It has `ssl`, which takes these six libpq names unchanged — asyncpg's own DSN parser renames
     # the one to the other and keeps the value, which is why this is a rename and not a guess.
     #
-    # `require` in particular must survive: dropping it would downgrade a connection that was meant
-    # to be encrypted, and `disable` and `require` are emphatically not interchangeable.
+    # Every value has to survive, and dropping one is wrong in one of two directions. An absent
+    # `ssl` argument makes asyncpg *attempt* TLS — it defaults to `prefer` for a TCP connection — so
+    # losing `disable` breaks Fly, whose endpoint resets the handshake rather than declining it.
+    # That was this deployment's second failure, after the TypeError. Losing `require` would be
+    # quieter and worse: an unencrypted connection to a database on the public internet, succeeding.
+    # Neither value is interchangeable with the other, or with saying nothing.
     settings = load(DATABASE_URL=f"postgres://u:dbpassword@host:5432/db?sslmode={mode}")
 
     assert settings.database_url.get_secret_value() == (

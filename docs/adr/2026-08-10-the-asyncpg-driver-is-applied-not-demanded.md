@@ -102,13 +102,36 @@ So `normalise_database_url` now also rewrites the query string, in three classes
 | Carried across | `ssl`, `target_session_attrs`, `timeout`, `command_timeout`, `server_settings`, `passfile`, and the four the dialect's DBAPI shim pops itself (`async_fallback`, `async_creator_fn`, `prepared_statement_cache_size`, `prepared_statement_name_func`) | The stack already accepts them under those names |
 | Rejected | `sslrootcert`, `sslcert`, `sslkey`, `sslcrl`, `options`, `application_name`, `connect_timeout`, and anything unrecognised | No equivalent a URL can express |
 
-**Nothing is dropped**, which is a departure from the first instinct. `sslmode=disable` was the
-value that failed, and discarding it would have connected — but asyncpg's default for a TCP
-connection is `prefer`, not `disable`, so discarding it would have changed behaviour rather than
-preserved it. Since the rename is exact for all six values, translating costs nothing and assumes
-nothing, and the security-relevant half of the question — that `disable` and `require` are not
-interchangeable, and that quietly turning `require` into anything weaker would downgrade a
-connection meant to be encrypted — never has to be decided.
+**Nothing is dropped**, which is a departure from the first instinct. The first instinct was that
+`sslmode=disable` could be discarded, since "do not use TLS" and "say nothing about TLS" sound like
+the same request. They are not, and the deployment proved it: with the parameter deleted by hand
+the `TypeError` was replaced by a `ConnectionResetError` raised from `start_tls`. asyncpg given no
+`ssl` argument does not decline TLS — it attempts it (`connect_utils.py:652-656`):
+
+```python
+if ssl is None:
+    ssl = os.getenv('PGSSLMODE')
+if ssl is None and have_tcp_addrs:
+    ssl = 'prefer'
+```
+
+And `prefer` is not a safe silence. It falls back to plaintext only when the server *declines* SSL
+at the protocol level, answering `N` to the SSLRequest. When the server answers `S` and the
+handshake then fails, `connect_utils.py:1102-1122` retries on two authorization-shaped exceptions
+and on nothing else, so a `ConnectionResetError` propagates and the connection is dead. Fly's
+endpoint does the second thing; the Compose Postgres does the first, which is exactly why every
+local run was green while the deploy was not.
+
+So both directions are load-bearing, for different reasons:
+
+- `sslmode=disable` **must** become an explicit `ssl=disable` — `SSLMode.disable` is the one value
+  that sets `ssl = False` (`connect_utils.py:689-690`). Dropping it breaks a real deployment.
+- `sslmode=require` **must** become an explicit `ssl=require`. Dropping that one would connect
+  unencrypted to a database on the public internet that somebody asked to encrypt, and would
+  succeed while doing it — the worse failure, for being invisible.
+
+Since the rename is exact for all six values, translating costs nothing and decides neither
+question.
 
 The rejected class is the deliberate one. Those parameters say how strictly the server's certificate
 is checked, or what the session starts as, and asyncpg exposes them only as an `ssl.SSLContext` or a
