@@ -36,7 +36,7 @@ canonical list.
 | `TARGET_REPO` | | `taxpon/superset` | |
 | `TARGET_BASE_BRANCH` | | `master` | The fork's default branch is `master`, not `main` |
 | `AUTOFIX_LABEL` | | `devin:autofix` | Trigger label |
-| `DATABASE_URL` | ✓ | | `postgresql+asyncpg://…`. A provider's `postgres://` or `postgresql://` is accepted and the driver applied ([ADR](./adr/2026-08-10-the-asyncpg-driver-is-applied-not-demanded.md)); a URL naming a different driver is rejected at startup |
+| `DATABASE_URL` | ✓ | | `postgresql+asyncpg://…`. A provider's `postgres://` or `postgresql://` is accepted and the driver applied ([ADR](./adr/2026-08-10-the-asyncpg-driver-is-applied-not-demanded.md)); a URL naming a different driver is rejected at startup. A libpq query string is adapted too — `sslmode` is renamed to asyncpg's `ssl`, and a parameter asyncpg cannot take is rejected by name ([details](#2-postgres)) |
 | `MAX_CONCURRENT_SESSIONS` | | `3` | In-flight session cap |
 | `DAILY_ACU_BUDGET` | | `100` | Hard daily spend ceiling |
 | `MAX_FIX_CYCLES` | | `3` | Review-fix iterations before `FAILED` |
@@ -165,11 +165,33 @@ Postgres it can reach on the private network. Compose and CI both run `postgres:
 version the migrations are exercised against. `fly postgres attach` writes the secret for you; a
 database from anywhere else means setting it yourself with `fly secrets set`.
 
-**The URL scheme is handled.** Every managed provider — Fly included — issues `postgres://` or
-`postgresql://`, and SQLAlchemy needs `postgresql+asyncpg://`. Sentinel applies the driver itself,
-in `Settings` and in the Alembic environment alike, so an attached URL works untouched. A URL naming
-some *other* driver is still rejected at startup, because that is a deliberate choice and the wrong
-one. See the [ADR](./adr/2026-08-10-the-asyncpg-driver-is-applied-not-demanded.md).
+**A provider-issued URL is adapted, not just accepted.** The operator does not choose this URL —
+`fly postgres attach` writes it — and it is written for libpq, the driver every provider assumes.
+Sentinel uses asyncpg, so two things about it need adapting, both in `Settings` and in the Alembic
+environment alike. See the [ADR](./adr/2026-08-10-the-asyncpg-driver-is-applied-not-demanded.md).
+
+*The scheme.* Every managed provider — Fly included — issues `postgres://` or `postgresql://`, and
+SQLAlchemy needs `postgresql+asyncpg://`. Sentinel applies the driver itself, so an attached URL
+works untouched. A URL naming some *other* driver is still rejected at startup, because that is a
+deliberate choice and the wrong one.
+
+*The query string.* SQLAlchemy's asyncpg dialect does not interpret it: every parameter becomes a
+keyword argument to `asyncpg.connect`, and the libpq names are not asyncpg's names. So:
+
+| In the URL | What happens |
+|---|---|
+| `sslmode=…` | Renamed to `ssl=…`, keeping the value. asyncpg's `ssl` takes the same six names — `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full` — so nothing is weakened or assumed |
+| `ssl`, `target_session_attrs`, `timeout`, `command_timeout`, `server_settings`, `prepared_statement_cache_size`, … | Carried across unchanged; asyncpg or the dialect defines them already |
+| `sslrootcert`, `sslcert`, `sslkey`, `options`, `application_name`, `connect_timeout`, anything unrecognised | **Rejected at startup**, naming the parameter. asyncpg takes these only as an `ssl.SSLContext` or a `server_settings` dict, which a URL cannot carry |
+
+Nothing is silently dropped. A parameter that cannot be translated faithfully stops the process
+with a message naming it, rather than connecting less verified than was asked for — remove it from
+the URL, and if you need client certificates or a non-default `application_name`, raise it rather
+than working around it here. No message quotes the URL: it contains the Postgres password.
+
+**If the release command fails with `connect() got an unexpected keyword argument`**, the URL
+carries a libpq parameter this list has missed. Read the keyword it names against
+`asyncpg.connect`'s signature.
 
 ### 3. Secrets
 
