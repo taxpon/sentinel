@@ -682,3 +682,88 @@ async def test_a_check_suite_that_arrives_after_the_merge_is_absorbed(
         (event.from_state, event.to_state) for event in await the_events(session_factory)
     ] == before
     assert await worker.run_once(pipeline.context, claimed_by=WORKER_ID) is False
+
+
+async def test_a_question_after_the_pull_request_carries_on_to_review(
+    pipeline: Pipeline,
+    delivery: DeliveryFactory,
+    devin_api: FakeAPI,
+    github_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Issue #5's re-run, from the label to review, with the offer Devin actually made.
+
+    Devin opened its pull request, reported that the issue's premise was partly wrong and that it
+    had fixed both causes, and then asked whether the user would like it to run the app end to end
+    as an optional extra. That question set `status_detail: waiting_for_user`, and the poller read
+    it as a stall: `PR_OPENED -> BLOCKED` 41 seconds later, on `cycle: 0`, with no CI failure and no
+    review. `BLOCKED` is terminal, so the remediation parked there — and every remediation in the
+    run would have, because Devin offers something at the end of every session.
+
+    The sequence asserted here is that one, and it ends in `IN_REVIEW`. The third tick is where the
+    whole change lives: it observes the question, moves nothing, and lets the check suites and the
+    reviewer carry the remediation the rest of the way.
+    """
+    await a_labelled_remediation(pipeline, delivery, devin_api, github_api)
+
+    offering_more = a_session(
+        status="running",
+        status_detail="waiting_for_user",
+        acus_consumed=ACUS_AT_PULL_REQUEST,
+        pull_requests=DEVIN_PULL_REQUESTS,
+        structured_output=REPORT,
+    )
+    devin_api.route("GET", SESSION).mock(
+        side_effect=[
+            a_session(),
+            a_session(acus_consumed=ACUS_AT_PULL_REQUEST, pull_requests=DEVIN_PULL_REQUESTS),
+            offering_more,
+            offering_more,
+        ]
+    )
+
+    assert (await pipeline.poll()).moved == 1
+    assert (await pipeline.poll()).moved == 1
+    assert (await the_remediation(session_factory)).state == State.PR_OPENED
+
+    # The tick that used to end the remediation. It escalates nothing and enqueues nothing, and a
+    # second one of the same observation adds no further row.
+    assert (await pipeline.poll()).moved == 0
+    assert (await pipeline.poll()).moved == 0
+
+    remediation = await the_remediation(session_factory)
+    assert remediation.state == State.PR_OPENED
+    assert remediation.blocked_reason is None
+    assert remediation.closed_at is None
+
+    # --- CI is green on the head, and the remediation goes to review as it always should have. ---
+    the_head_sha_looks_like(github_api, *INHERITED_AND_GREEN, *our_workflow(gate="success"))
+    await pipeline.deliver(delivery("check_suite.completed.success", delivery_id=CI_PASSED))
+    await pipeline.work()
+
+    remediation = await the_remediation(session_factory)
+    assert remediation.state == State.IN_REVIEW
+    assert remediation.ci_green_at is not None
+
+    # The question survives as an observation between the two transitions, once, rather than as the
+    # escalation it used to be or as nothing at all.
+    assert [
+        (event.from_state, event.to_state, event.kind)
+        for event in await the_events(session_factory)
+    ] == [
+        (None, State.QUEUED, "transition"),
+        (State.QUEUED, State.SESSION_CREATED, "transition"),
+        (State.SESSION_CREATED, State.RUNNING, "transition"),
+        (State.RUNNING, State.PR_OPENED, "transition"),
+        (State.PR_OPENED, State.PR_OPENED, poller.OBSERVATION),
+        (State.PR_OPENED, State.CI_PASSED, "transition"),
+        (State.CI_PASSED, State.IN_REVIEW, "transition"),
+    ]
+
+    # Nothing was escalated, and the autonomy this remediation would count towards is intact: no
+    # fix cycle, and no human message answering a question nobody was there to answer.
+    assert [job.kind for job in await the_jobs(session_factory)] == [
+        JobKind.CREATE_SESSION,
+        JobKind.EVALUATE_CI,
+    ]
+    assert (remediation.cycle, remediation.human_message_count) == (0, 0)
