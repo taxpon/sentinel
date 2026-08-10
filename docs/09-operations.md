@@ -7,7 +7,8 @@
 | Requirement | Notes |
 |---|---|
 | Devin organisation | `org_id` (`org-…`) and a service-user token (`cog_…`) with `ManageOrgSessions` |
-| GitHub fine-grained PAT | Scoped to `taxpon/superset`: issues read/write, pull requests read/write, contents read |
+| GitHub fine-grained PAT | **Sentinel's own credential.** Scoped to `taxpon/superset`: issues read/write, pull requests read/write, contents read |
+| Devin's access to `taxpon/superset` | **A separate thing, and not the PAT above.** Devin clones, pushes a branch and opens the pull request under its own GitHub connection — arranged in Devin's settings, not from this repository and not by any Sentinel credential ([B15](./blockers.md#b15)) |
 | Docker + Compose | Running locally |
 | `cloudflared` or `ngrok` | **Local runs only.** A publicly reachable URL for webhook delivery. A Fly deployment has a permanent one and needs neither ([Deployment](#deployment-flyio)) |
 | `flyctl` | **Deployed runs only.** Not needed to run locally |

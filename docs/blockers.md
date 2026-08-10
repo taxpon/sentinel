@@ -38,6 +38,7 @@ A working register, updated throughout implementation.
 | [B12](#b12) | Delivery | This repository is private | Reviewer access | Open |
 | [B13](#b13) | Delivery | Assignment brief must not leak into a public repository | Publication | Open |
 | [B14](#b14) | Devin API | Tag registration writes an undocumented path, and the documented one is enterprise-scoped | Bootstrap step 2; any organisation shared with anyone else | Open |
+| [B15](#b15) | Credentials | Devin needs its own GitHub access to the fork; nothing ever documented it as a prerequisite | Every session's push and pull request | Open |
 
 ---
 
@@ -311,3 +312,35 @@ git log --all --name-only --pretty=format: | sort -u | grep -E 'requirements/|CL
 ```
 
 Expect no output. Also confirm no token or webhook secret appears in any commit.
+
+### B15 — Devin needs its own access to the fork, and nobody wrote that down {#b15}
+
+**Known.** `GITHUB_TOKEN` is *Sentinel's* fine-grained PAT. [09](./09-operations.md#prerequisites)
+scopes it precisely — issues, pull requests and contents on `taxpon/superset` — and Sentinel spends
+it on labels, comments and pull-request reads. **Devin never uses it.** A session is created with
+`repos: ["taxpon/superset"]` ([05](./05-devin-integration.md#creating-a-session)) and a prompt whose
+definition of done is a branch, a push and a pull request; all three happen under Devin's *own*
+GitHub connection, which is configured in Devin and by nothing in this repository. Until this entry,
+neither the prerequisites, nor [05](./05-devin-integration.md), nor this register said so.
+
+**Not established.** Whether that connection is already in place. It may well be — nobody has
+looked. The defect recorded here is that the requirement was never written down, not that the access
+is known to be missing.
+
+**Impact if it is missing.** A session still starts and still investigates. It fails when it tries
+to push, and the likely surface is `outcome: "blocked"`, which is a normal, expected result that
+escalates to a human ([04](./04-state-machine.md)). So the pipeline appears to work while all eight
+remediations escalate for a reason nothing here explains — expensive to diagnose during a demo, and
+trivial to check beforehand.
+
+**To resolve.** Look at Devin's connected repositories for `taxpon/superset` in the web app. Two v3
+endpoints do report repository reach, and neither replaces looking:
+
+| | |
+|---|---|
+| `GET /v3beta1/organizations/{org_id}/repositories` | *"List repositories available to an organization"*, service-user `Read` at the organization level. The prefix is **`v3beta1`**; every path Sentinel sends is `v3` ([05](./05-devin-integration.md)) |
+| `GET /v3/enterprise/git-providers/connections/{connection_id}/repositories` | *"List repositories for a git connection"* — `ManageGitIntegrations` at the **enterprise** level, which this service user is not assumed to carry ([B5](#b5)) |
+
+Nothing reports what a given *session* was able to reach. **Do not spend a real session finding
+out**: a live check costs a session and its ACUs, and the first real remediation is that check
+anyway ([B8](#b8)).
