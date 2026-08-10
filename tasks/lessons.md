@@ -56,3 +56,30 @@ If a mutant survives, print the module's `__file__` before believing it.
 
 **Rule:** before bumping an action's major, confirm the tag itself resolves:
 `gh api repos/<owner>/<repo>/git/ref/tags/v<N>`.
+
+## Read the endpoint's own page, not the index
+
+An API's index — `llms.txt`, a route list, a summary table — tells you a path exists. It does not
+tell you what the path takes, what it returns, or whether the vendor has stopped recommending it.
+Four separate defects here came from trusting something second-hand instead of opening the page:
+
+- The index listed the schedules endpoint with no hint of deprecation. Its own page carries a banner
+  saying to use a different feature for any *new* scheduled workflow. We built one, then removed it.
+- The page slug said `organizations-tags`; the OpenAPI block inside the same page said
+  `enterprise/organizations`. The slug is the URL somebody chose, not the path the API serves — and
+  the two disagreed.
+- Twice a request or response shape was taken from this project's own design document rather than
+  from the reference. One of them sent a field name the API does not define, so the request would
+  have been rejected outright. The other omitted a field that switches on the review-fix loop, which
+  fails *silently*: the pipeline would have looked healthy and simply never resumed a session.
+
+The last one is the reason this is a lesson rather than an anecdote. It shipped through a green test
+suite, because the fakes were built from the same design document as the code. **A test double
+copied from the same source as the code under test asserts that you were consistent, not that you
+were right.**
+
+**Rule:** open the reference page for the exact endpoint before writing the call, and again before
+believing a shape a test asserts. Read three things on it: the request schema, the response schema,
+and any banner or callout above them. Where the index and the page disagree, the page wins; where
+the page and your own spec disagree, the page wins and the spec gets fixed in the same change.
+Anything left unverified says so in the code, next to the field it is unsure about.
