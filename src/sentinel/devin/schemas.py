@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated, Any, Final, Literal
@@ -207,14 +207,35 @@ def _zero_if_null(value: Any) -> Any:
     return 0.0 if value is None else value
 
 
+def _default_if_null[T](default: T) -> Callable[[Any], Any]:
+    """Treat an explicit `null` as the field's default, for a field nothing branches on.
+
+    `is_archived` is read only to order adoption candidates and was previously ignored entirely.
+    Modelling it would otherwise make a `null` a `DevinResponseError` on the poller's critical
+    path — failing a remediation over a field that decides nothing about it. The reference marks it
+    non-nullable with a default of `false`; this is the same bargain `_zero_if_null` makes, for the
+    same reason.
+    """
+    return lambda value: default if value is None else value
+
+
 class Session(BaseModel):
     """A Devin session as v3 returns it, on creation and on every poll.
 
     Extra fields are ignored rather than rejected: the response carries more than the spec's
     "fields consumed" list, and a field added upstream must not fail a poll. That is not
-    hypothetical — the listing observed on 2026-08-10 carried thirteen fields nothing here reads,
-    including `created_at` and `updated_at` as **integers**, which is why neither is modelled as a
-    timestamp.
+    hypothetical — the listing observed on 2026-08-10 carried fields nothing here read, including
+    `updated_at` as an **integer**, which is why it is still not modelled as a timestamp.
+
+    `created_at` and `is_archived` are read by `DevinClient.find_session` alone, to order the
+    candidates for adoption. The reference marks `created_at` required and `is_archived` defaulted
+    to `false`, so an absent value in either is an incomplete body rather than a fact.
+
+    `created_at` is therefore `None` when absent and **not** `0`. The order is a `min`, so a zero
+    would sort a body that says nothing about its age ahead of every session that does — the
+    opposite of what an absent value should buy. `_adoption_order` sorts an unknown age last.
+    `is_archived` needs no such treatment: `false` is the reference's own default, so absence
+    genuinely means not archived.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -225,6 +246,8 @@ class Session(BaseModel):
     status_detail: str | None = None
     title: str | None = None
     tags: tuple[str, ...] = ()
+    created_at: int | None = None
+    is_archived: Annotated[bool, BeforeValidator(_default_if_null(False))] = False
     acus_consumed: Annotated[float, BeforeValidator(_zero_if_null)] = 0.0
     pull_requests: tuple[PullRequest, ...] = ()
     structured_output: StructuredOutput | None = None
@@ -272,19 +295,29 @@ class SessionPage(BaseModel):
     """The body of `GET /v3/organizations/{org_id}/sessions` — `PaginatedResponse[SessionResponse]`
     in the v3 reference, and confirmed by the call of 2026-08-10.
 
-    The envelope is `items`, beside `end_cursor`, `has_next_page` and `total`. The three pagination
-    keys are read by nothing and so modelled by nothing — see `DevinClient.list_sessions`, which
-    returns one page.
+    The envelope is `items`, beside `end_cursor`, `has_next_page` and `total`. Two of those three
+    are modelled, because `DevinClient.find_session` follows the cursor: a lookup that decides
+    whether a session already exists must not answer "no" because the one it wanted was on page two.
+    `total` is still read by nothing.
+
+    Both pagination fields default to "this is the last page", so a bare list — and the observed
+    body's `has_next_page: false` with a null `end_cursor` — both terminate the walk.
     """
 
     model_config = ConfigDict(frozen=True)
 
     sessions: tuple[Session, ...]
+    end_cursor: str | None = None
+    has_next_page: bool = False
 
     @model_validator(mode="before")
     @classmethod
     def _accept_bare_list(cls, payload: Any) -> Any:
-        return {"sessions": _unwrap(payload, "items")}
+        page: dict[str, Any] = {"sessions": _unwrap(payload, "items")}
+        if isinstance(payload, Mapping):
+            page["end_cursor"] = payload.get("end_cursor")
+            page["has_next_page"] = bool(payload.get("has_next_page"))
+        return page
 
 
 class CreateSessionRequest(BaseModel):

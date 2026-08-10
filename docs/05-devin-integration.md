@@ -18,7 +18,7 @@ below says so in as many words.
 |---|---|---|---|
 | `POST` | `/v3/organizations/{org_id}/sessions` | Create a remediation session | `SessionCreateRequest` → `SessionResponse` · `ManageOrgSessions` |
 | `GET` | `/v3/organizations/{org_id}/sessions/{devin_id}` | Poller reconciliation — status, ACUs, structured output, PRs | — → `SessionResponse` · `ViewOrgSessions` |
-| `GET` | `/v3/organizations/{org_id}/sessions` | Backfill and in-flight listing | `SessionsQueryParams` → `PaginatedResponse[SessionResponse]` · `ViewOrgSessions` |
+| `GET` | `/v3/organizations/{org_id}/sessions` | The adopt-or-create lookup before every creation; backfill and in-flight listing | `SessionsQueryParams` → `PaginatedResponse[SessionResponse]` · `ViewOrgSessions` |
 | `POST` | `/v3/organizations/{org_id}/sessions/{devin_id}/messages` | Review-fix loop: feed CI logs and reviewer feedback | `SessionMessageCreateRequest` → `SessionResponse` · `ManageOrgSessions` |
 | `POST` | `/v3/organizations/{org_id}/sessions/{devin_id}/tags` | Append lifecycle tags (`cycle:N`, `outcome:merged`) | `SessionTagsUpdateRequest` → `SessionTagsResponse` · permission not stated |
 | `PUT` | `/v3/organizations/{org_id}/tags` | Register the organisation's allowed tag vocabulary at bootstrap | **undocumented path** — see below |
@@ -41,7 +41,10 @@ Three things the reference states that are easy to get wrong from the paths alon
   say. Sentinel passes `session_id` through unchanged. *Unobserved*, and the first thing a live
   `GET` settles.
 - **The three listings return `PaginatedResponse[T]`**, whose array is `items` and which also
-  carries `has_next_page` and `end_cursor`. Sentinel reads one page of each and follows no cursor.
+  carries `has_next_page` and `end_cursor`. The session listing pages on `after` (the cursor) and
+  `first` (default 100, minimum 1, **maximum 200**). `list_sessions` reads one page and follows no
+  cursor; the adopt-or-create lookup follows it, at `first=200` — see
+  [Adopt or create](#adopt-or-create).
 - **Both the enterprise metrics window parameters are required.** `time_before` and `time_after`
   are the only `required: true` query parameters in this table.
 
@@ -90,8 +93,65 @@ rather than here ([B15](./blockers.md#b15)).
 Sentinel sends no other field. The reference defines twelve more —
 `attachment_urls`, `bypass_approval`, `child_playbook_id`, `create_as_user_id`, `devin_mode`,
 `platform`, `secret_ids`, `session_links`, `session_secrets` among them — and there is **no
-idempotency key of any kind**, which is why [Client behaviour](#client-behaviour) puts idempotency
-in Sentinel's own uniqueness constraint.
+idempotency key of any kind**: no `Idempotency-Key` header, no request-body field, and nothing on
+the endpoint's own reference page that behaves as one. The single query parameter, `devin_id`, is
+the *parent* session of a session Devin spawns, not a client-supplied token. Everything below
+follows from that.
+
+### Adopt or create {#adopt-or-create}
+
+**Creating a session is idempotent per remediation, and Sentinel does it, because the API cannot.**
+`create_session` runs a lookup before it posts:
+
+1. `GET /v3/organizations/{org_id}/sessions?tags=sentinel&tags=repo:<repo>&tags=issue:<n>&first=200`,
+   following `end_cursor` while `has_next_page`.
+2. Every returned session is re-checked against all three tags here, because the reference does not
+   state whether the server ANDs the `tags` array, ORs it, or ignores a value. The filter is an
+   optimisation; the check is the rule.
+3. If one matches, it is **adopted** — returned as though it had just been created, and recorded on
+   the remediation exactly as a fresh one would be. No `POST` is made.
+4. If none matches, the session is created, and the `POST` is sent **exactly once**.
+
+Those three tags are `session_identity` in `devin/playbooks.py`, and they are the first three of
+the five a creation sends, so the lookup cannot search for a combination a creation does not write.
+They identify the *remediation*, not the attempt: `remediation` is `UNIQUE (repo, issue_number)`, so
+one repository and one issue number name one remediation for ever, and a remediation has at most one
+session because the review-fix loop resumes rather than recreates. `run:<delivery_id>` is
+deliberately not part of the key — it names one webhook delivery, and keying on it would miss a
+session a *previous* job had created.
+
+Where several sessions match — the incident below left three per issue — one is chosen
+deterministically so that repeated attempts converge: a live session before an archived one, then
+the earliest created, then the lowest id. Every match is a candidate, including an archived one:
+archiving is how a runaway is stopped by hand, and answering that with another session would repeat
+the fault.
+
+**A lookup that cannot answer creates nothing.** "I could not find out" is not "there is none", and
+creating on it is the defect itself. All three ways it can fail raise before the `POST`, but they do
+not end the same way, and the difference is operational:
+
+- **Timed out, or `5xx`/`429`, past the read retries** — retryable. The queue backs off and tries
+  the job again, up to `MAX_JOB_ATTEMPTS`.
+- **Refused — `403`, a token without `ViewOrgSessions`** — not retryable. The job is retired on the
+  first occurrence and the remediation escalates, because the next attempt would be refused
+  identically.
+- **Still claiming another page after the page budget, or naming another page with no cursor to
+  reach it** — not retryable, for the same reason: it is a property of the listing, not of the
+  moment.
+
+Two consequences worth stating. `ViewOrgSessions` is now a prerequisite for *creating* a session and
+not only for polling one, so a service user carrying `ManageOrgSessions` alone fails visibly on its
+first remediation instead of working. And a Devin outage stops sessions being created rather than
+duplicating them.
+
+The incident this answers, on **2026-08-11**: five issues were labelled within 2.3 s, Devin's API
+became overloaded and stopped answering `POST …/sessions` inside the 30 s timeout. The requests had
+arrived and the sessions existed; only the responses were lost. The client retried each transport
+error three times, so issues #3, #4 and #6 ended with three sessions each — nine in all, inside
+about ninety seconds, every one carrying Sentinel's own `[sentinel] #N …` title. They were archived
+by hand. Narrowing the client's retry alone would not have been enough: the job queue retries the
+job too, so the duplicate would have arrived a minute later instead of a second later. See
+[the ADR](./adr/2026-08-11-a-session-is-adopted-before-it-is-created.md).
 
 `SessionResponse` is the body of the create, the get, the listing's `items` and the message post.
 Its required fields are `session_id`, `url`, `status`, `tags`, `org_id`, `created_at`,
@@ -99,7 +159,8 @@ Its required fields are `session_id`, `url`, `status`, `tags`, `org_id`, `create
 `tags`, `acus_consumed` and `pull_requests[]`; on `GET` additionally `structured_output` and
 `status_detail`, both of which the reference marks "only populated on get/list endpoints" — so a
 create response carrying neither is correct, not a truncated one. `created_at` and `updated_at` are
-epoch **integers**, and nothing here reads them.
+epoch **integers**; `created_at` and `is_archived` are read by the adopt-or-create lookup, to order
+the candidates, and `updated_at` by nothing.
 
 The observed shape of all of this is in [Response shapes](#response-shapes) below; the entries of
 `pull_requests[]` in particular are `pr_url` and `pr_state`, and carry **no pull request number**.
@@ -144,9 +205,9 @@ The page is `{ items: [...], end_cursor, has_next_page, total }`. One item:
 | `playbook_id` | null | Arrived null on the observed session |
 | `user_id` | string | Not read |
 | `org_id` | string | Not read |
-| `created_at` | **integer** | An epoch, not an ISO-8601 string. Not read |
+| `created_at` | **integer** | An epoch, not an ISO-8601 string. Orders the adoption candidates |
 | `updated_at` | **integer** | As above |
-| `is_archived` | boolean | Not read |
+| `is_archived` | boolean | A live session is adopted in preference to an archived one |
 | `acus_consumed` | number | |
 | `pull_requests[].pr_url` | string | **Not `url`.** The field the poller links from |
 | `pull_requests[].pr_state` | string | New; not read — see below |
@@ -174,11 +235,14 @@ segment — by `devin/schemas.py`. A URL it cannot read leaves `pr_number` null,
 remediation unreachable from GitHub; the poller records the URL it could not read on the
 remediation's own event rather than inventing a number.
 
-**The listing paginates.** `end_cursor` and `has_next_page` are not in the specification and nothing
-follows them: `list_sessions` reads one page, so a backfill over an organisation with more sessions
-than a page sees a prefix. `pr_state` is likewise carried by the API and read by nothing — a merge
-observed there would reach Sentinel a poll ahead of the `pull_request.closed` webhook, but the
-webhook is authoritative today and nothing is built on it.
+**The listing paginates.** `list_sessions` still reads one page, so a backfill over an organisation
+with more sessions than a page sees a prefix. `find_session` does follow `end_cursor` while
+`has_next_page`, because a prefix is not an answer to "does this remediation already have a
+session?" — see [Adopt or create](#adopt-or-create).
+
+`pr_state` is likewise carried by the API and read by nothing — a merge observed there would reach
+Sentinel a poll ahead of the `pull_request.closed` webhook, but the webhook is authoritative today
+and nothing is built on it.
 
 ## Playbooks and ACU caps
 
@@ -447,10 +511,17 @@ as the observation it is.
 ## Client behaviour
 
 - **Retries**: exponential backoff with jitter on `429` and `5xx`; `4xx` other than `429` fails the
-  job immediately with the response body recorded in `remediation_event.detail`.
-- **Timeouts**: 30 s connect/read; session creation is never on a webhook request path.
-- **Idempotency**: enforced by Sentinel's `UNIQUE (repo, issue_number)`, not by a Devin-side key —
-  `SessionCreateRequest` defines no idempotency key, so there is no Devin-side one to use.
+  job immediately with the response body recorded in `remediation_event.detail`. `POST
+  /v3/organizations/{org_id}/sessions` is the one exception and is sent **exactly once** — see
+  Idempotency below. Every read keeps all three attempts; the poller depends on it.
+- **Timeouts**: 30 s connect/read; session creation is never on a webhook request path. A read
+  timeout on a creation is not evidence that nothing was created, which is why the create is not
+  retried.
+- **Idempotency**: enforced by Sentinel, because the API offers nothing to enforce it with.
+  `SessionCreateRequest` defines no idempotency key and the endpoint accepts no header that acts as
+  one. Two layers, and both are needed: `UNIQUE (repo, issue_number)` stops a second *remediation*
+  for one issue, and [adopt-or-create](#adopt-or-create) stops a second *session* for one
+  remediation — including across a job retry, which the uniqueness constraint never saw.
 - **Errors**: every `4xx` and `429` is `ProblemDetail` (RFC 9457) — `title` and `status` required,
   `detail` retained from the legacy body, and `errors` carrying field-level failures on `422` only.
   The client stores the body as text rather than parsing it, so a rejection is diagnosable from

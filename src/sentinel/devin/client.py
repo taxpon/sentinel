@@ -18,7 +18,9 @@ What this module decides, so that no caller has to:
   exponential backoff and jitter, honouring `Retry-After`. Every other `4xx` raises immediately —
   a body Devin rejected as malformed will not become well-formed, and retrying it only spends
   quota. The exception carries the response body, which `docs/06-event-pipeline.md` records in
-  `remediation_event.detail`.
+  `remediation_event.detail`. **Creating a session is the one exception and is sent exactly once**
+  — see `create_session` and
+  `docs/adr/2026-08-11-a-session-is-adopted-before-it-is-created.md`.
 - **What is a degradation rather than a failure.** The enterprise-scoped and consumption endpoints
   answer `403` or `404` when the credentials do not carry the scope (B5, B6), and their field names
   are unverified until credentials exist (B8). A refusal, an absent enterprise id and a body that
@@ -59,6 +61,7 @@ from sentinel.devin.playbooks import (
     acu_cap_for,
     initial_prompt,
     playbook_id_for,
+    session_identity,
     session_tags,
     session_title,
     validate_tag,
@@ -224,6 +227,20 @@ class DevinResponseError(DevinError):
     """
 
 
+class SessionLookupIncomplete(DevinError):
+    """The adopt-or-create lookup ran out of pages before it could answer, so nothing was created.
+
+    Reached only when the listing keeps reporting `has_next_page` for `LOOKUP_PAGE_LIMIT` pages
+    without the `tags` filter having narrowed anything — which means the server-side filter is not
+    doing what `SessionsQueryParams.tags` says it does. Not retryable: the next attempt walks the
+    same pages to the same place.
+
+    Raising is the point. The alternative to an answer is not "create one anyway" — that is the
+    defect this whole path exists to prevent — so a lookup that cannot answer fails the job, and
+    the remediation escalates to a human with a session count of zero rather than of two.
+    """
+
+
 # --- Retry policy --------------------------------------------------------------------------------
 
 
@@ -275,6 +292,46 @@ def retry_after_seconds(response: httpx.Response) -> float | None:
 
 
 DEFAULT_RETRY: Final = RetryPolicy()
+
+SEND_ONCE: Final = RetryPolicy(attempts=1)
+"""The policy `POST /v3/organizations/{org_id}/sessions` is sent under: one attempt, no retry.
+
+A read timeout is not a failed request. On 2026-08-11 Devin was overloaded and stopped answering
+the create within 30 s; the requests had arrived and the sessions existed, so three attempts made
+three sessions and three issues ended up with three each. Nothing in `SessionCreateRequest` takes an
+idempotency key, so a resend cannot be told from a first send by anything on the wire.
+
+Retrying here is therefore not merely unhelpful, it is the bug. Recovery is `create_session`'s
+adopt-or-create instead, which is also what covers the *job* being retried minutes later — a
+narrower policy on its own would only move the duplicate one layer out.
+"""
+
+LOOKUP_PAGE_SIZE: Final = 200
+"""`SessionsQueryParams.first`, at the maximum the reference gives it — default 100, minimum 1,
+maximum 200, recorded in the endpoint table of `docs/05-devin-integration.md`. The lookup wants as
+few round trips as the endpoint will give it."""
+
+LOOKUP_PAGE_LIMIT: Final = 4
+"""How many pages `find_session` walks before it gives up and raises `SessionLookupIncomplete`.
+
+With the `tags` filter working, an organisation has at most a handful of sessions per remediation
+and the first page ends the walk. This bound only bites when the filter is being ignored.
+
+**It is derived from the job lease, not chosen.** The walk runs inside a claimed job, and a lookup
+that outlasts `JOB_LEASE_TIMEOUT_SECONDS` lets a second worker claim the same job — and if both
+workers look before either posts, both create. That is the reclaim hazard this design closes
+everywhere else, reintroduced by the lookup meant to close it.
+
+A page is a read and keeps every retry a read has (`DEFAULT_RETRY`), so one page can succeed on its
+third attempt and cost `attempts * TIMEOUT + max_total_delay` = 150 s. Four of those plus one create
+is 630 s, against a lease of 900 s. `test_the_lookup_cannot_outlast_the_lease_that_protects_the_job`
+computes that from the constants rather than restating it, so raising either number without raising
+the lease fails the suite.
+
+Four pages is 800 sessions examined, which is not the constraint it looks like: when the filter
+works one page ends the walk, and when it does not the answer is to find out why rather than to
+scan further.
+"""
 
 Sleep = Callable[[float], Awaitable[None]]
 
@@ -363,14 +420,27 @@ class DevinClient:
         base_branch: str | None = None,
         knowledge_ids: Sequence[str] | None = None,
     ) -> Session:
-        """Create the remediation session for one issue.
+        """The remediation session for one issue: **adopted if it already exists, created if not.**
 
         Takes the issue rather than a request body: every field of that body is derived from
         `playbooks.py` and the configuration, and the two that a caller could get wrong — the tag
         set and the ACU cap — are the ones a reviewer checks in the Devin dashboard.
 
+        Idempotent, and it has to be, because a `POST` that times out has still been received: on
+        2026-08-11 nine sessions existed for three issues, all of them Sentinel's, because the
+        retries of a request that had already been served each made another one. `find_session`
+        below is the whole of the answer — it runs first, and a session already tagged for this
+        remediation is returned instead of a second one being made. That covers the *job* being
+        retried by `pipeline/worker.py` minutes later exactly as it covers a retry within one call,
+        which a narrower retry policy would not.
+
+        The create itself is sent under `SEND_ONCE`. Everything it could have retried — a `429`, a
+        `5xx`, a timeout — is handed back to the queue, which comes back through this method and
+        adopts whatever the previous attempt turned out to have made.
+
         Raises `UnknownIssueClass` for a class with no playbook and `MissingPlaybookId` for one
-        whose id was never configured, both before anything is sent.
+        whose id was never configured, both before anything is sent. Raises rather than creating if
+        the lookup itself cannot be completed.
         """
         repo = self._settings.target_repo if repo is None else repo
         base_branch = self._settings.target_base_branch if base_branch is None else base_branch
@@ -397,9 +467,18 @@ class DevinClient:
             knowledge_ids=tuple(configured if knowledge_ids is None else knowledge_ids),
             max_acu_limit=acu_cap_for(issue_class),
         )
+
+        adopted = await self.find_session(repo=repo, issue_number=issue_number)
+        if adopted is not None:
+            return adopted
+
         started = time.perf_counter()
         payload = await self._request(
-            "POST", SESSIONS, json=request.model_dump(mode="json"), path=self._org()
+            "POST",
+            SESSIONS,
+            json=request.model_dump(mode="json"),
+            path=self._org(),
+            retry=SEND_ONCE,
         )
         session = self._parse(Session, payload, "POST", SESSIONS)
         log.info(
@@ -409,6 +488,93 @@ class DevinClient:
             duration_ms=_millis(time.perf_counter() - started),
         )
         return session
+
+    async def find_session(self, *, repo: str, issue_number: int) -> Session | None:
+        """The session this remediation already has, if one was created for it — otherwise `None`.
+
+        `session_identity` is the key: the three tags every session of this remediation carries and
+        no session of another one does. They are sent as the listing's `tags` filter *and* checked
+        again on every session that comes back, because the reference documents
+        `SessionsQueryParams.tags` as an array without saying whether the server ANDs them, ORs
+        them, or ignores an unregistered one. Whichever it does, only a session carrying all three
+        is adopted; the filter is an optimisation and the check is the rule.
+
+        The cursor is followed for the same reason. Answering "there is no session" from the first
+        page of a listing that is not filtering would create a duplicate, which is the one outcome
+        this method exists to prevent — so **only** `has_next_page: false` ends the walk with a
+        negative answer. A page that claims another page and gives no cursor to reach it is a
+        disagreement, not a terminator: it raises, because answering `None` there would be reading
+        the prefix as the whole.
+
+        Where several match — the nine sessions of 2026-08-11 were three sets of three — one is
+        chosen deterministically, so repeated attempts converge on the same session rather than
+        each adopting a different one: a session still live in preference to an archived one, then
+        the earliest created, then the lowest id. The earliest is the one whose response was lost,
+        and the one with the most work already done; the later ones are what the retries made.
+
+        The adopted session is returned **as it is**, not reconciled against the request that was
+        built for it. An issue relabelled between the lost `POST` and this call is running under the
+        playbook and `class:` tag of the original — narrow, and preferable to a second session, but
+        it is the one way a remediation can be attached to a session it would not have created
+        today.
+        """
+        identity = session_identity(repo=repo, issue_number=issue_number)
+        wanted = frozenset(identity)
+        matches: list[Session] = []
+        seen = 0
+        cursor: str | None = None
+        for page_number in range(1, LOOKUP_PAGE_LIMIT + 1):
+            page = await self._session_page(tags=identity, first=LOOKUP_PAGE_SIZE, after=cursor)
+            seen += len(page.sessions)
+            matches.extend(
+                session for session in page.sessions if wanted <= frozenset(session.tags)
+            )
+            if not page.has_next_page:
+                return self._adopt(matches, issue_number, pages=page_number, seen=seen)
+            if page.end_cursor is None:
+                raise SessionLookupIncomplete(
+                    f"GET {SESSIONS} reported another page and no end_cursor to reach it, on page "
+                    f"{page_number} for issue {issue_number}; nothing was created by this call"
+                )
+            cursor = page.end_cursor
+        # The budget is spent, so nothing here can say there is no session — but what the walk did
+        # find is not in doubt. Every match passed the tag check on this side, which is the same
+        # evidence an ordinary answer rests on, so adopting one is safe and is strictly better than
+        # failing a remediation while a session of its own runs unrecorded.
+        if matches:
+            return self._adopt(matches, issue_number, pages=LOOKUP_PAGE_LIMIT, seen=seen)
+        raise SessionLookupIncomplete(
+            f"GET {SESSIONS} still reported more pages after {LOOKUP_PAGE_LIMIT} of "
+            f"{LOOKUP_PAGE_SIZE} for issue {issue_number}; {seen} sessions were seen and none of "
+            f"them was this remediation's, which is not the same as there being none. Nothing was "
+            f"created by this call"
+        )
+
+    def _adopt(
+        self, matches: list[Session], issue_number: int, *, pages: int, seen: int
+    ) -> Session | None:
+        """The chosen session, or `None` — and a log line either way.
+
+        The negative answer is logged as deliberately as the positive one. It is the branch that
+        goes on to create a session, so when a duplicate next appears it is the branch an operator
+        has to be able to see: what was filtered on, how far the walk got, and how much it looked
+        at. A `seen` of zero against an organisation known to have sessions is what a `tags`
+        parameter the server misparses looks like, and nothing else would say so.
+        """
+        if not matches:
+            log.info("devin.session.absent", issue=issue_number, pages=pages, seen=seen)
+            return None
+        chosen = min(matches, key=_adoption_order)
+        log.info(
+            "devin.session.adopted",
+            session_id=chosen.session_id,
+            issue=issue_number,
+            is_archived=chosen.is_archived,
+            matched=len(matches),
+            pages=pages,
+            seen=seen,
+        )
+        return chosen
 
     async def get_session(self, session_id: str) -> Session:
         """One session, as the poller reconciles it: status, `status_detail`, ACUs, pull requests
@@ -435,14 +601,24 @@ class DevinClient:
         2026-08-10 carries `end_cursor`, `has_next_page` and `total` beside the items — so the
         endpoint does paginate and this reads the first page only. A backfill over an organisation
         with more sessions than one page silently sees a prefix of them, which is worth closing.
+        `find_session` does follow the cursor, because a prefix is not an answer to the question it
+        asks.
         """
+        return (await self._session_page(tags=tags, first=limit)).sessions
+
+    async def _session_page(
+        self, *, tags: Sequence[str] = (), first: int | None = None, after: str | None = None
+    ) -> SessionPage:
+        """One page of the session listing, cursor and all."""
         params: dict[str, Any] = {}
         if tags:
             params["tags"] = [registered_tag(tag) for tag in tags]
-        if limit is not None:
-            params["first"] = limit
+        if first is not None:
+            params["first"] = first
+        if after is not None:
+            params["after"] = after
         payload = await self._request("GET", SESSIONS, params=params, path=self._org())
-        return self._parse(SessionPage, payload, "GET", SESSIONS).sessions
+        return self._parse(SessionPage, payload, "GET", SESSIONS)
 
     async def send_message(self, session_id: str, message: str) -> None:
         """Feed a resumable session the next fact — a CI failure, a review requesting changes.
@@ -652,15 +828,24 @@ class DevinClient:
         json: Any = None,
         params: Mapping[str, Any] | None = None,
         path: PathParams | None = None,
+        retry: RetryPolicy | None = None,
     ) -> Any:
         """One call, with the retry policy applied. Returns the decoded body, or `None` if empty.
 
         `endpoint` is the template; `path` fills it. Both the metric label and every message built
         here use the template, so no session id reaches a Prometheus label or an exception.
+
+        `retry` overrides the client's policy for this one call. It exists for `SEND_ONCE`: whether
+        a request may be repeated is a property of what the request *does*, not of the deployment,
+        and the create is the one route on a *remediation's* path where repeating it creates
+        something. `create_knowledge_note` is the other repeat-unsafe `POST` here; it runs only
+        from `make bootstrap-devin`, whose idempotence is `.env`'s job
+        (`docs/adr/2026-08-08-env-is-the-bootstrap-scripts-record.md`), and it is left alone.
         """
+        policy = self._retry if retry is None else retry
         url = endpoint.format(**(path or {}))
         waited = 0.0
-        for attempt in range(1, self._retry.attempts + 1):
+        for attempt in range(1, policy.attempts + 1):
             started = time.perf_counter()
             try:
                 response = await self._client.request(
@@ -695,7 +880,7 @@ class DevinClient:
                 )
                 retry_after = retry_after_seconds(response)
 
-            if not error.retryable or attempt == self._retry.attempts:
+            if not error.retryable or attempt == policy.attempts:
                 log.warning(
                     "devin.request.failed",
                     method=method,
@@ -705,7 +890,7 @@ class DevinClient:
                 )
                 raise error
 
-            delay = self._delay(attempt, retry_after, waited)
+            delay = self._delay(policy, attempt, retry_after, waited)
             waited += delay
             log.warning(
                 "devin.request.retry",
@@ -718,7 +903,9 @@ class DevinClient:
             await self._sleep(delay)
         raise AssertionError("the retry loop returns or raises on its last attempt")
 
-    def _delay(self, attempt: int, retry_after: float | None, waited: float) -> float:
+    def _delay(
+        self, policy: RetryPolicy, attempt: int, retry_after: float | None, waited: float
+    ) -> float:
         """How long to wait before the next attempt, given how long this call has waited already.
 
         `Retry-After` wins when Devin sent one — it knows when the window resets and we do not —
@@ -730,12 +917,12 @@ class DevinClient:
         cost of one call is bounded by the policy rather than by the arithmetic happening to work
         out at the current attempt count.
         """
-        ceiling = self._retry.ceiling(attempt)
+        ceiling = policy.ceiling(attempt)
         if retry_after is not None:
-            delay = min(retry_after, self._retry.max_delay)
+            delay = min(retry_after, policy.max_delay)
         else:
             delay = self._rng.uniform(ceiling / 2, ceiling)
-        return max(0.0, min(delay, self._retry.max_total_delay - waited))
+        return max(0.0, min(delay, policy.max_total_delay - waited))
 
     def _observe(self, method: str, endpoint: str, outcome: DevinOutcome, elapsed: float) -> None:
         self._metrics.observe_devin_request(
@@ -755,6 +942,33 @@ class DevinClient:
             raise DevinResponseError(
                 f"{method} {endpoint} returned a body {model.__name__} does not accept — {faults}"
             ) from None
+
+
+def _adoption_order(session: Session) -> tuple[bool, bool, int, str]:
+    """Which of several sessions for one remediation is adopted — `min` of this key wins.
+
+    A live session before an archived one, because archiving is how a human stops a session and the
+    one they left running is the one they meant to keep. Then the earliest, which is the session the
+    lost response belonged to and the one with the most work already done. Then the id, so the order
+    is total and two workers racing the same lookup cannot disagree.
+
+    A session whose body carried no `created_at` sorts **after** every session that did: not knowing
+    when a session started is not evidence that it started first, and the reference marks the field
+    required, so its absence says something is wrong with that body rather than something early
+    about that session.
+
+    Note what is *not* here: no branch that creates a session when every match is archived. A human
+    archiving all of them is exactly the 2026-08-11 incident being cleaned up by hand, and answering
+    that with a tenth session would be the defect volunteering for a rematch. The remediation adopts
+    an archived session, the poller reports it as stopped, and it escalates — visibly, and without
+    spending anything.
+    """
+    return (
+        session.is_archived,
+        session.created_at is None,
+        session.created_at or 0,
+        session.session_id,
+    )
 
 
 def _decode(method: str, endpoint: str, response: httpx.Response) -> Any:

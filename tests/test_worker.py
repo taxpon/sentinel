@@ -302,8 +302,23 @@ def fake_budget(devin_api: FakeAPI, *days: tuple[datetime.date, float]) -> None:
     devin_api.responds("GET", CONSUMPTION, json=a_consumption_body(*days))
 
 
+def a_session_page(*sessions: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "items": list(sessions),
+        "end_cursor": None,
+        "has_next_page": False,
+        "total": len(sessions),
+    }
+
+
+def fake_no_session_yet(devin_api: FakeAPI) -> None:
+    """The adopt-or-create lookup `create_session` makes before it posts, answering "none yet"."""
+    devin_api.responds("GET", SESSIONS, json=a_session_page())
+
+
 def fake_session_creation(devin_api: FakeAPI, **overrides: Any) -> None:
     fake_budget(devin_api)
+    fake_no_session_yet(devin_api)
     devin_api.responds("POST", SESSIONS, 201, a_session_body(**overrides))
 
 
@@ -492,6 +507,112 @@ async def test_a_reclaimed_create_session_does_not_create_a_second_session(
     assert len(await event_rows(session_factory)) == 1
 
 
+async def test_a_create_job_retried_after_a_timeout_adopts_rather_than_creating_again(
+    context: Context,
+    seed: Seed,
+    enqueue: Enqueue,
+    devin_api: FakeAPI,
+    github_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The outer layer — the one a narrower fix would have missed entirely.
+
+    On 2026-08-11 the client's own retries made three sessions per issue. Stopping *those* would
+    have left this: the job fails, `queue.fail` schedules it again with backoff, and the second
+    attempt posts a second time — the same duplicate, arriving a minute later instead of a second
+    later.
+
+    So the job really is retried here, through `run_once` both times, and the assertion is on the
+    count of `POST`s across the pair. The session Devin made from the first (timed-out) request is
+    what the listing answers with on the second attempt.
+    """
+    remediation_id = await a_create_job(seed, enqueue)
+    fake_issue(github_api)
+    fake_budget(devin_api)
+    # The request arrived and the session was made; only the response was lost.
+    devin_api.route("POST", SESSIONS).mock(side_effect=httpx.ReadTimeout("no response"))
+    devin_api.route("GET", SESSIONS).mock(
+        side_effect=[
+            httpx.Response(200, json=a_session_page()),
+            httpx.Response(
+                200,
+                json=a_session_page(
+                    {
+                        "session_id": SESSION_ID,
+                        "status": "running",
+                        "url": SESSION_URL,
+                        "tags": [
+                            "sentinel",
+                            f"repo:{REPO}",
+                            f"issue:{ISSUE_NUMBER}",
+                            f"class:{ISSUE_CLASS}",
+                            f"run:{DELIVERY}",
+                        ],
+                    }
+                ),
+            ),
+        ]
+    )
+
+    await worker.run_once(context, claimed_by=WORKER)
+
+    [job] = await job_rows(session_factory)
+    assert job.status == JobStatus.PENDING, "a timeout is worth another attempt"
+    assert (await remediation_row(session_factory, remediation_id)).state == State.QUEUED
+
+    # The queue would wait out the backoff; the test does not.
+    async with session_factory() as db:
+        await db.execute(update(Job).where(Job.id == job.id).values(run_after=text("now()")))
+        await db.commit()
+
+    await worker.run_once(context, claimed_by=WORKER)
+
+    assert len(devin_api.sent("POST", SESSIONS)) == 1, (
+        "the retried job must adopt the session the timed-out request created, not make another"
+    )
+    remediation = await remediation_row(session_factory, remediation_id)
+    assert remediation.state == State.SESSION_CREATED
+    assert remediation.devin_session_id == SESSION_ID
+    assert remediation.devin_session_url == SESSION_URL
+    [job] = await job_rows(session_factory)
+    assert job.status == JobStatus.DONE
+    # One transition, not one per attempt: the adopting attempt must not re-record the creation.
+    assert len(await event_rows(session_factory)) == 1
+
+
+async def test_a_lookup_the_worker_cannot_complete_creates_nothing_and_escalates(
+    context: Context,
+    seed: Seed,
+    enqueue: Enqueue,
+    devin_api: FakeAPI,
+    github_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The lookup's failure path, at the layer where its cost is paid.
+
+    A listing that cannot answer is not a listing that answered "none": the create is skipped, the
+    job is retired without another attempt — the condition is a property of the listing, not of the
+    moment — and the remediation escalates to a human. What must not happen is a `POST`.
+    """
+    remediation_id = await a_create_job(seed, enqueue)
+    fake_issue(github_api)
+    fake_budget(devin_api)
+    devin_api.responds(
+        "GET", SESSIONS, json={"items": [], "end_cursor": "cursor-1", "has_next_page": True}
+    )
+
+    await worker.run_once(context, claimed_by=WORKER)
+
+    assert devin_api.sent("POST", SESSIONS) == []
+    created, escalation = await job_rows(session_factory)
+    assert created.status == JobStatus.FAILED
+    assert created.attempts == 1, "re-walking the same listing would find the same nothing"
+    assert escalation.kind == JobKind.ESCALATE
+    remediation = await remediation_row(session_factory, remediation_id)
+    assert remediation.state == State.FAILED
+    assert remediation.devin_session_id is None
+
+
 async def test_a_session_created_for_a_remediation_cancelled_mid_flight_is_still_recorded(
     context: Context,
     seed: Seed,
@@ -511,6 +632,7 @@ async def test_a_session_created_for_a_remediation_cancelled_mid_flight_is_still
     remediation_id = await a_create_job(seed, enqueue)
     fake_issue(github_api)
     fake_budget(devin_api)
+    fake_no_session_yet(devin_api)
 
     async def cancel_it(request: httpx.Request) -> httpx.Response:
         async with session_factory() as db:
@@ -1512,6 +1634,7 @@ async def test_a_retryable_failure_is_scheduled_rather_than_given_up_on(
     remediation_id = await a_create_job(seed, enqueue)
     fake_issue(github_api)
     fake_budget(devin_api)
+    fake_no_session_yet(devin_api)
     devin_api.responds("POST", SESSIONS, 503, json={"message": "later"})
 
     await worker.run_once(context, claimed_by=WORKER)
@@ -1535,6 +1658,7 @@ async def test_a_rejected_body_fails_immediately(
     remediation_id = await a_create_job(seed, enqueue)
     fake_issue(github_api)
     fake_budget(devin_api)
+    fake_no_session_yet(devin_api)
     devin_api.responds("POST", SESSIONS, 422, json={"message": "unregistered tag"})
 
     await worker.run_once(context, claimed_by=WORKER)
@@ -1607,6 +1731,7 @@ async def test_the_last_attempt_takes_the_remediation_with_it(
     remediation_id = await a_create_job(seed, enqueue)
     fake_issue(github_api)
     fake_budget(devin_api)
+    fake_no_session_yet(devin_api)
     devin_api.responds("POST", SESSIONS, 503, json={"message": "later"})
 
     async with session_factory() as db:
@@ -1687,6 +1812,7 @@ async def test_a_lost_lease_leaves_the_row_to_the_worker_that_holds_it(
     remediation_id = await a_create_job(seed, enqueue)
     fake_issue(github_api)
     fake_budget(devin_api)
+    fake_no_session_yet(devin_api)
     devin_api.responds("POST", SESSIONS, 503, json={"message": "later"})
 
     slow = await claim()

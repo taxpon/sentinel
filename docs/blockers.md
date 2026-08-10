@@ -307,12 +307,24 @@ says whether the write was accepted or refused.
 **Impact.** Blocks all live execution: session creation, the review-fix loop, ACU accounting, the
 demo. Also gates [B5](#b5), [B6](#b6) and [B7](#b7).
 
-**Needed.** `DEVIN_ORG_ID` (`org-…`) and a service-user token (`cog_…`) with at least
-`ManageOrgSessions`; enterprise scope if the metrics panel is to use Devin's own figures.
+**Needed.** `DEVIN_ORG_ID` (`org-…`) and a service-user token (`cog_…`) with `ManageOrgSessions`
+**and `ViewOrgSessions`** — the read became a prerequisite for *creating* a session on 2026-08-11,
+not only for polling one
+([ADR](./adr/2026-08-11-a-session-is-adopted-before-it-is-created.md)); enterprise scope if the
+metrics panel is to use Devin's own figures.
 
 **Meanwhile.** Everything except live execution is buildable — the orchestrator, its full test
 suite (Devin is faked with `respx`), the analytics layer and the dashboard all develop without
 credentials ([08](./08-testing.md)). This blocker gates the runs, not the build.
+
+**This blocker's premise no longer holds, and the entry has not been rewritten to match.** On
+2026-08-11 five labelled issues reached Devin and nine sessions were created, which means a
+credential exists and live execution has happened
+([ADR](./adr/2026-08-11-a-session-is-adopted-before-it-is-created.md)). "Blocks all live execution",
+the "Meanwhile" paragraph and "exactly one call has been made" below are all stale as written.
+Rewriting them needs the facts about what credential exists and with which permissions, which the
+incident does not supply — so this note records the contradiction where a reader will meet it rather
+than guessing at a replacement.
 
 **Response shapes: one endpoint has been called, 2026-08-10.** Every endpoint has since been read
 against its own page of the v3 OpenAPI reference (below), which is a weaker thing than a call: it

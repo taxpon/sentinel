@@ -30,10 +30,12 @@ The four ways in are checked in a fixed order, and the order is the point:
    **It narrows that window; it does not close it.** The check reads committed state, so it can
    only see a session the first worker has already committed. A worker that posts, writes
    `devin_session_id` and *then* calls `complete()` learns there that its lease expired:
-   `LeaseLost` rolls its transaction back, the id never commits, and the reclaimer reads `None` and
-   posts again. **The handler must therefore commit `devin_session_id` on its own, as soon as the
-   `POST` returns and before it does anything else.** How wide the remaining window is, is decided
-   by that commit and by nothing in this module.
+   `LeaseLost` rolls its transaction back, the id never commits, and the reclaimer reads `None`.
+   Since `docs/adr/2026-08-11-a-session-is-adopted-before-it-is-created.md` the reclaimer no longer
+   *posts* on reading `None` — `DevinClient.create_session` finds the first worker's session by its
+   tags and adopts it. **The handler must still commit `devin_session_id` on its own, as soon as the
+   `POST` returns and before it does anything else**, because that is what makes Sentinel's own
+   record agree with what exists at Devin; without it the id is only recoverable by another lookup.
 3. **The daily ACU budget.** A *terminal* verdict — waiting does not make an exhausted budget
    affordable — so it is decided before the temporary one. The other order would let a saturated
    queue postpone the escalation indefinitely, leaving the issue silently `QUEUED` while an

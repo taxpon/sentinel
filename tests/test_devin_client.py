@@ -42,8 +42,10 @@ from sentinel.devin.client import (
     ENDPOINTS,
     ENTERPRISE_SESSION_METRICS,
     KNOWLEDGE_NOTES,
+    LOOKUP_PAGE_LIMIT,
     ORGANIZATION_TAGS,
     PLAYBOOKS,
+    SEND_ONCE,
     SESSION,
     SESSION_MESSAGES,
     SESSION_TAGS,
@@ -54,6 +56,7 @@ from sentinel.devin.client import (
     DevinResponseError,
     DevinTransportError,
     RetryPolicy,
+    SessionLookupIncomplete,
     registered_tag,
 )
 from sentinel.devin.schemas import (
@@ -272,6 +275,26 @@ the fixture to disagree with the API.
 """
 
 
+def a_page(*sessions: dict[str, Any], end_cursor: str | None = None) -> dict[str, Any]:
+    """A `PaginatedResponse[SessionResponse]`, in the envelope the reference names."""
+    return {
+        "items": list(sessions),
+        "end_cursor": end_cursor,
+        "has_next_page": end_cursor is not None,
+        "total": len(sessions),
+    }
+
+
+def no_session_yet(devin_api: FakeAPI) -> None:
+    """The adopt-or-create lookup, answering that this remediation has none yet.
+
+    Every creation below goes through it, because `create_session` looks before it posts. A test
+    that forgets it does not quietly create a second session — `respx` refuses the unregistered
+    `GET` and the test fails.
+    """
+    devin_api.responds("GET", SESSIONS_URL, json=a_page())
+
+
 class Sleeps:
     """The backoff, recorded instead of waited out."""
 
@@ -356,6 +379,7 @@ def test_the_retry_classification_is_the_documented_one() -> None:
 async def test_create_session_sends_the_documented_body(
     client: DevinClient, devin_api: FakeAPI
 ) -> None:
+    no_session_yet(devin_api)
     devin_api.responds("POST", SESSIONS_URL, 201, a_session(status="new", acus_consumed=None))
 
     await client.create_session(**ISSUE)
@@ -402,6 +426,7 @@ async def test_every_class_sends_registered_tags_and_its_own_ceiling(
     """The tag set is built through T15's vocabulary, so an unregistered tag — a `422` at creation
     (B7) — cannot be constructed here, and the ACU ceiling follows the class rather than a default.
     """
+    no_session_yet(devin_api)
     devin_api.responds("POST", SESSIONS_URL, 201, a_session())
 
     await client.create_session(**{**ISSUE, "issue_class": issue_class})
@@ -416,6 +441,7 @@ async def test_every_class_sends_registered_tags_and_its_own_ceiling(
 async def test_create_session_returns_the_parsed_session(
     client: DevinClient, devin_api: FakeAPI
 ) -> None:
+    no_session_yet(devin_api)
     devin_api.responds("POST", SESSIONS_URL, 201, a_session(status="new", status_detail=None))
 
     session = await client.create_session(**ISSUE)
@@ -453,6 +479,7 @@ async def test_the_session_created_event_is_logged(
 ) -> None:
     """`docs/09-operations.md` greps the demo runbook for exactly this event name."""
     logs = capture()
+    no_session_yet(devin_api)
     devin_api.responds("POST", SESSIONS_URL, 201, a_session())
 
     await client.create_session(**ISSUE)
@@ -461,6 +488,477 @@ async def test_the_session_created_event_is_logged(
     assert len(created) == 1
     assert created[0]["session_id"] == SESSION_ID
     assert created[0]["duration_ms"] >= 0
+
+
+# --- Creating a session is idempotent -------------------------------------------------------------
+#
+# On 2026-08-11 five issues were labelled inside 2.3 s, Devin's API stopped answering the create
+# within the 30 s timeout, and the client's three transport retries each made another session:
+# issues #3, #4 and #6 finished with three sessions apiece, nine in all. The requests had arrived —
+# only the responses were lost — so every test below is about the same fact, that a read timeout is
+# not evidence that nothing happened.
+
+
+def a_timeout() -> httpx.ReadTimeout:
+    """What a create that Devin *did* receive looks like from here."""
+    return httpx.ReadTimeout("timed out waiting for the response")
+
+
+async def test_a_create_that_times_out_is_not_sent_again(
+    client: DevinClient, devin_api: FakeAPI, sleeps: Sleeps
+) -> None:
+    """The incident itself, at the layer that caused it.
+
+    One `POST`, no backoff, and the failure handed to the queue. Three attempts here were three
+    sessions, and nothing on the wire could have told Devin the second was a repeat of the first —
+    `SessionCreateRequest` defines no idempotency key.
+    """
+    no_session_yet(devin_api)
+    devin_api.route("POST", SESSIONS_URL).mock(side_effect=a_timeout())
+
+    with pytest.raises(DevinTransportError) as raised:
+        await client.create_session(**ISSUE)
+
+    assert raised.value.retryable, "the queue must still get another attempt at this"
+    assert len(devin_api.sent("POST", SESSIONS_URL)) == 1
+    assert sleeps.delays == []
+
+
+async def test_a_create_rate_limited_is_not_sent_again_either(
+    client: DevinClient, devin_api: FakeAPI, sleeps: Sleeps
+) -> None:
+    """`429` and `5xx` earn a retry everywhere else in this client. Not here.
+
+    A `5xx` can be a session created and a response lost, and telling the two apart from the status
+    line is exactly what is impossible — so the create has one rule rather than a rule per status,
+    and recovery is the adopt-or-create lookup on the next attempt.
+    """
+    no_session_yet(devin_api)
+    devin_api.route("POST", SESSIONS_URL).mock(
+        side_effect=[httpx.Response(429), httpx.Response(201, json=a_session())]
+    )
+
+    with pytest.raises(DevinAPIError) as raised:
+        await client.create_session(**ISSUE)
+
+    assert raised.value.status_code == 429
+    assert len(devin_api.sent("POST", SESSIONS_URL)) == 1
+    assert sleeps.delays == []
+
+
+def test_the_create_is_sent_exactly_once() -> None:
+    """The policy itself, so that widening it is a visible change rather than a diff in a loop."""
+    assert SEND_ONCE.attempts == 1
+
+
+def test_a_lookup_that_cannot_answer_is_not_worth_another_attempt() -> None:
+    """`SessionLookupIncomplete` must not be retryable, and the worker reads exactly this.
+
+    Rebased on a retryable error it would re-walk the whole listing once per job attempt until
+    `MAX_JOB_ATTEMPTS`, instead of escalating on the first — which is the opposite of what the
+    exception exists to say. The condition is a property of the listing, not of the moment.
+    """
+    assert not SessionLookupIncomplete("lookup exhausted").retryable
+
+
+def test_the_lookup_cannot_outlast_the_lease_that_protects_the_job() -> None:
+    """The walk is bounded in pages *and* in wall-clock time.
+
+    A page is a read and keeps every retry a read has, so a page that *succeeds* can have failed
+    twice and waited out the backoff first — the per-page cost is the whole policy, not one
+    timeout. Raising `LOOKUP_PAGE_LIMIT`, or the retry policy, without raising the lease would let
+    a lookup outlive the lease it runs under; another worker then claims the same job, and two
+    workers that both look before either posts both create. That is the reclaim hazard all of this
+    exists to close, reintroduced by the thing meant to close it.
+
+    Computed from the constants rather than restated, so the relationship is what is asserted.
+    """
+    per_page = DEFAULT_RETRY.attempts * SPEC_TIMEOUT_SECONDS + DEFAULT_RETRY.max_total_delay
+    worst_case = LOOKUP_PAGE_LIMIT * per_page + SEND_ONCE.attempts * SPEC_TIMEOUT_SECONDS
+
+    assert per_page == 150.0
+    assert worst_case == 630.0
+    assert worst_case < make_settings().job_lease_timeout_seconds
+
+
+async def test_a_second_attempt_adopts_the_session_the_first_one_made(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """The whole point: the remediation ends with one session however often the attempt repeats.
+
+    The first attempt times out after Devin has created the session; the second finds it by its
+    tags and returns it. **No second `POST` is made** — which is what the nine sessions of
+    2026-08-11 were.
+    """
+    devin_api.route("GET", SESSIONS_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=a_page()),
+            httpx.Response(200, json=a_page(a_session())),
+        ]
+    )
+    devin_api.route("POST", SESSIONS_URL).mock(side_effect=a_timeout())
+
+    with pytest.raises(DevinTransportError):
+        await client.create_session(**ISSUE)
+    adopted = await client.create_session(**ISSUE)
+
+    assert adopted.session_id == SESSION_ID
+    assert len(devin_api.sent("POST", SESSIONS_URL)) == 1
+
+
+async def test_the_lookup_searches_on_the_tags_the_creation_writes(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """The captured request, both halves of it.
+
+    The lookup's filter has to be a prefix of the tag set a creation sends, or it searches for
+    something no session of ours carries. Asserting the two against each other is what stops them
+    drifting — a `class:` or `run:` tag added to the filter would narrow it to one attempt and
+    adopt nothing.
+    """
+    no_session_yet(devin_api)
+    devin_api.responds("POST", SESSIONS_URL, 201, a_session())
+
+    await client.create_session(**ISSUE)
+
+    lookup = devin_api.only("GET", SESSIONS_URL)
+    identity = ["sentinel", "repo:taxpon/superset", "issue:42"]
+    assert lookup.url.params.get_list("tags") == identity
+    assert lookup.url.params["first"] == "200"
+    assert "after" not in lookup.url.params
+
+    created = devin_api.only("POST", SESSIONS_URL).json
+    assert created["tags"][:3] == identity
+    assert created["tags"][3:] == ["class:security", f"run:{DELIVERY_ID}"]
+
+
+async def test_the_lookup_runs_before_anything_is_created(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """Ordering is the property, not the presence of two calls: a lookup after the `POST` would
+    find the session it had just made and prevent nothing."""
+    no_session_yet(devin_api)
+    devin_api.responds("POST", SESSIONS_URL, 201, a_session())
+
+    await client.create_session(**ISSUE)
+
+    assert [request.method for request in devin_api.sent(path=SESSIONS_URL)] == ["GET", "POST"]
+
+
+async def test_a_session_of_another_remediation_is_never_adopted(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """The listing's own filtering is an optimisation; the check on what came back is the rule.
+
+    The reference documents `SessionsQueryParams.tags` as an array and does not say whether the
+    server ANDs them, ORs them or ignores one — so a page answering as though it ORed them must
+    still not hand this remediation somebody else's session.
+    """
+    another_issue = a_session(
+        session_id="devin-someone-else",
+        tags=["sentinel", "repo:taxpon/superset", "issue:99", "class:bug", "run:other"],
+    )
+    another_repo = a_session(
+        session_id="devin-other-repo",
+        tags=["sentinel", "repo:taxpon/other", "issue:42", "class:bug", "run:other"],
+    )
+    devin_api.responds("GET", SESSIONS_URL, json=a_page(another_issue, another_repo))
+    devin_api.responds("POST", SESSIONS_URL, 201, a_session())
+
+    session = await client.create_session(**ISSUE)
+
+    assert session.session_id == SESSION_ID
+    assert devin_api.only("POST", SESSIONS_URL).json["tags"][2] == "issue:42"
+
+
+async def test_a_session_is_adopted_whatever_attempt_created_it(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """A different `run:` tag is still this remediation's session.
+
+    `run:<delivery_id>` names the webhook delivery, so a second delivery about one issue carries a
+    different one. Keying on it would have missed the session a previous job created — which is the
+    duplicate arriving a minute later rather than a second later.
+    """
+    earlier_delivery = a_session(
+        session_id="devin-earlier",
+        tags=["sentinel", "repo:taxpon/superset", "issue:42", "class:security", "run:some-other"],
+    )
+    devin_api.responds("GET", SESSIONS_URL, json=a_page(earlier_delivery))
+
+    session = await client.create_session(**ISSUE)
+
+    assert session.session_id == "devin-earlier"
+    assert devin_api.sent("POST", SESSIONS_URL) == []
+
+
+async def test_the_adopted_session_is_the_same_one_every_time(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """Three sessions for one issue is what the incident left behind, twice over.
+
+    Whichever attempt runs, and whichever order the listing returns them in, the choice is the
+    same: a live session before an archived one, then the earliest — the one whose response was
+    lost — then the id.
+
+    The winner is given the **last** id alphabetically on purpose. With ids and timestamps in
+    agreement, the id tiebreak alone reproduces every expected answer and `created_at` could be
+    dropped from the key without a test noticing.
+    """
+    live_late = a_session(session_id="devin-b", created_at=300, is_archived=False)
+    live_early = a_session(session_id="devin-z", created_at=200, is_archived=False)
+    archived_earliest = a_session(session_id="devin-a", created_at=100, is_archived=True)
+    devin_api.responds("GET", SESSIONS_URL, json=a_page(live_late, archived_earliest, live_early))
+
+    first = await client.create_session(**ISSUE)
+    second = await client.create_session(**ISSUE)
+
+    assert first.session_id == second.session_id == "devin-z"
+
+
+async def test_a_session_that_does_not_say_when_it_started_does_not_win_by_default(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """An absent `created_at` sorts last, not first.
+
+    The reference marks the field required, so a body without one says something is wrong with that
+    body — not something early about that session. Modelled as `None` rather than `0` for exactly
+    this: a zero would win a `min` against every session that does state its age.
+    """
+    undated = a_session(session_id="devin-a", is_archived=False)
+    dated = a_session(session_id="devin-z", created_at=500, is_archived=False)
+    assert "created_at" not in undated
+    devin_api.responds("GET", SESSIONS_URL, json=a_page(undated, dated))
+
+    session = await client.create_session(**ISSUE)
+
+    assert session.session_id == "devin-z"
+
+
+async def test_a_null_in_an_ordering_field_does_not_fail_the_poll(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """`created_at` and `is_archived` order adoption candidates and decide nothing else.
+
+    They are parsed on every `get_session` too, so a `null` in either would otherwise be a
+    `DevinResponseError` — and the poller answers that by taking the remediation to
+    `SESSION_UNREADABLE` and then `FAILED`. Failing a remediation over a field that decides nothing
+    about it is the bargain `acus_consumed` already refuses.
+    """
+    devin_api.responds("GET", SESSION_URL, 200, a_session(created_at=None, is_archived=None))
+
+    session = await client.get_session(SESSION_ID)
+
+    assert session.created_at is None
+    assert session.is_archived is False
+
+
+async def test_a_remediation_whose_sessions_were_all_archived_gets_no_tenth_one(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """Archiving is how the nine were stopped by hand. Answering that with another one would be
+    the defect volunteering for a rematch, so the earliest archived session is adopted instead and
+    the log line says it is archived."""
+    archived = a_session(session_id="devin-a", created_at=100, is_archived=True)
+    later = a_session(session_id="devin-b", created_at=200, is_archived=True)
+    devin_api.responds("GET", SESSIONS_URL, json=a_page(later, archived))
+
+    with structlog.testing.capture_logs() as records:
+        session = await client.create_session(**ISSUE)
+
+    assert session.session_id == "devin-a"
+    assert devin_api.sent("POST", SESSIONS_URL) == []
+    adopted = [record for record in records if record["event"] == "devin.session.adopted"]
+    assert [record["is_archived"] for record in adopted] == [True]
+
+
+async def test_a_session_on_a_later_page_is_still_found(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """A first page that does not contain it is not an answer.
+
+    `has_next_page` is followed with `after`, because deciding "there is no session" from a prefix
+    of the listing creates the duplicate this method exists to prevent.
+    """
+    devin_api.route("GET", SESSIONS_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=a_page(end_cursor="cursor-1")),
+            httpx.Response(200, json=a_page(a_session())),
+        ]
+    )
+
+    session = await client.create_session(**ISSUE)
+
+    assert session.session_id == SESSION_ID
+    assert devin_api.sent("POST", SESSIONS_URL) == []
+    pages = devin_api.sent("GET", SESSIONS_URL)
+    assert "after" not in pages[0].url.params
+    assert pages[1].url.params["after"] == "cursor-1"
+    assert [page.url.params["first"] for page in pages] == ["200", "200"]
+
+
+@pytest.mark.parametrize("winner_on_page", [1, 2], ids=["first-page", "second-page"])
+async def test_a_match_is_kept_whichever_page_it_was_on(
+    client: DevinClient, devin_api: FakeAPI, winner_on_page: int
+) -> None:
+    """Matches accumulate across the walk; they are not the last page's.
+
+    Two mutations hide here and each survives the other's fixture. Rebinding `matches` per page
+    drops a session found on page one — the walk then answers "none" and creates a duplicate, which
+    is the incident by another road. Returning as soon as a page yields a match reads the ordering
+    off a prefix instead of the whole. Both are covered only by running this from both ends.
+
+    The winner is the *earliest* session; the decoy is later and has a lower id, so neither the
+    listing order nor the id tiebreak can produce the right answer on its own.
+    """
+    winner = a_session(session_id="devin-z", created_at=100)
+    decoy = a_session(session_id="devin-a", created_at=900)
+    first, second = (winner, decoy) if winner_on_page == 1 else (decoy, winner)
+    devin_api.route("GET", SESSIONS_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=a_page(first, end_cursor="cursor-1")),
+            httpx.Response(200, json=a_page(second)),
+        ]
+    )
+
+    session = await client.create_session(**ISSUE)
+
+    assert session.session_id == "devin-z"
+    assert devin_api.sent("POST", SESSIONS_URL) == []
+
+
+async def test_a_terminal_page_ends_the_walk_even_when_it_names_a_cursor(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """`has_next_page: false` is the terminator, not "there is no cursor".
+
+    A final page carrying a cursor is the ordinary Relay shape and entirely plausible here, since
+    this endpoint's paging has never been driven for real. Requiring both would re-walk that page
+    until the budget ran out and raise on *every* session creation.
+    """
+    devin_api.responds(
+        "GET",
+        SESSIONS_URL,
+        json={"items": [], "end_cursor": "cursor-1", "has_next_page": False},
+    )
+    devin_api.responds("POST", SESSIONS_URL, 201, a_session())
+
+    session = await client.create_session(**ISSUE)
+
+    assert session.session_id == SESSION_ID
+    assert len(devin_api.sent("GET", SESSIONS_URL)) == 1
+
+
+async def test_the_lookup_adopts_from_the_listing_the_live_api_actually_returned(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """The one body in this file whose key names and types came off the real API.
+
+    Every other fixture here was written from the same reference as the code, so it asserts that
+    the two are consistent rather than that either is right — the lesson of 2026-08-10. This is the
+    lookup standing on the observed shape: its `items[0].tags` are the three identity tags and its
+    `created_at` is a real epoch integer.
+    """
+    devin_api.responds("GET", SESSIONS_URL, json=OBSERVED_SESSION_LISTING)
+
+    session = await client.create_session(**ISSUE)
+
+    assert session.session_id == SESSION_ID
+    assert session.created_at == 1_754_784_000
+    assert session.is_archived is False
+    assert devin_api.sent("POST", SESSIONS_URL) == []
+
+
+async def test_a_page_that_promises_more_without_a_cursor_refuses_to_answer(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """`has_next_page: true` with no `end_cursor` is a page the walk cannot continue.
+
+    Answering `None` there — reading the prefix as the whole — is the shape a renamed cursor field
+    would take, and it would make every lookup answer from page one for ever while the code looked
+    healthy. `a_page` cannot produce this body, which is exactly why it is written out here.
+    """
+    devin_api.responds(
+        "GET", SESSIONS_URL, json={"items": [], "end_cursor": None, "has_next_page": True}
+    )
+
+    with pytest.raises(SessionLookupIncomplete, match="no end_cursor"):
+        await client.create_session(**ISSUE)
+
+    assert devin_api.sent("POST", SESSIONS_URL) == []
+    assert len(devin_api.sent("GET", SESSIONS_URL)) == 1
+
+
+async def test_a_walk_that_runs_out_of_budget_still_adopts_what_it_found(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """Exhausting the page budget says nothing about the sessions already identified.
+
+    Each one passed the tag check on this side, which is the same evidence an ordinary answer
+    rests on. Failing the remediation while a session of its own runs unrecorded would be an orphan
+    created by the path that exists to prevent orphans.
+    """
+    devin_api.route("GET", SESSIONS_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=a_page(a_session(), end_cursor=f"cursor-{page}"))
+            for page in range(LOOKUP_PAGE_LIMIT)
+        ]
+    )
+
+    session = await client.create_session(**ISSUE)
+
+    assert session.session_id == SESSION_ID
+    assert devin_api.sent("POST", SESSIONS_URL) == []
+
+
+async def test_a_listing_that_never_ends_refuses_to_create_rather_than_guessing(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """The lookup's own failure path, decided rather than defaulted.
+
+    A listing that keeps claiming another page is one that is not filtering, and the honest answer
+    to "I could not find out" is not "create one anyway" — that is the bug. The job fails, the
+    remediation escalates, and nothing is spent.
+    """
+    devin_api.responds("GET", SESSIONS_URL, json=a_page(end_cursor="cursor-forever"))
+
+    with pytest.raises(SessionLookupIncomplete):
+        await client.create_session(**ISSUE)
+
+    assert devin_api.sent("POST", SESSIONS_URL) == []
+    assert len(devin_api.sent("GET", SESSIONS_URL)) == LOOKUP_PAGE_LIMIT
+
+
+async def test_a_lookup_that_is_refused_creates_nothing(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """`ViewOrgSessions` is a prerequisite of creating a session now, not only of polling one.
+
+    A deployment whose service user cannot list sessions cannot create one safely, so it fails
+    loudly on the first remediation instead of duplicating quietly on the first bad afternoon.
+    """
+    devin_api.responds("GET", SESSIONS_URL, 403, text='{"title":"Forbidden"}')
+
+    with pytest.raises(DevinAPIError) as raised:
+        await client.create_session(**ISSUE)
+
+    assert raised.value.status_code == 403
+    assert devin_api.sent("POST", SESSIONS_URL) == []
+
+
+async def test_a_lookup_that_times_out_creates_nothing_and_is_retried_by_the_queue(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """Reads keep their retries — the lookup is a `GET` and gets all three attempts. What it does
+    not do is fall through to a create when they are all used up."""
+    devin_api.route("GET", SESSIONS_URL).mock(side_effect=a_timeout())
+
+    with pytest.raises(DevinTransportError) as raised:
+        await client.create_session(**ISSUE)
+
+    assert raised.value.retryable
+    assert len(devin_api.sent("GET", SESSIONS_URL)) == 3
+    assert devin_api.sent("POST", SESSIONS_URL) == []
 
 
 # --- Reading a session ----------------------------------------------------------------------------
@@ -844,14 +1342,15 @@ async def test_a_listing_can_filter_on_a_class_no_session_of_ours_carries(
 async def test_a_rate_limited_request_backs_off_and_retries(
     client: DevinClient, devin_api: FakeAPI, sleeps: Sleeps
 ) -> None:
-    devin_api.route("POST", SESSIONS_URL).mock(
-        side_effect=[httpx.Response(429), httpx.Response(201, json=a_session())]
+    """A resume message, not a creation: `POST …/sessions` is sent once and never retried, and
+    every other route — including the other `POST`s — keeps the documented backoff."""
+    devin_api.route("POST", MESSAGES_URL).mock(
+        side_effect=[httpx.Response(429), httpx.Response(202)]
     )
 
-    session = await client.create_session(**ISSUE)
+    await client.send_message(SESSION_ID, "CI failed on the head commit.")
 
-    assert session.session_id == SESSION_ID
-    assert len(devin_api.sent("POST", SESSIONS_URL)) == 2
+    assert len(devin_api.sent("POST", MESSAGES_URL)) == 2
     # One wait, jittered across the top half of the first ceiling (0.5 s).
     assert len(sleeps.delays) == 1
     assert 0.25 <= sleeps.delays[0] <= 0.5
@@ -925,6 +1424,7 @@ async def test_a_client_error_fails_without_retrying(
     client: DevinClient, devin_api: FakeAPI, sleeps: Sleeps, status: int
 ) -> None:
     """A body Devin rejected will not become well-formed; retrying it only spends quota."""
+    no_session_yet(devin_api)
     devin_api.responds("POST", SESSIONS_URL, status, text='{"detail":"tag not registered"}')
 
     with pytest.raises(DevinAPIError) as raised:
@@ -954,16 +1454,16 @@ async def test_the_error_names_the_templated_path_not_the_session(
 async def test_every_attempt_is_measured(
     client: DevinClient, devin_api: FakeAPI, registry: CollectorRegistry
 ) -> None:
-    devin_api.route("POST", SESSIONS_URL).mock(
-        side_effect=[httpx.Response(429), httpx.Response(201, json=a_session())]
+    devin_api.route("POST", MESSAGES_URL).mock(
+        side_effect=[httpx.Response(429), httpx.Response(202)]
     )
 
-    await client.create_session(**ISSUE)
+    await client.send_message(SESSION_ID, "CI failed on the head commit.")
 
     def observations(outcome: str) -> float | None:
         return registry.get_sample_value(
             "sentinel_devin_request_duration_seconds_count",
-            {"method": "POST", "endpoint": SESSIONS, "outcome": outcome},
+            {"method": "POST", "endpoint": SESSION_MESSAGES, "outcome": outcome},
         )
 
     assert observations("rate_limited") == 1.0
@@ -1441,6 +1941,16 @@ LOGGABLE_KEYS = frozenset(
         "delay_ms",
         "session_id",
         "issue",
+        # What the adopt-or-create lookup saw. `is_archived` because a remediation attached to a
+        # session somebody stopped by hand will not progress and nothing else on the line says so;
+        # `matched`, `pages` and `seen` because the branch that finds nothing is the branch that
+        # goes on to create, and a `seen` of zero against an organisation full of sessions is what
+        # a `tags` filter the server misparses looks like. All four are counts and flags about
+        # Sentinel's own sessions — no title, no body, no header.
+        "is_archived",
+        "matched",
+        "pages",
+        "seen",
         "capability",
         "reason",
         "detail",
@@ -1469,17 +1979,28 @@ async def test_no_header_or_body_is_handed_to_the_logger(
     client: DevinClient, devin_api: FakeAPI
 ) -> None:
     """Every log call site of a successful path, checked before redaction runs."""
-    devin_api.route("POST", SESSIONS_URL).mock(
-        side_effect=[httpx.Response(429), httpx.Response(201, json=a_session())]
+    devin_api.route("GET", SESSIONS_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=a_page()),
+            httpx.Response(200, json=a_page(a_session())),
+        ]
+    )
+    devin_api.responds("POST", SESSIONS_URL, 201, a_session())
+    devin_api.route("POST", MESSAGES_URL).mock(
+        side_effect=[httpx.Response(429), httpx.Response(202)]
     )
 
     with structlog.testing.capture_logs() as records:
         await client.create_session(**ISSUE)
+        await client.create_session(**ISSUE)
+        await client.send_message(SESSION_ID, "CI failed on the head commit.")
 
     assert {record["event"] for record in records} == {
         "devin.request",
         "devin.request.retry",
+        "devin.session.absent",
         "devin.session.created",
+        "devin.session.adopted",
     }
     assert_nothing_sensitive_was_logged(records)
 
@@ -1488,6 +2009,7 @@ async def test_nothing_sensitive_is_logged_on_the_failure_paths(
     client: DevinClient, devin_api: FakeAPI
 ) -> None:
     """The failure and the degradation call sites, including a response that quotes the token."""
+    no_session_yet(devin_api)
     devin_api.responds("POST", SESSIONS_URL, 422, text=f"token {DEVIN_TOKEN} may not use this tag")
     devin_api.responds("GET", CONSUMPTION_URL, 403, text=f"token {DEVIN_TOKEN} is not authorised")
 
@@ -1506,6 +2028,7 @@ async def test_the_token_is_sent_and_stays_out_of_the_exception(
 ) -> None:
     """It authenticates the request and appears nowhere else — including in the exception the
     worker records in `remediation_event.detail`."""
+    no_session_yet(devin_api)
     devin_api.responds("POST", SESSIONS_URL, 422, text='{"detail":"tag not registered"}')
 
     with pytest.raises(DevinAPIError) as raised:

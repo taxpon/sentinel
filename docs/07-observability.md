@@ -123,3 +123,16 @@ Structured JSON to stdout, one event per line.
 `run` is the GitHub delivery id, the same value carried as the `run:` Devin tag
 ([06](./06-event-pipeline.md)) — one identifier joins GitHub, Sentinel and the Devin dashboard.
 Tokens and webhook secrets are never logged, at any level.
+
+Two siblings of that event come from the adopt-or-create lookup
+([05](./05-devin-integration.md#adopt-or-create)), and they are what an operator reads when a
+remediation's session is not the one they expected:
+
+- **`devin.session.adopted`** — a session already existed for this remediation and was taken rather
+  than a second one created. Carries `session_id`, `issue`, `is_archived`, and `matched`, `pages`
+  and `seen` describing the walk. `is_archived: true` outside an incident cleanup means the
+  remediation is attached to a session somebody stopped by hand, and it will not progress.
+- **`devin.session.absent`** — the lookup found nothing, so a session is about to be created.
+  Carries `issue`, `pages` and `seen`. It is logged precisely because it is the branch that goes on
+  to create: a `seen` of zero against an organisation known to hold sessions is what a `tags` filter
+  the server misparses would look like, and nothing else would say so.

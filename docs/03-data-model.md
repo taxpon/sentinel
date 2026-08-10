@@ -104,10 +104,18 @@ The central aggregate: one labelled issue and everything that follows from it.
 | `merged_at` | `timestamptz` | |
 | `closed_at` | `timestamptz` | Terminal timestamp for `BLOCKED` / `FAILED` |
 
-**`UNIQUE (repo, issue_number)`** is the idempotency guarantee. Several distinct events — a label
-added twice, a comment, a re-opened issue — all resolve to the same row, so at most one Devin
-session exists per issue. The worker uses `INSERT … ON CONFLICT DO NOTHING RETURNING id` to make
-"create if absent" a single atomic statement.
+**`UNIQUE (repo, issue_number)`** is the idempotency guarantee **for this table**. Several distinct
+events — a label added twice, a comment, a re-opened issue — all resolve to the same row, so at most
+one remediation exists per issue. The worker uses `INSERT … ON CONFLICT DO NOTHING RETURNING id` to
+make "create if absent" a single atomic statement.
+
+It does **not** guarantee one Devin session per issue, and reading it as though it did is what
+2026-08-11 cost: the constraint held perfectly while nine sessions existed for three issues, because
+a session is created by a job that can be run more than once and this row knows nothing about that.
+The session-level guarantee is the adopt-or-create lookup in
+[05](./05-devin-integration.md#adopt-or-create). `devin_session_id` is Sentinel's record of its
+outcome, not its enforcement — which is also why the constraint being unique on `(repo,
+issue_number)` is what makes the session tags a usable key.
 
 Indexes: `(state)` for the worker's in-flight query, `(labeled_at)` for time-window analytics,
 `(devin_session_id)` for poller reconciliation.

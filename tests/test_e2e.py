@@ -222,6 +222,17 @@ def a_session(**overrides: Any) -> httpx.Response:
     )
 
 
+def no_session_yet(devin_api: FakeAPI) -> None:
+    """The adopt-or-create lookup `create_session` makes before it posts, finding nothing.
+
+    Registered separately from the `POST`, so a run that skipped the lookup would fail here rather
+    than create a session — `respx` answers no unregistered request.
+    """
+    devin_api.responds(
+        "GET", SESSIONS, json={"items": [], "end_cursor": None, "has_next_page": False, "total": 0}
+    )
+
+
 def a_workflow_run() -> dict[str, Any]:
     return {
         "id": RUN_ID,
@@ -372,15 +383,25 @@ async def test_what_sentinel_sends_across_a_whole_remediation(
     assert create_job.kind == JobKind.CREATE_SESSION
     assert create_job.payload["delivery_id"] == LABELLED
 
-    # --- The worker creates the session: budget, issue, `POST /sessions`. ---
+    # --- The worker creates the session: budget, issue, the adopt-or-create lookup, then
+    # `POST /sessions`. ---
     devin_api.responds("GET", CONSUMPTION, json=a_consumption_body())
     github_api.responds("GET", ISSUE, json=github_payload("issues.labeled")["issue"])
+    no_session_yet(devin_api)
     devin_api.responds(
         "POST", SESSIONS, 201, {"session_id": SESSION_ID, "status": "new", "url": SESSION_URL}
     )
 
     await pipeline.work()
 
+    # The lookup asks for this remediation's three identity tags, and the creation sends them as
+    # the first three of its five — so a session Devin had already made for this issue would have
+    # been found by exactly the filter that was sent.
+    assert devin_api.only("GET", SESSIONS).url.params.get_list("tags") == [
+        "sentinel",
+        f"repo:{REPO}",
+        f"issue:{ISSUE_NUMBER}",
+    ]
     created = devin_api.only("POST", SESSIONS).json
     assert created["tags"] == [
         "sentinel",
@@ -615,6 +636,7 @@ async def a_labelled_remediation(
     await pipeline.deliver(classified(delivery))
     devin_api.responds("GET", CONSUMPTION, json=a_consumption_body())
     github_api.responds("GET", ISSUE, json=github_payload("issues.labeled")["issue"])
+    no_session_yet(devin_api)
     creations = devin_api.responds(
         "POST", SESSIONS, 201, {"session_id": SESSION_ID, "status": "new", "url": SESSION_URL}
     )

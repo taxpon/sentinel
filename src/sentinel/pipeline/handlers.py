@@ -43,8 +43,17 @@ So the ordering below is load-bearing, and it is the same in both handlers that 
    `RUNNING` transition and the incremented cycle for a resume;
 3. complete the job in a second transaction, where a `LeaseLost` can no longer undo step 2.
 
-What is left is the genuinely unavoidable window: a worker that dies between the call and the
-commit. v3 takes no idempotency token, so nothing available to Sentinel closes that one.
+What is left is the window a worker that dies between the call and the commit leaves open. v3 still
+takes no idempotency token — but that window is now closed for `create_session` all the same, one
+layer down: `DevinClient.create_session` looks for a session already tagged for this remediation
+before it posts, and adopts it if there is one
+(`docs/adr/2026-08-11-a-session-is-adopted-before-it-is-created.md`). The next attempt, by this
+worker or another, finds the session the dead one made and records it instead of making a second.
+That covers a *job* retried minutes later exactly as it covers a reclaim, and the ordering above is
+still what keeps the id from being rolled back once it is written.
+
+`resume_session` has no such lookup and needs none: a message sent twice is a message, not a second
+session, and the cycle count it turns on is written in the same transaction as the resume.
 
 ## The review-fix loop
 
@@ -226,6 +235,11 @@ async def create_session(context: Context, job: ClaimedJob) -> None:
 
     The payload is read before anything is spent, so a job the ingress built wrongly fails without
     a consumption call and without a session.
+
+    Safe to run again, at any point: `devin.create_session` adopts a session already tagged for
+    this remediation rather than making a second one, so a job that fails after the `POST` — or
+    whose `POST` timed out having been served — comes back here and records the session that
+    already exists.
     """
     delivery_id = _required(job, "delivery_id")
 
@@ -311,8 +325,9 @@ async def _admit(context: Context, job: ClaimedJob, *, delivery_id: str) -> _Ses
 async def _record_session(context: Context, job: ClaimedJob, session: Session) -> None:
     """Commit the session id, alone, before the job is completed.
 
-    This is the transaction that closes the double-session window described at the top of the
-    module. It writes what the transition table calls for — `devin_session_id`,
+    This is the transaction that keeps a `LeaseLost` from rolling the session id back — the
+    double-session window itself is closed one layer down, in `DevinClient.create_session` (see the
+    top of the module). It writes what the transition table calls for — `devin_session_id`,
     `session_created_at`, the state and its event — and nothing about the job, so a `LeaseLost`
     raised later cannot roll the id back.
 
