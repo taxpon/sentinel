@@ -45,6 +45,10 @@ SESSION_ID = "devin-7b3f9c2a"
 SESSION_URL = f"https://app.devin.ai/sessions/{SESSION_ID}"
 PR_URL = "https://github.com/taxpon/superset/pull/42889"
 PR_NUMBER = 42889
+A_LATER_PR_URL = "https://github.com/taxpon/superset/pull/42890"
+UNNUMBERED_PR_URL = "https://github.com/taxpon/superset/pulls"
+"""A `pr_url` no number can be read out of. Devin reports no number of its own, so this is the only
+way `pr_number` can end up null on a linked remediation."""
 
 REPORT: dict[str, Any] = {
     "outcome": "fixed",
@@ -79,8 +83,10 @@ def a_session(**overrides: Any) -> dict[str, Any]:
     return {"session_id": SESSION_ID, "status": "running", "url": SESSION_URL, **overrides}
 
 
-def a_pull_request(url: str = PR_URL, number: int = PR_NUMBER) -> list[dict[str, Any]]:
-    return [{"url": url, "number": number}]
+def a_pull_request(url: str = PR_URL) -> list[dict[str, Any]]:
+    """`pull_requests[]` as the live API sends it: `pr_url` and `pr_state`, and no number — which
+    is why `PR_NUMBER` is not a parameter here but a consequence of `url`."""
+    return [{"pr_url": url, "pr_state": "open"}]
 
 
 def responds(body: dict[str, Any]) -> httpx.Response:
@@ -361,8 +367,8 @@ async def test_a_remediation_holding_a_pull_request_survives_its_session(
 async def test_a_pull_request_the_session_stops_reporting_does_not_fail_the_remediation(
     seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
 ) -> None:
-    """`pull_requests[]` is read from an API whose shape is unverified (B8). A linked remediation is
-    judged on its own link, not on whether this observation happens to repeat it."""
+    """A linked remediation is judged on its own link, not on whether this observation happens to
+    repeat it."""
     remediation = await seed(state=State.IN_REVIEW.value, pr_url=PR_URL, pr_number=PR_NUMBER)
     devin_api.responds("GET", session_path, 200, a_session(status="exit", pull_requests=[]))
 
@@ -393,6 +399,51 @@ async def test_pull_request_is_discovered_from_the_session(
     assert remediation.pr_number == PR_NUMBER
     assert remediation.pr_opened_at is not None
     assert [event.to_state for event in await events(session)] == [State.PR_OPENED.value]
+    assert poller.PR_NUMBER_UNRESOLVED not in (await events(session))[0].detail
+
+
+async def test_the_pull_request_number_is_derived_from_the_url(
+    seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
+) -> None:
+    """Devin reports no pull request number, and `webhooks._criterion` resolves every check suite
+    and every review by `remediation.pr_number`. So the number the fix loop runs on is the one
+    parsed out of `pr_url` — nothing else supplies it."""
+    remediation = await seed(state=State.RUNNING.value)
+    devin_api.responds(
+        "GET", session_path, 200, a_session(pull_requests=[{"pr_url": PR_URL, "pr_state": "open"}])
+    )
+
+    await poll()
+
+    await session.refresh(remediation)
+    assert remediation.pr_number == PR_NUMBER
+
+
+async def test_a_pull_request_url_carrying_no_number_is_recorded_rather_than_guessed(
+    seed: Seed, session: AsyncSession, devin_api: FakeAPI, session_path: str, poll: Poll
+) -> None:
+    """A `pr_url` no number can be read out of leaves `pr_number` null, and that is not survivable
+    quietly: `webhooks._criterion` resolves check suites and reviews by it, so the remediation
+    becomes unreachable from GitHub while sitting in a perfectly healthy-looking `PR_OPENED`.
+
+    The link is still made — the pull request exists and the dashboard must show it — and no number
+    is invented. What the event carries is the URL that could not be read, on the remediation that
+    will stall, so the timeline anyone opens says why.
+    """
+    remediation = await seed(state=State.RUNNING.value)
+    devin_api.responds(
+        "GET", session_path, 200, a_session(pull_requests=a_pull_request(url=UNNUMBERED_PR_URL))
+    )
+
+    await poll()
+
+    await session.refresh(remediation)
+    assert remediation.state == State.PR_OPENED.value
+    assert remediation.pr_url == UNNUMBERED_PR_URL
+    assert remediation.pr_number is None
+    assert [event.detail[poller.PR_NUMBER_UNRESOLVED] for event in await events(session)] == [
+        UNNUMBERED_PR_URL
+    ]
 
 
 async def test_a_transition_carries_the_cycle_forward(
@@ -449,9 +500,7 @@ async def test_the_pull_request_link_is_write_once(
     route.mock(
         side_effect=[
             responds(a_session(pull_requests=a_pull_request())),
-            responds(
-                a_session(pull_requests=a_pull_request(url=PR_URL + "0", number=PR_NUMBER + 1))
-            ),
+            responds(a_session(pull_requests=a_pull_request(url=A_LATER_PR_URL))),
         ]
     )
 

@@ -64,6 +64,7 @@ from sentinel.devin.schemas import (
     SessionStatus,
     Unavailability,
     Unavailable,
+    pull_request_number,
 )
 from sentinel.observability.prom import Metrics
 
@@ -204,8 +205,12 @@ STRUCTURED_REPORT: dict[str, Any] = {
 }
 
 
+PR_URL = "https://github.com/taxpon/superset/pull/7"
+PR_NUMBER = 7
+
+
 def a_session(**overrides: Any) -> dict[str, Any]:
-    """A session body shaped as `docs/05-devin-integration.md` says v3 returns one."""
+    """A session body shaped as the live API returns one — see `OBSERVED_SESSION_LISTING`."""
     return {
         "session_id": SESSION_ID,
         "url": f"https://app.devin.ai/sessions/{SESSION_ID}",
@@ -219,9 +224,53 @@ def a_session(**overrides: Any) -> dict[str, Any]:
             delivery_id=DELIVERY_ID,
         ),
         "acus_consumed": 3.5,
-        "pull_requests": [{"url": "https://github.com/taxpon/superset/pull/7", "number": 7}],
+        "pull_requests": [{"pr_url": PR_URL, "pr_state": "open"}],
         **overrides,
     }
+
+
+OBSERVED_SESSION_LISTING: dict[str, Any] = {
+    "items": [
+        {
+            "session_id": SESSION_ID,
+            "url": f"https://app.devin.ai/sessions/{SESSION_ID}",
+            "status": "running",
+            "title": "[sentinel] #42 Stored XSS in the dashboard filter box",
+            "tags": ["sentinel", "repo:taxpon/superset", "issue:42"],
+            "playbook_id": None,
+            "user_id": "user-8c1d2e3f",
+            "org_id": ORG,
+            "created_at": 1754784000,
+            "updated_at": 1754787600,
+            "is_archived": False,
+            "acus_consumed": 3.5,
+            "pull_requests": [{"pr_url": PR_URL, "pr_state": "open"}],
+            "parent_session_id": None,
+            "child_session_ids": [],
+            "service_user_id": None,
+            "category": "engineering",
+            "subcategory": "bug_fix",
+            "origin": "api",
+            "automation_id": None,
+            "structured_output": None,
+            "devin_mode": "standard",
+            "status_detail": "working",
+        }
+    ],
+    "end_cursor": None,
+    "has_next_page": False,
+    "total": 1,
+}
+"""`GET /v3/organizations/{org_id}/sessions` as the live API answered it on 2026-08-10 — every key
+and every type exactly as observed, with the values replaced by this file's own.
+
+A regression fixture, because the shape it records is not the one the code was written against and
+the difference cost the review-fix loop: `pull_requests[].pr_url` was modelled as `url` (the parse
+failed outright) and `pull_requests[].number` does not exist at all (it parsed to `None`, which is
+worse — `webhooks._criterion` resolves every check suite and review by `pr_number`). Values are
+substituted; **key names and types are not**, and changing one here to make a test pass is changing
+the fixture to disagree with the API.
+"""
 
 
 class Sleeps:
@@ -535,6 +584,74 @@ async def test_list_sessions_accepts_a_bare_list(client: DevinClient, devin_api:
     devin_api.responds("GET", SESSIONS_URL, 200, [a_session()])
 
     assert len(await client.list_sessions()) == 1
+
+
+# --- The shape the API actually sends ---------------------------------------------------------
+
+
+async def test_the_observed_session_listing_parses(client: DevinClient, devin_api: FakeAPI) -> None:
+    """The body `GET /v3/organizations/{org_id}/sessions` returned on 2026-08-10, verbatim.
+
+    Every field the poller reads has to survive it: the status it branches on, the ACUs the budget
+    guard sums, the pull request it links, and the number `webhooks._criterion` resolves CI failures
+    and reviews by — which the API does not send and which therefore has to come out of the URL.
+    """
+    devin_api.responds("GET", SESSIONS_URL, 200, OBSERVED_SESSION_LISTING)
+
+    sessions = await client.list_sessions()
+
+    assert len(sessions) == 1
+    session = sessions[0]
+    assert session.session_id == SESSION_ID
+    assert session.status is SessionStatus.RUNNING
+    assert session.status_detail == "working"
+    assert session.acus_consumed == 3.5
+    assert session.structured_output is None
+    assert session.pull_request_url == PR_URL
+    assert [pr.number for pr in session.pull_requests] == [PR_NUMBER]
+
+
+async def test_a_pull_request_is_read_only_under_the_name_the_api_sends(
+    client: DevinClient, devin_api: FakeAPI
+) -> None:
+    """`pr_url` has no `url` alias, and this is what says so.
+
+    `_unwrap` tolerates several list envelopes because the spec names none — the tolerance stands in
+    for a fact nobody had. This field is not that: the name is known, so accepting the old one would
+    only let a future rename pass unnoticed. A body under the old name is a protocol violation and
+    fails the parse.
+    """
+    devin_api.responds(
+        "GET",
+        SESSION_URL,
+        200,
+        a_session(pull_requests=[{"url": PR_URL, "number": PR_NUMBER}]),
+    )
+
+    with pytest.raises(DevinResponseError):
+        await client.get_session(SESSION_ID)
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://github.com/taxpon/superset/pull/7", 7),
+        ("https://github.com/taxpon/superset/pull/42889", 42889),
+        ("https://github.com/taxpon/superset/pull/7/files", 7),
+        ("https://github.com/taxpon/superset/pull/7#discussion_r1", 7),
+        ("https://github.com/taxpon/superset/pull/7?w=1", 7),
+        # A GitHub Enterprise install spells the path the same way, so the host is not matched.
+        ("https://github.example.com/taxpon/superset/pull/7", 7),
+        # Nothing here is a pull request number, and none of them may be invented.
+        ("https://github.com/taxpon/superset/pulls", None),
+        ("https://github.com/taxpon/superset/issues/7", None),
+        ("https://github.com/taxpon/superset/pull/", None),
+        ("https://github.com/taxpon/superset/pull/head", None),
+        ("", None),
+    ],
+)
+def test_a_pull_request_number_is_derived_from_its_url(url: str, expected: int | None) -> None:
+    assert pull_request_number(url) == expected
 
 
 # --- The review-fix loop --------------------------------------------------------------------------

@@ -77,6 +77,11 @@ ACTIONS = f"/repos/{REPO}/actions"
 HEAD_SHA = "349a7f639dfb353669c001187706d7fd0112ed2f"
 PR_URL = f"https://github.com/{REPO}/pull/{PR_NUMBER}"
 
+# `pull_requests[]` as the live API sends it — `pr_url` and `pr_state`, and no number at all.
+# `PR_NUMBER` reaches the remediation only by being parsed back out of `PR_URL`, and every
+# `check_suite` and `pull_request_review` delivery in this file resolves by it.
+DEVIN_PULL_REQUESTS = [{"pr_url": PR_URL, "pr_state": "open"}]
+
 RUN_ID = 84410727864
 CI_JOB_ID = 231855142299
 CI_JOB_NAME = "pytest"
@@ -336,7 +341,7 @@ async def test_what_sentinel_sends_across_a_whole_remediation(
             a_session(),
             a_session(
                 acus_consumed=ACUS_AT_PULL_REQUEST,
-                pull_requests=[{"url": PR_URL, "number": PR_NUMBER}],
+                pull_requests=DEVIN_PULL_REQUESTS,
                 structured_output=REPORT,
             ),
         ]
@@ -540,9 +545,7 @@ async def test_a_check_suite_that_arrives_after_the_merge_is_absorbed(
     a job.
     """
     await a_labelled_remediation(pipeline, delivery, devin_api, github_api)
-    devin_api.route("GET", SESSION).mock(
-        return_value=a_session(pull_requests=[{"url": PR_URL, "number": PR_NUMBER}])
-    )
+    devin_api.route("GET", SESSION).mock(return_value=a_session(pull_requests=DEVIN_PULL_REQUESTS))
     await pipeline.poll()
     await pipeline.deliver(delivery("check_suite.completed.success", delivery_id=CI_PASSED))
     await pipeline.deliver(delivery("pull_request.closed.merged", delivery_id=MERGED))
