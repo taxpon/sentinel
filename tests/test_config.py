@@ -65,7 +65,6 @@ DEFAULTS: dict[str, object] = {
     "MAX_JOB_ATTEMPTS": 5,
     "JOB_LEASE_TIMEOUT_SECONDS": 900,
     "POLL_INTERVAL_SECONDS": 20,
-    "ACU_UNIT_COST_USD": 2.25,
     "LOG_LEVEL": "info",
 }
 
@@ -535,7 +534,6 @@ def test_the_database_url_survives_validation_intact(load: Load) -> None:
         ("MAX_JOB_ATTEMPTS", "1", 1),
         ("JOB_LEASE_TIMEOUT_SECONDS", "60", 60),
         ("POLL_INTERVAL_SECONDS", "5", 5),
-        ("ACU_UNIT_COST_USD", "0", 0.0),
     ],
 )
 def test_numeric_variables_are_coerced_from_their_string_form(
@@ -556,7 +554,6 @@ def test_numeric_variables_are_coerced_from_their_string_form(
         ("MAX_JOB_ATTEMPTS", "0"),  # a job that is never attempted cannot fail either
         ("POLL_INTERVAL_SECONDS", "-1"),
         ("DAILY_ACU_BUDGET", "0"),  # no budget at all is a stopped pipeline, not a configuration
-        ("ACU_UNIT_COST_USD", "-1"),
     ],
 )
 def test_nonsensical_numeric_values_are_rejected(load: Load, variable: str, value: str) -> None:

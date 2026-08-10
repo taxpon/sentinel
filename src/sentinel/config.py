@@ -328,9 +328,8 @@ class PolicySettings(ConfigurationGroup):
 
 
 class ReportingSettings(ConfigurationGroup):
-    """What the cost panel scales by, and how much anything says about itself."""
+    """How much anything says about itself."""
 
-    acu_unit_cost_usd: float = Field(default=2.25, ge=0)
     log_level: LogLevel = "info"
 
     @field_validator("log_level", mode="before")

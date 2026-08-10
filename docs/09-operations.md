@@ -45,7 +45,6 @@ canonical list.
 | `MAX_JOB_ATTEMPTS` | | `5` | Retries before the remediation fails |
 | `JOB_LEASE_TIMEOUT_SECONDS` | | `900` | Stale-lease reclaim window |
 | `POLL_INTERVAL_SECONDS` | | `20` | Devin reconciliation cadence |
-| `ACU_UNIT_COST_USD` | | `2.25` | **Set from your own contract** — it only scales the cost panel |
 | `LOG_LEVEL` | | `info` | |
 
 `api`, `worker` and `poller` read all of it: one required variable missing and the process refuses
@@ -470,7 +469,7 @@ docker compose logs api | grep '"event":"devin.session.created"' | tail -1 | jq
 #    requesting changes; the same session is resumed with cycle:1 and self-corrects
 
 # 4. Merge, then show the metrics move
-curl -s 'localhost:8000/api/analytics/summary?window=7d' | jq '.funnel, .rates, .cost'
+curl -s 'localhost:8000/api/analytics/summary?window=7d' | jq '.funnel, .rates, .impact'
 
 # 5. Show what did not work
 #    the failure-breakdown panel, and the open items in docs/blockers.md
