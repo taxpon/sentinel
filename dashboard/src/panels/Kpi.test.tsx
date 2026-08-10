@@ -44,15 +44,25 @@ describe('the panel contract', () => {
     expect(title).toBe('Key metrics')
   })
 
-  it('renders all four tiles itself, because the kpi region is a single column', () => {
+  it('renders all three tiles itself, because the kpi region is a single column', () => {
     const { container } = render(<Kpi state={ready(summaryFixture)} />)
 
     expect(container.querySelectorAll('.kpi-tiles')).toHaveLength(1)
-    expect(container.querySelectorAll('.kpi-tile')).toHaveLength(4)
+    expect(container.querySelectorAll('.kpi-tile')).toHaveLength(3)
+  })
+
+  it('reports no spend figure at all', () => {
+    // Cost per fix was the fourth tile. It went with the rest of the spend reporting: Devin reports
+    // consumption in ACUs and this account is not billed in ACUs, so the figure could only ever be
+    // zero. A tile that cannot be measured is worse than no tile.
+    const { container } = render(<Kpi state={ready(summaryFixture)} />)
+
+    expect(screen.queryByRole('group', { name: 'Cost per fix' })).not.toBeInTheDocument()
+    expect(container.textContent).not.toMatch(/\$|ACU/)
   })
 })
 
-describe('the four figures', () => {
+describe('the three figures', () => {
   it('shows success rate as merged / labelled', () => {
     const { funnel } = summaryFixture
     render(<Kpi state={ready(summaryFixture)} />)
@@ -84,38 +94,6 @@ describe('the four figures', () => {
     expect(tile('MTTR p50')).not.toHaveTextContent('33m')
   })
 
-  it('shows cost per fix in dollars, over the ACU figure it was priced from', () => {
-    render(<Kpi state={ready(summaryFixture)} />)
-
-    expect(tileLines('Cost per fix')).toEqual([
-      'Cost per fix',
-      '$27.60',
-      '12.3 ACU per fix from Devin',
-      'priced locally at $2.25 per ACU',
-    ])
-  })
-
-  it('attributes only the ACU count to Devin, never the dollars', () => {
-    // `cost.source` says where the ACU figure came from and nothing else: the dollars are always
-    // acus × ACU_UNIT_COST_USD, and docs/09-operations.md has that constant set from the reader's
-    // own contract. A provenance badge on the dollar line would be a claim Devin never made — and
-    // one the cost panel contradicts on the same screen.
-    render(<Kpi state={ready(summaryFixture)} />)
-
-    const lines = tileLines('Cost per fix')
-    expect(lines.filter((line) => line.includes('Devin'))).toEqual(['12.3 ACU per fix from Devin'])
-    expect(lines.filter((line) => line.includes('$27.60'))).toEqual(['$27.60'])
-    expect(lines).toContain('priced locally at $2.25 per ACU')
-  })
-
-  it('labels an ACU count Sentinel derived rather than one Devin reported', () => {
-    render(<Kpi state={ready(busyWindowSummaryFixture)} />)
-
-    expect(tile('Cost per fix')).toHaveTextContent('26.7 ACU per fix derived by Sentinel')
-    expect(tile('Cost per fix')).not.toHaveTextContent('from Devin')
-    // The conversion is local whichever way the ACU count was obtained.
-    expect(tile('Cost per fix')).toHaveTextContent('priced locally at $2.25 per ACU')
-  })
 })
 
 describe('formatting', () => {
@@ -132,9 +110,6 @@ describe('formatting', () => {
     expect(durations_seconds.to_merge.p50).toBe(26 * 3600)
     expect(tile('MTTR p50')).toHaveTextContent('1d 2h')
     expect(tile('MTTR p50')).toHaveTextContent('p90 2d')
-
-    expect(tile('Cost per fix')).toHaveTextContent('$60.08')
-    expect(tile('Cost per fix')).toHaveTextContent('26.7 ACU per fix')
   })
 
   it('never renders a raw ratio or a raw second count', () => {
@@ -156,10 +131,7 @@ describe('the empty window', () => {
     expect(tile('Success rate')).toHaveTextContent('nothing labelled in this window')
     expect(tile('Merge rate')).toHaveTextContent('—')
     expect(tile('Merge rate')).toHaveTextContent('no pull requests opened')
-    expect(tile('MTTR p50')).toHaveTextContent('—')
-    expect(screen.getAllByText('nothing merged yet')).toHaveLength(2)
-    // Nothing was priced, so the tile does not explain a conversion it did not make.
-    expect(tileLines('Cost per fix')).toEqual(['Cost per fix', '—', 'nothing merged yet'])
+    expect(tileLines('MTTR p50')).toEqual(['MTTR p50', '—', 'nothing merged yet'])
   })
 
   it('shows no NaN, no Infinity and no blank tile', () => {
@@ -173,7 +145,7 @@ describe('the empty window', () => {
 
   it('keeps a figure whose own denominator is non-zero', () => {
     // Three issues labelled, none of which reached a pull request: the success rate is a real 0%,
-    // while merge rate, MTTR and cost per fix have nothing to divide by.
+    // while merge rate and MTTR have nothing to divide by.
     const stalled: AnalyticsSummary = {
       ...summaryFixture,
       funnel: { labelled: 3, session_created: 3, pr_opened: 0, ci_green: 0, merged: 0 },
@@ -185,7 +157,6 @@ describe('the empty window', () => {
     expect(tile('Success rate')).toHaveTextContent('0 merged of 3 labelled')
     expect(tile('Merge rate')).toHaveTextContent('—')
     expect(tile('MTTR p50')).toHaveTextContent('—')
-    expect(tile('Cost per fix')).toHaveTextContent('—')
   })
 
   it('renders an em dash rather than a non-finite figure from the API', () => {
@@ -214,7 +185,7 @@ describe('loading and error', () => {
     render(<Kpi state={failed(summaryFixture)} />)
 
     expect(tile('Success rate')).toHaveTextContent('63%')
-    expect(tile('Cost per fix')).toHaveTextContent('$27.60')
+    expect(tile('MTTR p50')).toHaveTextContent('1h 48m')
   })
 
   it('says so when the API failed before any payload arrived', () => {
