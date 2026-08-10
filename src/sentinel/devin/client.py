@@ -3,8 +3,8 @@
 Every path is a `/v3/...` path: v1 and v2 are not reachable from here, which
 `docs/adr/2026-08-07-devin-v3-only.md` requires and a test over `ENDPOINTS` asserts. The endpoints
 are the table in `docs/05-devin-integration.md#endpoints-used`, no more and no fewer — the worker
-and the poller use the first six, `make bootstrap-devin` the next four, and the dashboard the
-last.
+and the poller use the first six, `make bootstrap-devin` the next three, `make devin-playbooks` the
+playbook listing, and the dashboard the last.
 
 What this module decides, so that no caller has to:
 
