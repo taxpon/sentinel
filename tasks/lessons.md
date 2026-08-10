@@ -156,10 +156,19 @@ A related one landed the same hour: a `make ci` here reported 15 failures and 13
 Postgres container had been removed underneath it. Same family — shared mutable state between agents
 — and the same tell, a failure count far outside anything the change could explain.
 
-**Rule:** a worktree with another agent in it is shared state. Do history rewrites and multi-step
-file surgery somewhere private — a scratch clone, or a second worktree — and move the finished ref
-across. If it has to happen in place, say so before starting and say when it is done. And on both
-sides: **a failure report about a shared tree must name a SHA**, and be verified with
-`git show <sha>:<path>` or a clean checkout, because "what is in the directory" and "what is in the
-commit" are different questions. Before believing any failure, check the count: one that no diff
-could explain is usually the ground moving, not the code.
+**Two rules, one for each side.**
+
+*If you are rewriting:* a worktree with another agent in it is shared state. Do history rewrites
+and multi-step file surgery somewhere private — a scratch clone, or a second worktree — and move
+the finished ref across. If it has to happen in place, say so before you start and again when you
+are done.
+
+*If you are reporting a failure in someone else's tree:* name the SHA you are describing, and check
+it with `git show <sha>:<path>` or a clean checkout before you send. "What is in the directory" and
+"what is in the commit" are different questions, and one command settles which you are looking at.
+Skip it and you hand somebody mid-rewrite a convincing bug report about a state that never existed
+— they will either chase a phantom test bug or "fix" correct code, and both end somewhere worse
+than where they started.
+
+Both rules were available here and neither was followed. Check the count as well, before believing
+any failure: one that no diff could explain is usually the ground moving, not the code.
