@@ -18,6 +18,18 @@ Four steps, in this order:
 4. **schedule** — the nightly vulnerability sweep, whose id is written into `.env` as
    `DEVIN_SCHEDULE_ID`.
 
+And a way to see all four before any of them happens:
+
+    uv run scripts/bootstrap_devin.py --dry-run
+
+which reports what the run would create and writes nothing — no request that changes anything, and
+no line in `.env`. Step 1 still runs, and so do the capability probes: they are `GET`s, and a
+preview that could not tell you the token is rejected would be worth much less than one that can.
+What it says about each of the other three is what would *change* — the tag `PUT` sends the whole
+vocabulary and replaces whatever is registered, and the notes and the sweep are created or skipped
+according to what `.env` records, which is the thing that silently duplicates when `.env` has been
+replaced from `.env.example`.
+
 And one thing this file does that is not part of that run:
 
     make devin-playbooks
@@ -70,11 +82,11 @@ import re
 import stat
 import sys
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import TextIO
+from typing import Any, TextIO
 
 from pydantic import Field
 
@@ -620,6 +632,92 @@ def _failed(step: str, exc: DevinError) -> BootstrapError:
     return BootstrapError(_label(step), problem, remedy)
 
 
+# --- What a run changes ---------------------------------------------------------------------------
+
+
+class Writer:
+    """The one place this script changes anything, and therefore the whole of what `--dry-run` is.
+
+    A run creates three things and records two of them: the tag vocabulary, the four knowledge
+    notes and their ids in `.env`, the nightly sweep and its id in `.env`. Every one of those
+    happens inside a coroutine handed to `_apply`, which on a dry run does not run it. So "a dry
+    run writes nothing, to Devin or to `.env`" is one branch to read rather than a property to
+    re-check at five call sites — the shape `scripts/file_remediation_issues.py` uses for the same
+    reason.
+
+    The `.env` record is inside the coroutine rather than beside it because there is nothing to
+    record until the call that produces the id has returned. A dry run gets no ids, so there is
+    nothing it could write even if the guard were removed from underneath it.
+
+    Reads are not here. Listing sessions and the capability probes go straight to the client: they
+    are what a preview is for.
+    """
+
+    def __init__(self, devin: DevinClient, env: EnvFile, *, dry_run: bool = False) -> None:
+        self._devin = devin
+        self.env = env
+        self.dry_run = dry_run
+
+    def __repr__(self) -> str:
+        return f"Writer(env={str(self.env.path)!r}, dry_run={self.dry_run!r})"
+
+    async def register_vocabulary(self) -> None:
+        """`PUT` the whole vocabulary. Idempotent by nature, and a replacement of whatever is
+        registered rather than an addition to it."""
+
+        async def register() -> None:
+            await self._devin.register_tags(VOCABULARY)
+
+        await self._apply("tags", register)
+
+    async def create_note(self, note: Note, recorded: list[str]) -> None:
+        """Create one knowledge note and append its id to the record, or neither.
+
+        `recorded` is the list `.env` holds, extended in place: the record is rewritten after
+        *each* creation, because an id that was not recorded belongs to a note nobody can find
+        again.
+        """
+
+        async def create() -> None:
+            created = await self._devin.create_knowledge_note(
+                name=note.name, body=note.body, trigger_description=note.trigger
+            )
+            recorded.append(_checked_id(_label("knowledge"), "knowledge note", created.id))
+            self.env.record(KNOWLEDGE_IDS, json.dumps(recorded, separators=(",", ":")))
+
+        await self._apply("knowledge", create)
+
+    async def create_schedule(self, prompt: str) -> str | None:
+        """Create the nightly sweep and record its id. `None` when nothing was created, which is
+        what a dry run leaves behind."""
+
+        async def create() -> str:
+            schedule = await self._devin.create_schedule(
+                name=SCHEDULE_NAME,
+                prompt=prompt,
+                frequency=SCHEDULE_FREQUENCY,
+                tags=SCHEDULE_TAGS,
+            )
+            identifier = _checked_id(_label("schedule"), "schedule", schedule.id)
+            self.env.record(SCHEDULE_ID, identifier)
+            return identifier
+
+        return await self._apply("schedule", create)
+
+    async def _apply[T](self, step: str, mutate: Callable[[], Coroutine[Any, Any, T]]) -> T | None:
+        """Make one change, or — on a dry run — none of it.
+
+        The coroutine is never created on a dry run, so nothing is sent and nothing is written.
+        `None` means exactly that: nothing happened, and there is no id for a caller to report.
+        """
+        if self.dry_run:
+            return None
+        try:
+            return await mutate()
+        except DevinError as exc:
+            raise _failed(step, exc) from None
+
+
 # --- The steps ------------------------------------------------------------------------------------
 
 
@@ -638,16 +736,23 @@ async def _verify_token(devin: DevinClient) -> str:
     return f"accepted — {len(sessions)} session(s) visible, {ours} of them Sentinel's"
 
 
-async def _register_vocabulary(devin: DevinClient) -> str:
-    """Register the tag vocabulary. Idempotent because it is a `PUT` of the whole set."""
-    try:
-        await devin.register_tags(VOCABULARY)
-    except DevinError as exc:
-        raise _failed("tags", exc) from None
-    return f"registered {len(VOCABULARY)} tags: {', '.join(VOCABULARY)}"
+async def _register_vocabulary(writer: Writer) -> str:
+    """Register the tag vocabulary. Idempotent because it is a `PUT` of the whole set.
+
+    Which is also why a dry run cannot say which of them are new. The `PUT` replaces the
+    organisation's vocabulary with what it carries, and v3 exposes no read of the current one —
+    `docs/05-devin-integration.md#endpoints-used` has this path under `PUT` and nothing else, so
+    there is nothing to compare against. The preview names the whole set and says what sending it
+    means; a tag registered outside this list, by hand in the dashboard, is what a run would drop.
+    """
+    await writer.register_vocabulary()
+    listed = ", ".join(VOCABULARY)
+    if writer.dry_run:
+        return f"would replace the whole vocabulary with these {len(VOCABULARY)}: {listed}"
+    return f"registered {len(VOCABULARY)} tags: {listed}"
 
 
-async def _seed_knowledge(devin: DevinClient, env: EnvFile) -> str:
+async def _seed_knowledge(writer: Writer) -> str:
     """Create whichever of the four notes `.env` does not already record the id of.
 
     `DEVIN_KNOWLEDGE_IDS` is positional — the *n*-th id belongs to the *n*-th entry of `NOTES` — so
@@ -658,7 +763,12 @@ async def _seed_knowledge(devin: DevinClient, env: EnvFile) -> str:
     The record is written after *each* creation rather than once at the end: an id that was not
     recorded belongs to a note nobody can find again, and the point of the record is that a failure
     part-way through costs nothing on the next run.
+
+    So what `.env` records is the whole of what decides between "create" and "skip", and it is what
+    a dry run reports: four notes recorded is a run that would create nothing, and a blank record
+    beside four notes that exist is the duplication this step refuses to make.
     """
+    env = writer.env
     recorded = env.recorded_ids(KNOWLEDGE_IDS)
     if not recorded and env.bootstrapped_before():
         # A blank `DEVIN_KNOWLEDGE_IDS` beside a recorded schedule is not a first run: the schedule
@@ -675,33 +785,40 @@ async def _seed_knowledge(devin: DevinClient, env: EnvFile) -> str:
             f"output), or — if the notes really are gone — clear {SCHEDULE_ID} as well and re-run "
             "to start from nothing",
         )
-    outstanding = NOTES[len(recorded) :]
-    if not outstanding:
-        return f"{len(recorded)} note(s) already recorded — nothing created"
-
     kept = len(recorded)
+    outstanding = NOTES[kept:]
+    if not outstanding:
+        already = f"{kept} note(s) already recorded"
+        if writer.dry_run:
+            return f"{already} in {KNOWLEDGE_IDS} — none would be created"
+        return f"{already} — nothing created"
+
     for note in outstanding:
-        try:
-            created = await devin.create_knowledge_note(
-                name=note.name, body=note.body, trigger_description=note.trigger
-            )
-        except DevinError as exc:
-            raise _failed("knowledge", exc) from None
-        recorded.append(_checked_id(_label("knowledge"), "knowledge note", created.id))
-        env.record(KNOWLEDGE_IDS, json.dumps(recorded, separators=(",", ":")))
+        await writer.create_note(note, recorded)
+    if writer.dry_run:
+        return (
+            f"would create {len(outstanding)} note(s) and record the id(s); "
+            f"{KNOWLEDGE_IDS} records {kept} of {len(NOTES)}"
+        )
     already = f", {kept} already recorded" if kept else ""
     return f"created {len(outstanding)} note(s){already}; {KNOWLEDGE_IDS} written to {env.path}"
 
 
-async def _create_schedule(devin: DevinClient, settings: TargetSettings, env: EnvFile) -> str:
+async def _create_schedule(writer: Writer, settings: TargetSettings) -> str:
     """Create the nightly sweep, unless `.env` records that it already exists.
 
     The same shape as the notes, for the same reason: `POST /schedules` creates one every time it
     is called and v3 offers nothing that lists them, so a second run would leave two sweeps filing
     the same issues every night.
+
+    It is also the step a preview is most worth running for. What it creates keeps acting on its
+    own every night, and `.env` is the only thing that stops a second one being made.
     """
+    env = writer.env
     existing = env.recorded(SCHEDULE_ID)
     if existing:
+        if writer.dry_run:
+            return f"already recorded in {SCHEDULE_ID} ({existing}) — none would be created"
         return f"already created ({existing}) — nothing created"
     prompt = SWEEP_PROMPT.format(
         repo=settings.target_repo,
@@ -710,18 +827,14 @@ async def _create_schedule(devin: DevinClient, settings: TargetSettings, env: En
         python_class=IssueClass.SECURITY_DEP.value,
         frontend_class=IssueClass.FRONTEND_DEP.value,
     )
-    try:
-        schedule = await devin.create_schedule(
-            name=SCHEDULE_NAME,
-            prompt=prompt,
-            frequency=SCHEDULE_FREQUENCY,
-            tags=SCHEDULE_TAGS,
+    created = await writer.create_schedule(prompt)
+    if created is None:
+        return (
+            f"would create {SCHEDULE_NAME} at {SCHEDULE_FREQUENCY} UTC — a recurring sweep; "
+            f"{SCHEDULE_ID} records nothing"
         )
-    except DevinError as exc:
-        raise _failed("schedule", exc) from None
-    env.record(SCHEDULE_ID, _checked_id(_label("schedule"), "schedule", schedule.id))
     return (
-        f"created {SCHEDULE_NAME} ({schedule.id}) at {SCHEDULE_FREQUENCY} UTC; "
+        f"created {SCHEDULE_NAME} ({created}) at {SCHEDULE_FREQUENCY} UTC; "
         f"{SCHEDULE_ID} written to {env.path}"
     )
 
@@ -985,6 +1098,33 @@ async def list_playbooks(devin: DevinClient, settings: DevinSettings, *, out: Te
 
 CAPABILITY_HEADING = "\nOptional capabilities — the degradation path, before the demo not during it"
 
+DRY_RUN_HEADING = " (dry run — nothing is created, and .env is not written)"
+
+LIMITS_HEADING = "\nWhat this preview cannot tell you"
+
+DRY_RUN_FOOTER = (
+    "\nNothing was written: no request that changes anything was sent, and {path} was not touched. "
+    "The token was verified and the capabilities were probed, because those are reads. Re-run "
+    "without --dry-run to create what the four steps describe."
+)
+
+
+DRY_RUN_LIMITS: tuple[str, ...] = (
+    f"which of the {len(VOCABULARY)} tags are new. The PUT replaces the organisation's vocabulary "
+    "as a whole and v3 exposes no read of the current one, so a tag somebody added in the "
+    "dashboard is dropped without this run naming it.",
+    f"whether the notes and the sweep really exist. {KNOWLEDGE_IDS} and {SCHEDULE_ID} are the only "
+    "record — nothing in v3 lists either — so what these steps would skip is what the file says, "
+    "not what the organisation holds.",
+    "whether Devin enforces the vocabulary at all (B7). That shows only when a session is created "
+    "with a tag outside it, which neither this preview nor the run does.",
+)
+"""The three things a preview is honestly not able to answer.
+
+Printed rather than left to be discovered: each is a way the real run could do something the report
+above does not show, and an operator deciding whether to type the command without `--dry-run` is
+owed the shape of what they cannot see."""
+
 
 async def bootstrap(
     devin: DevinClient,
@@ -992,11 +1132,18 @@ async def bootstrap(
     *,
     env: EnvFile,
     out: TextIO,
+    dry_run: bool = False,
 ) -> Report:
-    """The four steps and the probe, printing as it goes. Raises `BootstrapError` on a step."""
+    """The four steps and the probe, printing as it goes. Raises `BootstrapError` on a step.
+
+    `dry_run` reaches exactly one place — the `Writer` the three creating steps go through — so
+    what a preview reports is what a run would do, produced by the same code that would do it.
+    """
     report = Report()
+    writer = Writer(devin, env, dry_run=dry_run)
     print(
-        f"Devin bootstrap — organisation {settings.devin_org_id} at {settings.devin_api_base}\n",
+        f"Devin bootstrap — organisation {settings.devin_org_id} at {settings.devin_api_base}"
+        f"{DRY_RUN_HEADING if dry_run else ''}\n",
         file=out,
     )
 
@@ -1007,22 +1154,18 @@ async def bootstrap(
         print(f"  [{STEPS.index(step) + 1}/{len(STEPS)}] {step:<10} {summary}", file=out)
 
     done("token", await _verify_token(devin))
-    done("tags", await _register_vocabulary(devin))
-    done("knowledge", await _seed_knowledge(devin, env))
-    done("schedule", await _create_schedule(devin, settings, env))
+    done("tags", await _register_vocabulary(writer))
+    done("knowledge", await _seed_knowledge(writer))
+    done("schedule", await _create_schedule(writer, settings))
 
     report.capabilities.extend(await _probe(devin, settings))
-    report.capabilities.append(
-        Capable(
-            "B7",
-            "tag_vocabulary",
-            REGISTERED,
-            f"{len(VOCABULARY)} tags accepted; whether Devin enforces the vocabulary shows only at "
-            "session creation, which this script does not do",
-        )
-    )
+    report.capabilities.append(_vocabulary_row(dry_run))
     print(CAPABILITY_HEADING, file=out)
     print("\n".join(_table(report.capabilities)), file=out)
+    if dry_run:
+        print(LIMITS_HEADING, file=out)
+        print("\n".join(f"  - {limit}" for limit in DRY_RUN_LIMITS), file=out)
+        print(DRY_RUN_FOOTER.format(path=env.path), file=out)
 
     # After the table, not instead of it. The four steps are done and the rest of the answer is
     # worth having, but a capability the probe could not put a question to is a run that did not do
@@ -1033,15 +1176,42 @@ async def bootstrap(
             "the capability probe",
             "; ".join(f"{row.name}: {row.detail}" for row in faults),
             f"{faults[0].remedy} This is a fault rather than a refusal, so no fallback is claimed "
-            "and the capability is still an open question. The four setup steps above are done and "
-            "idempotent: re-running repeats none of them.",
+            "and the capability is still an open question. "
+            + (
+                "Nothing was created, here or above: this was a dry run."
+                if dry_run
+                else "The four setup steps above are done and idempotent: re-running repeats none "
+                "of them."
+            ),
         )
     return report
 
 
-async def _run(settings: DevinSettings, env: EnvFile, out: TextIO) -> Report:
+def _vocabulary_row(dry_run: bool) -> Capable:
+    """B7's row: what step 2 did about the vocabulary, which on a dry run is nothing.
+
+    Reporting `registered` after a run that sent no `PUT` would close B7's mitigation on a preview.
+    """
+    if dry_run:
+        return Capable(
+            "B7",
+            "tag_vocabulary",
+            NOT_PROBED,
+            f"{len(VOCABULARY)} tags would be registered; nothing was sent, so the vocabulary is "
+            "whatever it already was",
+        )
+    return Capable(
+        "B7",
+        "tag_vocabulary",
+        REGISTERED,
+        f"{len(VOCABULARY)} tags accepted; whether Devin enforces the vocabulary shows only at "
+        "session creation, which this script does not do",
+    )
+
+
+async def _run(settings: DevinSettings, env: EnvFile, out: TextIO, *, dry_run: bool) -> Report:
     async with DevinClient(settings) as devin:
-        return await bootstrap(devin, settings, env=env, out=out)
+        return await bootstrap(devin, settings, env=env, out=out, dry_run=dry_run)
 
 
 async def _lookup(settings: DevinSettings, out: TextIO) -> Capable:
@@ -1060,7 +1230,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=Path(".env"),
         help="the file the created ids are recorded in (default: .env)",
     )
-    parser.add_argument(
+    # Two ways of not doing the run, and neither is a modifier of the other: `--list-playbooks`
+    # already creates nothing, so `--dry-run` alongside it would describe a property it has anyway.
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what the run would create and write nothing — no request that changes "
+        "anything, and no line in .env. Step 1 and the capability probes still run: they are reads",
+    )
+    mode.add_argument(
         "--list-playbooks",
         action="store_true",
         help="instead of the run above: list the organisation's playbooks and print the "
@@ -1082,7 +1261,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.list_playbooks:
             asyncio.run(_lookup(settings, sys.stdout))
         else:
-            asyncio.run(_run(settings, EnvFile(arguments.env, os.environ), sys.stdout))
+            asyncio.run(
+                _run(
+                    settings,
+                    EnvFile(arguments.env, os.environ),
+                    sys.stdout,
+                    dry_run=arguments.dry_run,
+                )
+            )
     except BootstrapError as exc:
         print(exc.report(), file=sys.stderr)
         return 1

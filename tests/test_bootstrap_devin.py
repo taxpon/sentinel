@@ -171,6 +171,12 @@ async def run(devin: DevinClient, settings: Settings, env: Any) -> Any:
     return await bootstrap_devin.bootstrap(devin, settings, env=env, out=Out())
 
 
+async def preview(devin: DevinClient, settings: Settings, env: Any, out: Any = None) -> Any:
+    return await bootstrap_devin.bootstrap(
+        devin, settings, env=env, out=Out() if out is None else out, dry_run=True
+    )
+
+
 class Out:
     """Somewhere for the report to go, which the tests that care about it can read back."""
 
@@ -408,6 +414,216 @@ async def test_running_twice_leaves_four_notes_and_one_schedule(
     assert len(wired.sent("POST", NOTES)) == 4
     assert len(wired.sent("POST", SCHEDULES)) == 1
     assert read_bytes(env_path) == after_first
+
+
+# --- The preview ---------------------------------------------------------------------------------
+#
+# `--dry-run`. The step it exists for is the fourth: the sweep is recurring, so a run made by
+# mistake leaves something that keeps acting on its own every night. Steps 3 and 4 are idempotent
+# only through what `.env` records, so a run against a `.env` replaced from `.env.example` also
+# duplicates the notes — and that is exactly what a preview has to be able to say out loud.
+
+
+@pytest.fixture
+def reads_only(devin_api: FakeAPI) -> FakeAPI:
+    """Devin answering the two reads a dry run is allowed to make, and nothing else.
+
+    No `PUT` and no `POST` is registered, and an unregistered route raises rather than answering.
+    So "a dry run writes nothing" is asserted by the fake itself: a guard that let one through
+    would fail here rather than be caught by a request-count assertion that someone could weaken.
+    """
+    devin_api.responds("GET", SESSIONS, 200, {"sessions": []})
+    devin_api.responds("GET", CONSUMPTION, 200, {"days": []})
+    return devin_api
+
+
+async def test_a_dry_run_writes_nothing_at_all(
+    devin: DevinClient, settings: Settings, env: Any, env_path: Path, reads_only: FakeAPI
+) -> None:
+    """The whole promise, in one test: the only requests are the reads, and `.env` comes back byte
+    for byte the file it was."""
+    before = read_bytes(env_path)
+
+    await preview(devin, settings, env)
+
+    assert [(request.method, request.path) for request in reads_only.requests] == [
+        ("GET", SESSIONS),
+        ("GET", CONSUMPTION),
+    ]
+    assert read_bytes(env_path) == before
+
+
+async def test_a_dry_run_still_verifies_the_token(
+    devin: DevinClient, settings: Settings, env: Any, devin_api: FakeAPI
+) -> None:
+    """Step 1 is a `GET`, and a preview that cannot tell an operator their token is rejected is
+    worth much less than one that can: it would report four steps that could not happen."""
+    devin_api.responds("GET", SESSIONS, 401, {"detail": "invalid token"})
+
+    with pytest.raises(bootstrap_devin.BootstrapError) as failure:
+        await preview(devin, settings, env)
+
+    assert failure.value.step == "step 1 of 4 (token)"
+    assert "DEVIN_API_TOKEN" in failure.value.remedy
+
+
+async def test_a_dry_run_still_probes_the_capabilities(
+    devin: DevinClient, settings: Settings, env: Any, reads_only: FakeAPI
+) -> None:
+    """The probes are reads too, and most of what a preview is for. Only B7's row changes: nothing
+    was registered, so reporting the vocabulary as `registered` would close B7's mitigation on a run
+    that sent no `PUT`."""
+    report = await preview(devin, settings, env)
+
+    assert report.capability(Capability.ACU_SPEND.value).status == bootstrap_devin.REACHABLE
+    assert report.capability(Capability.SESSION_METRICS.value).status == bootstrap_devin.NOT_PROBED
+
+    vocabulary = report.capability("tag_vocabulary")
+    assert vocabulary.status == bootstrap_devin.NOT_PROBED
+    assert "nothing was sent" in vocabulary.detail
+
+
+async def test_a_dry_run_names_the_whole_set_the_tag_put_would_replace(
+    devin: DevinClient, settings: Settings, env: Any, reads_only: FakeAPI
+) -> None:
+    """The `PUT` sends the vocabulary as a whole and replaces whatever is registered, so every tag
+    is named and the replacement is stated. Which of them are *new* cannot be: v3 exposes no read
+    of the current vocabulary, and the preview says so under its own limits rather than printing a
+    list that looks like a diff and is not."""
+    out = Out()
+
+    report = await preview(devin, settings, env, out)
+
+    tags = report.steps["tags"]
+    for tag in bootstrap_devin.VOCABULARY:
+        assert tag in tags
+    assert "would replace the whole vocabulary" in tags
+    assert f"which of the {len(bootstrap_devin.VOCABULARY)} tags are new" in out.text
+    assert "no read of the current one" in out.text
+
+
+async def test_a_dry_run_says_it_would_create_what_env_records_nothing_of(
+    devin: DevinClient, settings: Settings, env: Any, reads_only: FakeAPI
+) -> None:
+    """The first run, previewed: nothing is recorded, so all four notes and the sweep are new."""
+    report = await preview(devin, settings, env)
+
+    assert "would create 4 note(s)" in report.steps["knowledge"]
+    assert (
+        f"{bootstrap_devin.KNOWLEDGE_IDS} records 0 of {len(bootstrap_devin.NOTES)}"
+        in (report.steps["knowledge"])
+    )
+    assert f"would create {bootstrap_devin.SCHEDULE_NAME}" in report.steps["schedule"]
+    assert "a recurring sweep" in report.steps["schedule"]
+    assert f"{bootstrap_devin.SCHEDULE_ID} records nothing" in report.steps["schedule"]
+
+
+async def test_a_dry_run_resumes_at_the_note_after_the_last_recorded_one_too(
+    devin: DevinClient, settings: Settings, env: Any, env_path: Path, reads_only: FakeAPI
+) -> None:
+    """A run that stopped part-way through is previewed as what it would finish, not as four
+    notes."""
+    write(
+        env_path,
+        ENV_TEXT.replace("DEVIN_KNOWLEDGE_IDS=", 'DEVIN_KNOWLEDGE_IDS=["kept-1","kept-2"]'),
+    )
+
+    report = await preview(devin, settings, env)
+
+    assert "would create 2 note(s)" in report.steps["knowledge"]
+    assert (
+        f"{bootstrap_devin.KNOWLEDGE_IDS} records 2 of {len(bootstrap_devin.NOTES)}"
+        in (report.steps["knowledge"])
+    )
+
+
+async def test_a_dry_run_names_what_env_already_records_as_what_would_be_skipped(
+    devin: DevinClient, settings: Settings, env_path: Path, reads_only: FakeAPI
+) -> None:
+    """The other half of what decides between "create" and "skip". A recorded id is why nothing
+    would be created — and it is the line that, blanked, silently makes a second set of notes and a
+    second nightly sweep."""
+    write(
+        env_path,
+        ENV_TEXT.replace(
+            "DEVIN_KNOWLEDGE_IDS=", f"DEVIN_KNOWLEDGE_IDS={json.dumps(list(NOTE_IDS))}"
+        )
+        + f"DEVIN_SCHEDULE_ID={SCHEDULE}\n",
+    )
+    before = read_bytes(env_path)
+
+    report = await preview(devin, settings, bootstrap_devin.EnvFile(env_path, {}))
+
+    assert (
+        f"4 note(s) already recorded in {bootstrap_devin.KNOWLEDGE_IDS}"
+        in (report.steps["knowledge"])
+    )
+    assert "none would be created" in report.steps["knowledge"]
+    assert (
+        f"already recorded in {bootstrap_devin.SCHEDULE_ID} ({SCHEDULE})"
+        in (report.steps["schedule"])
+    )
+    assert "none would be created" in report.steps["schedule"]
+    assert read_bytes(env_path) == before
+
+
+async def test_the_preview_says_what_was_and_was_not_done(
+    devin: DevinClient, settings: Settings, env: Any, env_path: Path, reads_only: FakeAPI
+) -> None:
+    """What an operator reads at the end of it: nothing was written, the reads were made anyway,
+    and what to type to do it for real."""
+    out = Out()
+
+    await preview(devin, settings, env, out)
+
+    assert bootstrap_devin.DRY_RUN_HEADING.strip() in out.text
+    assert f"{env_path} was not touched" in out.text
+    assert "Re-run without --dry-run" in out.text
+    assert "[4/4] schedule" in out.text
+    assert bootstrap_devin.CAPABILITY_HEADING.strip() in out.text
+    # The limits are printed, not left to be discovered: each is a way the real run could do
+    # something the report above does not show.
+    assert bootstrap_devin.LIMITS_HEADING.strip() in out.text
+    assert all(limit in out.text for limit in bootstrap_devin.DRY_RUN_LIMITS)
+
+
+def test_a_dry_run_writes_nothing_and_the_run_after_it_writes(
+    settings: Settings,
+    env_path: Path,
+    wired: FakeAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    no_recorded_ids: None,
+) -> None:
+    """The guard must stop the writes and nothing else. `wired` answers every write, so a run that
+    still sent them would pass unnoticed — and the second half is the assertion that the ordinary
+    path was not disabled along with them."""
+    monkeypatch.setattr(bootstrap_devin, "load_config", lambda _model: settings)
+    before = read_bytes(env_path)
+
+    assert bootstrap_devin.main(["--dry-run", "--env", str(env_path)]) == 0
+
+    assert wired.sent("PUT") == [] and wired.sent("POST") == []
+    assert read_bytes(env_path) == before
+    assert DEVIN_TOKEN not in capsys.readouterr().out
+
+    assert bootstrap_devin.main(["--env", str(env_path)]) == 0
+
+    assert len(wired.sent("POST", NOTES)) == 4
+    assert len(wired.sent("POST", SCHEDULES)) == 1
+    assert env_value(env_path, bootstrap_devin.SCHEDULE_ID) == SCHEDULE
+
+
+def test_a_dry_run_and_the_playbook_listing_are_alternatives(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`--list-playbooks` creates nothing already, so `--dry-run` beside it would describe a
+    property it has anyway — and read as "preview the listing", which is not a thing."""
+    with pytest.raises(SystemExit) as exit_code:
+        bootstrap_devin.main(["--dry-run", "--list-playbooks"])
+
+    assert exit_code.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
 
 
 # --- Step 1: the token ---------------------------------------------------------------------------
