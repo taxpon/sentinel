@@ -29,7 +29,7 @@ A working register, updated throughout implementation.
 | [B3](#b3) | GitHub fork | Default branch is `master`, not `main` | PR base correctness | Mitigated |
 | [B4](#b4) | Devin API | No outbound webhook for session status | Push-based state updates | Accepted |
 | [B5](#b5) | Devin API | Session metrics endpoint is enterprise-scoped | Cost/merge-rate panel fidelity | Open |
-| [B6](#b6) | Devin API | Playbook CRUD is enterprise-scoped | Programmatic playbook creation | Open |
+| [B6](#b6) | Devin API | Playbooks are also organisation-scoped; reading them works | Programmatic playbook creation | Partly resolved — the premise was wrong |
 | [B7](#b7) | Devin API | Org tag vocabulary may need pre-registration | Session creation | Open |
 | [B8](#b8) | Credentials | Devin `org_id` and service-user token not yet obtained | **All live execution** | **Open — highest priority** |
 | [B9](#b9) | Operations | Webhook needs a public URL; free tunnels rotate | Live demo reliability | Open — a Fly deployment retires it, and is not yet done |
@@ -133,17 +133,35 @@ which figures came from Devin.
 **To resolve.** Check the service user's permissions once [B8](#b8) is done; `make bootstrap-devin`
 probes and reports reachability.
 
-### B6 — Playbook CRUD is enterprise-scoped {#b6}
+### B6 — Playbooks are organisation-scoped too, and the premise here was wrong {#b6}
 
-**Evidence.** Playbook create/update/delete live under `/v3/enterprise/playbooks/*`.
+**Original claim.** That playbook create/update/delete live only under `/v3/enterprise/playbooks/*`,
+so a token without enterprise scope could not create the four programmatically.
 
-**Impact.** If our token lacks enterprise scope, the four playbooks cannot be created
-programmatically.
+**That was wrong.** v3 exposes playbooks under **two** scopes. The organisation one carries the full
+set — `GET`, `POST`, `PUT`, `DELETE` under `/v3/organizations/{org_id}/playbooks` — and asks for
+`ManageAccountPlaybooks` rather than enterprise scope. Enumerated at
+[`llms.txt`](https://docs.devin.ai/llms.txt) and specified on each endpoint's own reference page.
 
-**Mitigation.** Create them in the Devin UI and supply ids through `DEVIN_PLAYBOOK_IDS`. Playbooks
-are configuration, so this costs reproducibility, not capability.
+**Verified, 2026-08-10.** `make devin-playbooks` reads the organisation's playbooks against the real
+API and returns them. The token has `ManageAccountPlaybooks`.
 
-**To resolve.** Same probe as [B5](#b5).
+| | |
+|---|---|
+| `GET /v3/organizations/{org_id}/playbooks` | **Works.** Confirmed against the live API |
+| `POST` to the same path | **Not tried.** Same permission on paper, so it probably works |
+
+**Why `POST` is untried.** Probing a create means creating a playbook. `bootstrap_devin.py` declines
+to do that deliberately — see `_probe_playbook_creation` — and the four already exist, so there was
+nothing to gain by finding out at the cost of leaving a stray playbook in the organisation.
+
+**What this changes.** The reproducibility this entry said was lost is probably available: the four
+texts in [`playbooks/`](./playbooks/) could be pushed by a script rather than pasted by hand. Nobody
+should act on that until a `POST` has actually been made to work — the claim above is exactly the
+kind this entry got wrong the first time.
+
+**Still true.** The four playbooks in use were created by hand in the UI, and their ids reach the
+system through `DEVIN_PLAYBOOK_IDS`.
 
 ### B7 — Org tag vocabulary may require pre-registration {#b7}
 
