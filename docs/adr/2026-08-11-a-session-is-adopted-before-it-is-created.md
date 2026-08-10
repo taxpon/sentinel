@@ -5,7 +5,7 @@ date: 2026-08-11
 type: architecture
 areas: [devin, pipeline]
 tasks: [T11, T23]
-files: [src/sentinel/devin/client.py, src/sentinel/devin/playbooks.py, src/sentinel/devin/schemas.py]
+files: [src/sentinel/devin/client.py, src/sentinel/devin/playbooks.py, src/sentinel/devin/schemas.py, src/sentinel/pipeline/handlers.py]
 specs: [docs/05-devin-integration.md, docs/06-event-pipeline.md]
 supersedes:
 ---
@@ -31,12 +31,13 @@ request never arrived" from "the request was served and the response was lost". 
 a `5xx`, which can be emitted after the session row is written.
 
 **The v3 create endpoint offers no idempotency key.** Its reference page
-(`api-reference/v3/sessions/post-organizations-sessions`) was read in full for this: nineteen body
-fields, none of them a client-supplied token; no `Idempotency-Key` or equivalent header; one query
-parameter, `devin_id`, which is the parent session of a session Devin spawns. So a resend cannot be
-marked as a resend, and the server cannot collapse it. This confirms rather than discovers what
-`docs/05` already said — but `docs/05` had also never listed the archive endpoint, which the same
-day's work found does exist, so the page was read rather than the document trusted.
+(`api-reference/v3/sessions/post-organizations-sessions`) was read in full for this: no field of
+`SessionCreateRequest` is a client-supplied token, there is no `Idempotency-Key` or equivalent
+header, and the one query parameter — `devin_id` — is the parent session of a session Devin spawns.
+So a resend cannot be marked as a resend, and the server cannot collapse it. This confirms rather
+than discovers what `docs/05` already said — but `docs/05` had also never listed the archive
+endpoint, which the same day's work found does exist, so the page was read rather than the document
+trusted.
 
 **Narrowing the retry would have moved the duplicate, not removed it.** There are two retry layers.
 The client retries within one job; when the job fails, `pipeline/worker.py` fails it back to the
@@ -49,6 +50,12 @@ for one issue and says nothing about sessions. `policy.admit_session` refuses a 
 already carries a `devin_session_id`, and its own record is explicit that this narrows the window
 rather than closing it — it can only see an id some earlier attempt committed, and an attempt whose
 response was lost commits none.
+
+Worth recording: [the fenced-lease record](./2026-08-08-one-claim-statement-and-a-fenced-lease.md)
+named "two Devin sessions carrying the same `run:<delivery_id>` tag" as the signal that its window
+was being hit in practice. That is exactly what happened — all three sessions of each issue came
+from one delivery and carried one `run:` tag. The tripwire fired, and it fired for a cause that
+record had not considered: not a lease expiring mid-handler, but a response that never arrived.
 
 What was available: `GET /v3/organizations/{org_id}/sessions` takes a `tags` array, a `first` page
 size up to 200 and an `after` cursor, and Sentinel already tags every session it creates.
@@ -85,8 +92,16 @@ might not be filtering would create the duplicate this exists to prevent. The wa
 `has_next_page: false` or, after ten pages of 200, at `SessionLookupIncomplete`.
 
 **A lookup that cannot answer creates nothing.** A refused listing, a timeout that outlasts the read
-retries, and an unending listing all raise, and the job fails back to the queue. "I could not find
-out" is not "there is none".
+retries, and an unending listing all raise before the `POST`. "I could not find out" is not "there
+is none". They do not end alike, and the difference matters to whoever is on call: a timeout is
+retryable, so the queue backs off and tries again; a `403` and an exhausted page budget are not, so
+the job is retired on the first occurrence and the remediation escalates. Both of those describe the
+listing rather than the moment, and a second walk would reach the same place.
+
+Where the budget runs out having *already* found matches, one is adopted rather than the lookup
+failing. Every match passed the tag check on this side, which is the same evidence an ordinary
+answer rests on — and failing the remediation while a session of its own runs unrecorded would be an
+orphan created by the path that exists to prevent orphans.
 
 Where several sessions match, one is chosen by `(is_archived, created_at, session_id)` — a live
 session before an archived one, then the earliest, then the lowest id — so repeated attempts
@@ -111,9 +126,35 @@ repeat the fault.
 
 ## Consequences
 
-A remediation ends with exactly one session however many times the attempt repeats: within a call,
-across a job retry, across a reclaimed lease, and across a worker that died between the `POST` and
+A remediation ends with exactly one session however many times the attempt is repeated **in
+sequence**: within a call, across a job retry, and across a worker that died between the `POST` and
 the commit. That last one the module docstring in `handlers.py` previously called unavoidable.
+
+**Two things this does not close, and neither should be read as closed.** The lookup and the create
+are two calls with nothing atomic between them, so it is check-then-act, and check-then-act narrows
+a concurrent race rather than ending it:
+
+- *A genuinely concurrent reclaim.* The hazard
+  [the fenced-lease record](./2026-08-08-one-claim-statement-and-a-fenced-lease.md) describes is a
+  worker that is slow rather than dead, still running while a reclaimer starts. If both look before
+  either posts, both find nothing and both create. The window is now the length of one `POST`
+  instead of the length of a whole handler, which is a large reduction and not a closure. Nothing
+  available at the client can close it: that is what an idempotency key would have been for.
+- *A listing that lags its own writes.* `find_session` assumes the session index is read-your-writes.
+  If Devin's listing trails the create, a job retried seconds after a timed-out `POST` sees an empty
+  page and creates the duplicate — indistinguishable here from a genuine absence. The queue's
+  backoff, ten seconds and upward, makes this narrow rather than impossible.
+
+So: the API cannot give us the guarantee, and this does not manufacture one. What it gives is that
+every *sequential* repeat — which is every repeat the 2026-08-11 incident consisted of — ends with
+one session.
+
+An adopted session stamps `remediation.session_created_at` at adoption rather than at Devin's own
+`created_at`, which is now parsed and available. A remediation that lost a response therefore
+reports a session start later than Devin holds, and time-to-session in
+[07](../07-observability.md) absorbs the gap. Left as it is because the column is written by the
+same transition for both paths and changing its source is a metric change, not a defect fix; the
+field is there when someone wants it.
 
 Creating a session now costs a `GET` first, and **`ViewOrgSessions` becomes a prerequisite for
 creating a session**, not only for polling one. A service user with `ManageOrgSessions` alone now
@@ -132,8 +173,17 @@ already known to belong to the same remediation.
 
 **What would tell us this was wrong:** `SessionLookupIncomplete` appearing in a real run, which
 would mean the `tags` filter is not filtering and the right answer is to find out what it does
-rather than to raise the page budget. `devin.session.adopted` firing with `is_archived: true`
-outside an incident cleanup, which would mean sessions are being archived under a live remediation
-and the poller's handling of that is the thing to fix. And a `403` on the listing from a deployment
-that can create — which would mean the two permissions come apart in practice and the trade made
-here needs revisiting rather than documenting.
+rather than to raise the page budget. `devin.session.absent` reporting `seen: 0` against an
+organisation known to hold sessions, which is what a `tags` parameter the server misparses looks
+like — and the case the client-side re-check cannot defend against, because an empty page has
+nothing to re-check. `devin.session.adopted` firing with `is_archived: true` outside an incident
+cleanup, which would mean sessions are being archived under a live remediation and the poller's
+handling of that is the thing to fix. A `403` on the listing from a deployment that can create,
+which would mean the two permissions come apart in practice and the trade made here needs revisiting
+rather than documenting.
+
+And, for the two windows named above: **two sessions for one issue carrying two different `run:`
+tags**. That is the concurrent-reclaim or listing-lag case, distinguishable from the 2026-08-11
+signature — which was three sessions sharing one `run:` tag — by exactly that. If it appears, the
+answer is not a wider lookup; it is that check-then-act has run out and Devin has to be asked for an
+idempotency key.

@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated, Any, Final, Literal
@@ -207,6 +207,18 @@ def _zero_if_null(value: Any) -> Any:
     return 0.0 if value is None else value
 
 
+def _default_if_null[T](default: T) -> Callable[[Any], Any]:
+    """Treat an explicit `null` as the field's default, for a field nothing branches on.
+
+    `is_archived` is read only to order adoption candidates and was previously ignored entirely.
+    Modelling it would otherwise make a `null` a `DevinResponseError` on the poller's critical
+    path — failing a remediation over a field that decides nothing about it. The reference marks it
+    non-nullable with a default of `false`; this is the same bargain `_zero_if_null` makes, for the
+    same reason.
+    """
+    return lambda value: default if value is None else value
+
+
 class Session(BaseModel):
     """A Devin session as v3 returns it, on creation and on every poll.
 
@@ -217,10 +229,13 @@ class Session(BaseModel):
 
     `created_at` and `is_archived` are read by `DevinClient.find_session` alone, to order the
     candidates for adoption. The reference marks `created_at` required and `is_archived` defaulted
-    to `false`, and both defaults below are what an *incomplete* body would sort as: earliest, and
-    not archived. That is deliberate — a body missing them must not push a real session out of the
-    way, and the ordering is only ever a tiebreak between sessions that are already known to belong
-    to the same remediation.
+    to `false`, so an absent value in either is an incomplete body rather than a fact.
+
+    `created_at` is therefore `None` when absent and **not** `0`. The order is a `min`, so a zero
+    would sort a body that says nothing about its age ahead of every session that does — the
+    opposite of what an absent value should buy. `_adoption_order` sorts an unknown age last.
+    `is_archived` needs no such treatment: `false` is the reference's own default, so absence
+    genuinely means not archived.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -231,8 +246,8 @@ class Session(BaseModel):
     status_detail: str | None = None
     title: str | None = None
     tags: tuple[str, ...] = ()
-    created_at: int = 0
-    is_archived: bool = False
+    created_at: int | None = None
+    is_archived: Annotated[bool, BeforeValidator(_default_if_null(False))] = False
     acus_consumed: Annotated[float, BeforeValidator(_zero_if_null)] = 0.0
     pull_requests: tuple[PullRequest, ...] = ()
     structured_output: StructuredOutput | None = None

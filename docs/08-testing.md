@@ -22,6 +22,7 @@ for in-process API calls, and a real Postgres from Compose (the queue relies on
 | Signature verification | valid signature; wrong secret; tampered body; missing header; malformed prefix; oversized body | Known HMAC vectors against `verify_signature` directly |
 | Delivery deduplication | same `delivery_id` twice → one row, one job, `200` on the second | ASGI client, assert on DB |
 | Domain idempotency | label added twice, and label + comment on the same issue → exactly one `remediation` and one session | Concurrent requests, assert unique-constraint behaviour |
+| Session idempotency | a `create_session` whose `POST` times out having been served → exactly one session, whether the attempt repeats inside the client or as a retried job | `respx`, asserting the count of captured `POST /v3/…/sessions` bodies across both attempts |
 | Event mapping | each subscribed event → expected intent; unknown event → `ignored`, never a 5xx | Recorded GitHub payload fixtures |
 | State machine | every legal transition; illegal transitions raise; terminal states absorb late webhooks; `cycle` monotonic | Table-driven over the transition matrix in [04](./04-state-machine.md) |
 | Devin client | v3 request shape — path, headers, tags, `structured_output_schema`, `max_acu_limit`, `resumable`; response parsing; `429` backoff; `4xx` fails without retry | `respx`, asserting on the captured request body |

@@ -302,21 +302,35 @@ three sessions and three issues ended up with three each. Nothing in `SessionCre
 idempotency key, so a resend cannot be told from a first send by anything on the wire.
 
 Retrying here is therefore not merely unhelpful, it is the bug. Recovery is `create_session`'s
-adopt-or-create instead, which is also what covers the *job* being retried an hour later — a
+adopt-or-create instead, which is also what covers the *job* being retried minutes later — a
 narrower policy on its own would only move the duplicate one layer out.
 """
 
 LOOKUP_PAGE_SIZE: Final = 200
-"""`SessionsQueryParams.first`, at its documented maximum. The lookup wants as few round trips as
-the endpoint will give it."""
+"""`SessionsQueryParams.first`, at the maximum the reference gives it — default 100, minimum 1,
+maximum 200, recorded in the endpoint table of `docs/05-devin-integration.md`. The lookup wants as
+few round trips as the endpoint will give it."""
 
-LOOKUP_PAGE_LIMIT: Final = 10
+LOOKUP_PAGE_LIMIT: Final = 4
 """How many pages `find_session` walks before it gives up and raises `SessionLookupIncomplete`.
 
 With the `tags` filter working, an organisation has at most a handful of sessions per remediation
-and the first page ends the walk. This bound only bites when the filter is being ignored, and it is
-here so that a lookup over an organisation with a hundred thousand sessions fails in twenty seconds
-rather than holding a job lease until it expires.
+and the first page ends the walk. This bound only bites when the filter is being ignored.
+
+**It is derived from the job lease, not chosen.** The walk runs inside a claimed job, and a lookup
+that outlasts `JOB_LEASE_TIMEOUT_SECONDS` lets a second worker claim the same job — and if both
+workers look before either posts, both create. That is the reclaim hazard this design closes
+everywhere else, reintroduced by the lookup meant to close it.
+
+A page is a read and keeps every retry a read has (`DEFAULT_RETRY`), so one page can succeed on its
+third attempt and cost `attempts * TIMEOUT + max_total_delay` = 150 s. Four of those plus one create
+is 630 s, against a lease of 900 s. `test_the_lookup_cannot_outlast_the_lease_that_protects_the_job`
+computes that from the constants rather than restating it, so raising either number without raising
+the lease fails the suite.
+
+Four pages is 800 sessions examined, which is not the constraint it looks like: when the filter
+works one page ends the walk, and when it does not the answer is to find out why rather than to
+scan further.
 """
 
 Sleep = Callable[[float], Awaitable[None]]
@@ -456,12 +470,6 @@ class DevinClient:
 
         adopted = await self.find_session(repo=repo, issue_number=issue_number)
         if adopted is not None:
-            log.info(
-                "devin.session.adopted",
-                session_id=adopted.session_id,
-                issue=issue_number,
-                is_archived=adopted.is_archived,
-            )
             return adopted
 
         started = time.perf_counter()
@@ -493,31 +501,80 @@ class DevinClient:
 
         The cursor is followed for the same reason. Answering "there is no session" from the first
         page of a listing that is not filtering would create a duplicate, which is the one outcome
-        this method exists to prevent — so the walk ends at `has_next_page: false` or at
-        `SessionLookupIncomplete`, never at a page boundary.
+        this method exists to prevent — so **only** `has_next_page: false` ends the walk with a
+        negative answer. A page that claims another page and gives no cursor to reach it is a
+        disagreement, not a terminator: it raises, because answering `None` there would be reading
+        the prefix as the whole.
 
         Where several match — the nine sessions of 2026-08-11 were three sets of three — one is
         chosen deterministically, so repeated attempts converge on the same session rather than
         each adopting a different one: a session still live in preference to an archived one, then
-        the earliest created, then the lowest id. The earliest is the one whose response was lost;
-        the later ones are what the retries made.
+        the earliest created, then the lowest id. The earliest is the one whose response was lost,
+        and the one with the most work already done; the later ones are what the retries made.
+
+        The adopted session is returned **as it is**, not reconciled against the request that was
+        built for it. An issue relabelled between the lost `POST` and this call is running under the
+        playbook and `class:` tag of the original — narrow, and preferable to a second session, but
+        it is the one way a remediation can be attached to a session it would not have created
+        today.
         """
         identity = session_identity(repo=repo, issue_number=issue_number)
         wanted = frozenset(identity)
         matches: list[Session] = []
+        seen = 0
         cursor: str | None = None
-        for _ in range(LOOKUP_PAGE_LIMIT):
+        for page_number in range(1, LOOKUP_PAGE_LIMIT + 1):
             page = await self._session_page(tags=identity, first=LOOKUP_PAGE_SIZE, after=cursor)
+            seen += len(page.sessions)
             matches.extend(
                 session for session in page.sessions if wanted <= frozenset(session.tags)
             )
-            if not page.has_next_page or page.end_cursor is None:
-                return min(matches, key=_adoption_order) if matches else None
+            if not page.has_next_page:
+                return self._adopt(matches, issue_number, pages=page_number, seen=seen)
+            if page.end_cursor is None:
+                raise SessionLookupIncomplete(
+                    f"GET {SESSIONS} reported another page and no end_cursor to reach it, on page "
+                    f"{page_number} for issue {issue_number}; nothing was created by this call"
+                )
             cursor = page.end_cursor
+        # The budget is spent, so nothing here can say there is no session — but what the walk did
+        # find is not in doubt. Every match passed the tag check on this side, which is the same
+        # evidence an ordinary answer rests on, so adopting one is safe and is strictly better than
+        # failing a remediation while a session of its own runs unrecorded.
+        if matches:
+            return self._adopt(matches, issue_number, pages=LOOKUP_PAGE_LIMIT, seen=seen)
         raise SessionLookupIncomplete(
             f"GET {SESSIONS} still reported more pages after {LOOKUP_PAGE_LIMIT} of "
-            f"{LOOKUP_PAGE_SIZE}; no session was created for issue {issue_number}"
+            f"{LOOKUP_PAGE_SIZE} for issue {issue_number}; {seen} sessions were seen and none of "
+            f"them was this remediation's, which is not the same as there being none. Nothing was "
+            f"created by this call"
         )
+
+    def _adopt(
+        self, matches: list[Session], issue_number: int, *, pages: int, seen: int
+    ) -> Session | None:
+        """The chosen session, or `None` — and a log line either way.
+
+        The negative answer is logged as deliberately as the positive one. It is the branch that
+        goes on to create a session, so when a duplicate next appears it is the branch an operator
+        has to be able to see: what was filtered on, how far the walk got, and how much it looked
+        at. A `seen` of zero against an organisation known to have sessions is what a `tags`
+        parameter the server misparses looks like, and nothing else would say so.
+        """
+        if not matches:
+            log.info("devin.session.absent", issue=issue_number, pages=pages, seen=seen)
+            return None
+        chosen = min(matches, key=_adoption_order)
+        log.info(
+            "devin.session.adopted",
+            session_id=chosen.session_id,
+            issue=issue_number,
+            is_archived=chosen.is_archived,
+            matched=len(matches),
+            pages=pages,
+            seen=seen,
+        )
+        return chosen
 
     async def get_session(self, session_id: str) -> Session:
         """One session, as the poller reconciles it: status, `status_detail`, ACUs, pull requests
@@ -780,7 +837,10 @@ class DevinClient:
 
         `retry` overrides the client's policy for this one call. It exists for `SEND_ONCE`: whether
         a request may be repeated is a property of what the request *does*, not of the deployment,
-        and the create is the one route here where repeating it creates something.
+        and the create is the one route on a *remediation's* path where repeating it creates
+        something. `create_knowledge_note` is the other repeat-unsafe `POST` here; it runs only
+        from `make bootstrap-devin`, whose idempotence is `.env`'s job
+        (`docs/adr/2026-08-08-env-is-the-bootstrap-scripts-record.md`), and it is left alone.
         """
         policy = self._retry if retry is None else retry
         url = endpoint.format(**(path or {}))
@@ -884,13 +944,18 @@ class DevinClient:
             ) from None
 
 
-def _adoption_order(session: Session) -> tuple[bool, int, str]:
+def _adoption_order(session: Session) -> tuple[bool, bool, int, str]:
     """Which of several sessions for one remediation is adopted — `min` of this key wins.
 
     A live session before an archived one, because archiving is how a human stops a session and the
     one they left running is the one they meant to keep. Then the earliest, which is the session the
-    lost response belonged to. Then the id, so the order is total and two workers racing the same
-    lookup cannot disagree.
+    lost response belonged to and the one with the most work already done. Then the id, so the order
+    is total and two workers racing the same lookup cannot disagree.
+
+    A session whose body carried no `created_at` sorts **after** every session that did: not knowing
+    when a session started is not evidence that it started first, and the reference marks the field
+    required, so its absence says something is wrong with that body rather than something early
+    about that session.
 
     Note what is *not* here: no branch that creates a session when every match is archived. A human
     archiving all of them is exactly the 2026-08-11 incident being cleaned up by hand, and answering
@@ -898,7 +963,12 @@ def _adoption_order(session: Session) -> tuple[bool, int, str]:
     an archived session, the poller reports it as stopped, and it escalates — visibly, and without
     spending anything.
     """
-    return (session.is_archived, session.created_at, session.session_id)
+    return (
+        session.is_archived,
+        session.created_at is None,
+        session.created_at or 0,
+        session.session_id,
+    )
 
 
 def _decode(method: str, endpoint: str, response: httpx.Response) -> Any:

@@ -576,6 +576,41 @@ async def test_a_create_job_retried_after_a_timeout_adopts_rather_than_creating_
     assert remediation.devin_session_url == SESSION_URL
     [job] = await job_rows(session_factory)
     assert job.status == JobStatus.DONE
+    # One transition, not one per attempt: the adopting attempt must not re-record the creation.
+    assert len(await event_rows(session_factory)) == 1
+
+
+async def test_a_lookup_the_worker_cannot_complete_creates_nothing_and_escalates(
+    context: Context,
+    seed: Seed,
+    enqueue: Enqueue,
+    devin_api: FakeAPI,
+    github_api: FakeAPI,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The lookup's failure path, at the layer where its cost is paid.
+
+    A listing that cannot answer is not a listing that answered "none": the create is skipped, the
+    job is retired without another attempt — the condition is a property of the listing, not of the
+    moment — and the remediation escalates to a human. What must not happen is a `POST`.
+    """
+    remediation_id = await a_create_job(seed, enqueue)
+    fake_issue(github_api)
+    fake_budget(devin_api)
+    devin_api.responds(
+        "GET", SESSIONS, json={"items": [], "end_cursor": "cursor-1", "has_next_page": True}
+    )
+
+    await worker.run_once(context, claimed_by=WORKER)
+
+    assert devin_api.sent("POST", SESSIONS) == []
+    created, escalation = await job_rows(session_factory)
+    assert created.status == JobStatus.FAILED
+    assert created.attempts == 1, "re-walking the same listing would find the same nothing"
+    assert escalation.kind == JobKind.ESCALATE
+    remediation = await remediation_row(session_factory, remediation_id)
+    assert remediation.state == State.FAILED
+    assert remediation.devin_session_id is None
 
 
 async def test_a_session_created_for_a_remediation_cancelled_mid_flight_is_still_recorded(

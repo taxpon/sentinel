@@ -41,7 +41,10 @@ Three things the reference states that are easy to get wrong from the paths alon
   say. Sentinel passes `session_id` through unchanged. *Unobserved*, and the first thing a live
   `GET` settles.
 - **The three listings return `PaginatedResponse[T]`**, whose array is `items` and which also
-  carries `has_next_page` and `end_cursor`. Sentinel reads one page of each and follows no cursor.
+  carries `has_next_page` and `end_cursor`. The session listing pages on `after` (the cursor) and
+  `first` (default 100, minimum 1, **maximum 200**). `list_sessions` reads one page and follows no
+  cursor; the adopt-or-create lookup follows it, at `first=200` — see
+  [Adopt or create](#adopt-or-create).
 - **Both the enterprise metrics window parameters are required.** `time_before` and `time_after`
   are the only `required: true` query parameters in this table.
 
@@ -123,11 +126,22 @@ the earliest created, then the lowest id. Every match is a candidate, including 
 archiving is how a runaway is stopped by hand, and answering that with another session would repeat
 the fault.
 
-**A lookup that cannot answer creates nothing.** A refusal, a timeout that outlasts the read
-retries, or a listing still claiming another page after ten of them all raise, and the job fails
-back to the queue. "I could not find out" is not "there is none", and creating on it is the defect
-itself. Two consequences worth stating: `ViewOrgSessions` is now a prerequisite for *creating* a
-session and not only for polling one, and a Devin outage stops sessions being created rather than
+**A lookup that cannot answer creates nothing.** "I could not find out" is not "there is none", and
+creating on it is the defect itself. All three ways it can fail raise before the `POST`, but they do
+not end the same way, and the difference is operational:
+
+- **Timed out, or `5xx`/`429`, past the read retries** — retryable. The queue backs off and tries
+  the job again, up to `MAX_JOB_ATTEMPTS`.
+- **Refused — `403`, a token without `ViewOrgSessions`** — not retryable. The job is retired on the
+  first occurrence and the remediation escalates, because the next attempt would be refused
+  identically.
+- **Still claiming another page after the page budget, or naming another page with no cursor to
+  reach it** — not retryable, for the same reason: it is a property of the listing, not of the
+  moment.
+
+Two consequences worth stating. `ViewOrgSessions` is now a prerequisite for *creating* a session and
+not only for polling one, so a service user carrying `ManageOrgSessions` alone fails visibly on its
+first remediation instead of working. And a Devin outage stops sessions being created rather than
 duplicating them.
 
 The incident this answers, on **2026-08-11**: five issues were labelled within 2.3 s, Devin's API
@@ -224,9 +238,11 @@ remediation's own event rather than inventing a number.
 **The listing paginates.** `list_sessions` still reads one page, so a backfill over an organisation
 with more sessions than a page sees a prefix. `find_session` does follow `end_cursor` while
 `has_next_page`, because a prefix is not an answer to "does this remediation already have a
-session?" — see [Adopt or create](#adopt-or-create). `pr_state` is likewise carried by the API and read by nothing — a merge
-observed there would reach Sentinel a poll ahead of the `pull_request.closed` webhook, but the
-webhook is authoritative today and nothing is built on it.
+session?" — see [Adopt or create](#adopt-or-create).
+
+`pr_state` is likewise carried by the API and read by nothing — a merge observed there would reach
+Sentinel a poll ahead of the `pull_request.closed` webhook, but the webhook is authoritative today
+and nothing is built on it.
 
 ## Playbooks and ACU caps
 

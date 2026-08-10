@@ -325,8 +325,9 @@ async def _admit(context: Context, job: ClaimedJob, *, delivery_id: str) -> _Ses
 async def _record_session(context: Context, job: ClaimedJob, session: Session) -> None:
     """Commit the session id, alone, before the job is completed.
 
-    This is the transaction that closes the double-session window described at the top of the
-    module. It writes what the transition table calls for — `devin_session_id`,
+    This is the transaction that keeps a `LeaseLost` from rolling the session id back — the
+    double-session window itself is closed one layer down, in `DevinClient.create_session` (see the
+    top of the module). It writes what the transition table calls for — `devin_session_id`,
     `session_created_at`, the state and its event — and nothing about the job, so a `LeaseLost`
     raised later cannot roll the id back.
 

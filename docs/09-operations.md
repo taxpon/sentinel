@@ -6,7 +6,7 @@
 
 | Requirement | Notes |
 |---|---|
-| Devin organisation | `org_id` (`org-…`) and a service-user token (`cog_…`) with `ManageOrgSessions` |
+| Devin organisation | `org_id` (`org-…`) and a service-user token (`cog_…`) with `ManageOrgSessions` **and `ViewOrgSessions`**. Both are required to create a session, not only to poll one: creation lists sessions first so that it can adopt rather than duplicate ([05](./05-devin-integration.md#adopt-or-create)), and a token without the read fails on the first remediation with a `403` |
 | GitHub fine-grained PAT | **Sentinel's own credential.** Scoped to `taxpon/superset`: issues read/write, pull requests read/write, contents read |
 | Devin's access to `taxpon/superset` | **A separate thing, and not the PAT above.** Devin clones, pushes a branch and opens the pull request under its own GitHub connection — arranged in Devin's settings, not from this repository and not by any Sentinel credential ([B15](./blockers.md#b15)) |
 | Docker + Compose | Running locally |
@@ -488,6 +488,8 @@ Step 5 is not optional. Unresolved and stalled work stays visible by design
 | A remediation past `PR_OPENED` stops moving, and nothing is escalated | The session asked something after opening its pull request. That no longer escalates ([ADR](./adr/2026-08-10-an-offer-after-the-pull-request-is-not-a-stall.md)), so **no alarm fires and it appears in no failure breakdown** — usually a harmless offer, occasionally a real stall | The query below, then read the session in the Devin web app. An offer can be ignored; a blocking question has to be answered there, and answering it costs one `human_message_count` |
 | Jobs stuck in `deferred` | Concurrency cap or ACU budget | `select kind, status, count(*) from job group by 1,2;`, then check `acu_ledger` |
 | `422` creating a session | Tag not registered in the organisation vocabulary | This answers [B7](./blockers.md#b7) — record it there. Re-run `make bootstrap-devin` and read step 2's line: if it says the vocabulary was **not** registered, the registration is refused and re-running cannot fix it |
+| No session is created and the remediation goes straight to `FAILED`, with `403` or `SessionLookupIncomplete` in the event detail | The adopt-or-create lookup could not answer, so nothing was created — deliberately ([05](./05-devin-integration.md#adopt-or-create)). A `403` is a token without `ViewOrgSessions`; `SessionLookupIncomplete` means the listing kept claiming more pages, i.e. the `tags` filter is not filtering | For the `403`, add the permission — it is a prerequisite for creating, not only for polling. For the other, read `devin.session.absent`/`adopted`: a `seen` of zero against an organisation full of sessions means the `tags` parameter is not being understood, and the answer is to find out how it is spelled, not to widen the page budget |
+| More than one Devin session for one issue | Two `run:` tags means a concurrent reclaim or a listing that lags its own writes — the two windows adopt-or-create narrows but cannot close. One shared `run:` tag would mean the lookup is not running at all | Archive the extras by hand. Two different `run:` tags is the signal named in [the ADR](./adr/2026-08-11-a-session-is-adopted-before-it-is-created.md) as the point at which Devin has to be asked for an idempotency key |
 | Cost panel labelled `derived` | Enterprise metrics endpoint unavailable | Expected without enterprise scope ([B5](./blockers.md)) — the figure is computed locally |
 
 ### Remediations that have gone quiet

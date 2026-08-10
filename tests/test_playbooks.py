@@ -287,7 +287,12 @@ def test_the_identity_tags_name_one_remediation_and_not_one_attempt() -> None:
 def test_the_identity_tags_are_all_in_the_registered_vocabulary() -> None:
     """They are sent as a listing filter, so an unregistered one would be a 422 on the lookup —
     which is now the call a creation depends on."""
-    assert [pb.validate_tag(tag) for tag in pb.session_identity(repo="a/b", issue_number=1)]
+    identity = pb.session_identity(repo="a/b", issue_number=1)
+    assert (
+        [pb.validate_tag(tag) for tag in identity]
+        == identity
+        == ["sentinel", "repo:a/b", "issue:1"]
+    )
 
 
 def test_the_exported_vocabulary_is_what_validation_enforces() -> None:

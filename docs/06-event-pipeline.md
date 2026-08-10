@@ -72,16 +72,23 @@ directly against known vectors ([08](./08-testing.md)).
 
 ## Deduplication
 
-Two independent layers, because they defend against different things.
+Three independent layers, because they defend against different things.
 
 | Layer | Key | Defends against |
 |---|---|---|
 | **Delivery** | `webhook_delivery.delivery_id` UNIQUE | GitHub retrying a delivery; a replayed request |
-| **Domain** | `remediation (repo, issue_number)` UNIQUE | Two *different* events about the same issue — label removed and re-added, issue reopened — opening a second session |
+| **Domain** | `remediation (repo, issue_number)` UNIQUE | Two *different* events about the same issue — label removed and re-added, issue reopened — opening a second remediation |
+| **Session** | The `sentinel`, `repo:<r>` and `issue:<n>` tags on the Devin session itself | One remediation's `create_session` job being *run* more than once — a client retry, a reclaimed lease, or a job retried after a `POST` whose response was lost ([05](./05-devin-integration.md#adopt-or-create)) |
 
-Both are enforced by the database, not by application-level checks, so they hold under concurrent
-workers. A duplicate delivery returns `200` with a `duplicate` body: an error would make GitHub
-retry it forever.
+The first two are enforced by the database rather than by application-level checks, so they hold
+under concurrent workers. A duplicate delivery returns `200` with a `duplicate` body: an error would
+make GitHub retry it forever.
+
+The third cannot be, because the row it would have to be unique on lives at Devin and the v3 create
+endpoint takes no idempotency key. It is enforced by asking instead: `create_session` lists sessions
+carrying those three tags and adopts one rather than creating a second. It exists because the first
+two layers stop a second *remediation* and say nothing about a second *session* for one remediation
+— which is what happened on 2026-08-11, when nine sessions were created for three issues.
 
 ## Jobs and claiming
 
@@ -114,7 +121,7 @@ mid-job does not strand its work.
 
 | Concern | Policy |
 |---|---|
-| **Retry** | On `429`/`5xx` or a network error: `attempts += 1`, `run_after = now() + 2^attempts × 5 s` with jitter, capped at 10 min. `MAX_JOB_ATTEMPTS` (default 5) then transitions the remediation to `FAILED`. |
+| **Retry** | On `429`/`5xx` or a network error: `attempts += 1`, `run_after = now() + 2^attempts × 5 s` with jitter, capped at 10 min. `MAX_JOB_ATTEMPTS` (default 5) then transitions the remediation to `FAILED`. This is the layer that makes an idempotent `create_session` necessary rather than optional: it re-runs the handler, and therefore the `POST`, long after the client's own retries are spent. |
 | **Non-retryable** | `4xx` other than `429` fails immediately; retrying a validation error only wastes quota. Response body recorded in `remediation_event.detail`. |
 | **Concurrency** | Before creating a session, count remediations in `SESSION_CREATED`/`RUNNING`. At or above `MAX_CONCURRENT_SESSIONS` (default 3), the job is `deferred` with `run_after = now() + 60 s`. Deferral is not an attempt and does not consume the retry budget. |
 | **ACU budget** | Before creating a session, compare today's `acu_ledger` total plus the class cap against `DAILY_ACU_BUDGET`. Over budget → `BLOCKED` with reason `daily_acu_budget_exhausted`, escalated to a human. A cost ceiling should be visible, not silent. |
