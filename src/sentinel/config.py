@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from functools import cache
 from types import MappingProxyType
 from typing import Annotated, Any, Literal
+from urllib.parse import parse_qsl, urlencode
 
 from pydantic import (
     AfterValidator,
@@ -37,6 +38,63 @@ DATABASE_URL_SCHEME = "postgresql+asyncpg://"
 # What a managed provider hands out. Postgres itself has no notion of a driver in a connection
 # URL — naming one is SQLAlchemy's convention — so these say which database to reach, not how.
 PLAIN_POSTGRES_SCHEMES = frozenset({"postgres", "postgresql"})
+
+# The keyword arguments of `asyncpg.connect`. SQLAlchemy's asyncpg dialect does not interpret the
+# query string: `create_connect_args` does `opts.update(url.query)` and the result becomes keyword
+# arguments to `asyncpg.connect`. So a query parameter is usable exactly when it is named here or
+# just below, and anything else is a `TypeError` raised on the first connection rather than at
+# startup — which on Fly is the release command, so the deploy never starts.
+#
+# Transcribed rather than introspected, so that this module keeps importing no driver and the
+# rejection is decided by a value that can be read here. `tests/test_config.py` holds the set to the
+# installed asyncpg's actual signature, so a version that adds a keyword fails CI rather than
+# rejecting a URL an operator was entitled to write.
+ASYNCPG_CONNECT_PARAMETERS = frozenset(
+    {
+        "command_timeout",
+        "connection_class",
+        "database",
+        "direct_tls",
+        "dsn",
+        "gsslib",
+        "host",
+        "krbsrvname",
+        "loop",
+        "max_cacheable_statement_size",
+        "max_cached_statement_lifetime",
+        "passfile",
+        "password",
+        "port",
+        "record_class",
+        "server_settings",
+        "service",
+        "servicefile",
+        "ssl",
+        "statement_cache_size",
+        "target_session_attrs",
+        "timeout",
+        "user",
+    }
+)
+
+# The four the dialect's DBAPI shim implements itself and pops before calling `asyncpg.connect`, so
+# they are accepted despite not appearing above.
+DIALECT_QUERY_PARAMETERS = frozenset(
+    {
+        "async_creator_fn",
+        "async_fallback",
+        "prepared_statement_cache_size",
+        "prepared_statement_name_func",
+    }
+)
+
+# `sslmode` is libpq's spelling of a setting asyncpg calls `ssl`, and the two take the same six
+# values — `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`. Renaming it is not
+# an interpretation of ours: asyncpg's own DSN parser performs this rewrite, `ssl` inheriting the
+# `sslmode` string unchanged, and then parses it against an enum of the libpq names
+# (`asyncpg/connect_utils.py`). SQLAlchemy never hands asyncpg a DSN to parse — only keyword
+# arguments — which is the whole reason the rewrite has to happen here instead.
+TRANSLATED_QUERY_PARAMETERS: Mapping[str, str] = MappingProxyType({"sslmode": "ssl"})
 
 LogLevel = Literal["debug", "info", "warning", "error", "critical"]
 
@@ -58,7 +116,7 @@ class ConfigurationError(RuntimeError):
 
 
 def normalise_database_url(url: str) -> str:
-    """Return `url` with the asyncpg driver named, rejecting one that names a different driver.
+    """Return `url` with the asyncpg driver named and its query string in asyncpg's spelling.
 
     Every managed provider issues `postgres://` or `postgresql://`, and `fly postgres attach` writes
     one straight into the app's secrets. Demanding the driver made deployment a step where the
@@ -70,17 +128,64 @@ def normalise_database_url(url: str) -> str:
     where "psycopg2 is not installed" surfaces from inside the engine on the first query rather than
     at startup.
 
-    The DSN embeds the Postgres password, so the message must not echo `url`.
+    Swapping the driver is not enough on its own, because the query string is written for the driver
+    the provider assumed. A provider-issued URL carries libpq settings, and the dialect forwards
+    every one of them to `asyncpg.connect` as a keyword argument it may not define; `sslmode` is the
+    one every hosted database sets, and it took down the first deploy. So the query string is
+    translated where an exact equivalent exists and rejected where none does, rather than carried
+    across and left to fail on the first connection.
+
+    The DSN embeds the Postgres password, so no message here may echo `url` — a parameter *name* is
+    reported, never a value.
     """
-    if url.startswith(DATABASE_URL_SCHEME):
-        return url
-    scheme, separator, rest = url.partition("://")
-    if separator and scheme in PLAIN_POSTGRES_SCHEMES:
-        return DATABASE_URL_SCHEME + rest
-    raise ValueError(
-        "DATABASE_URL must be a postgres:// or postgresql:// URL, or already name the "
-        f"{DATABASE_URL_SCHEME} driver"
-    )
+    base, separator, query = url.partition("?")
+    if base.startswith(DATABASE_URL_SCHEME):
+        normalised = base
+    else:
+        scheme, delimiter, rest = base.partition("://")
+        if not delimiter or scheme not in PLAIN_POSTGRES_SCHEMES:
+            raise ValueError(
+                "DATABASE_URL must be a postgres:// or postgresql:// URL, or already name the "
+                f"{DATABASE_URL_SCHEME} driver"
+            )
+        normalised = DATABASE_URL_SCHEME + rest
+    if not separator:
+        return normalised
+    return f"{normalised}?{_normalise_query(query)}"
+
+
+def _normalise_query(query: str) -> str:
+    """Rename the query parameters that asyncpg spells differently, rejecting those it cannot take.
+
+    Rejecting is the deliberate half. The parameters with no asyncpg equivalent are the ones saying
+    how strictly the server's certificate is checked (`sslrootcert`, `sslcert`, `sslkey`) or what
+    the session starts as (`options`, `application_name`), and asyncpg exposes those only as an
+    `ssl.SSLContext` or a `server_settings` dict — objects, which a URL cannot carry. Dropping them
+    would connect anyway, less verified or less configured than the operator asked for and with
+    nothing said about it. A deployment that stops with the parameter named costs the time it takes
+    to read the message; one that quietly stops verifying a certificate costs rather more.
+    """
+    parameters = parse_qsl(query, keep_blank_values=True)
+    present = {name for name, _ in parameters}
+    translated: list[tuple[str, str]] = []
+    for name, value in parameters:
+        target = TRANSLATED_QUERY_PARAMETERS.get(name)
+        if target is None:
+            if name not in ASYNCPG_CONNECT_PARAMETERS and name not in DIALECT_QUERY_PARAMETERS:
+                raise ValueError(
+                    f"DATABASE_URL sets '{name}', which the asyncpg driver does not accept. It is "
+                    "a libpq setting with no equivalent asyncpg can be given through a URL; remove "
+                    "it. ('sslmode' is the exception, and is translated automatically.)"
+                )
+            translated.append((name, value))
+        elif target in present:
+            raise ValueError(
+                f"DATABASE_URL sets both '{name}' and '{target}', which are the same setting under "
+                f"the libpq and asyncpg names. Keep '{target}'"
+            )
+        else:
+            translated.append((target, value))
+    return urlencode(translated)
 
 
 def _decode_json(value: Any, variable: str) -> Any:
