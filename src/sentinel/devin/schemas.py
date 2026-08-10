@@ -291,6 +291,26 @@ class PlaybookPage(BaseModel):
         }
 
 
+class TagVocabulary(BaseModel):
+    """The body of `GET /v3/enterprise/organizations/{org_id}/tags` — the reference's
+    `TagsResponse`, one required `tags` array of strings.
+
+    Read only by `scripts/bootstrap_devin.py --dry-run`, and read because the registration beside
+    it is a *replacement*: "Replace the full set of allowed session tags for an organization" is
+    what the v3 reference calls that `PUT`, so what a run would take away is as much a part of the
+    preview as what it would add — and nothing else in Sentinel can name it.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    tags: tuple[str, ...] = ()
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_bare_list(cls, payload: Any) -> Any:
+        return {"tags": _unwrap(payload, "tags", "allowed_tags", "data", "items") or ()}
+
+
 class Schedule(BaseModel):
     """The nightly vulnerability sweep, created once at bootstrap.
 
@@ -374,20 +394,22 @@ class SessionMetrics(BaseModel):
 class Capability(StrEnum):
     """The rows of the degradation table in `docs/05-devin-integration.md`.
 
-    All four, including the one no client method serves: `PLAYBOOK_CREATION` is configuration
+    All of them, including the one no client method serves: `PLAYBOOK_CREATION` is configuration
     rather than a runtime call — the four playbooks are created in the Devin UI and their ids
     supplied through `DEVIN_PLAYBOOK_IDS` (B6) — but the bootstrap script reports on the same
     vocabulary the dashboard labels figures with, and two vocabularies would drift.
 
     `PLAYBOOK_DISCOVERY` is the *read* beside that write: creating a playbook is unavailable, but
     finding the id of one somebody created by hand may not be, and that is what
-    `make devin-playbooks` asks.
+    `make devin-playbooks` asks. `TAG_DISCOVERY` is the same shape again, and the one whose absence
+    costs something: without it `--dry-run` cannot say which tags the registration would *remove*.
     """
 
     SESSION_METRICS = "session_metrics"
     ACU_SPEND = "acu_spend"
     PLAYBOOK_CREATION = "playbook_creation"
     PLAYBOOK_DISCOVERY = "playbook_discovery"
+    TAG_DISCOVERY = "tag_discovery"
 
     @property
     def fallback(self) -> str:
@@ -403,6 +425,10 @@ FALLBACKS: Final[Mapping[Capability, str]] = {
     ),
     Capability.PLAYBOOK_DISCOVERY: (
         "Open each playbook in the Devin web app and read its id from the page"
+    ),
+    Capability.TAG_DISCOVERY: (
+        "Read the organisation's allowed tags in the Devin web app before registering, since the "
+        "registration replaces them"
     ),
 }
 

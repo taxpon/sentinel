@@ -17,6 +17,7 @@ Base URL `https://api.devin.ai`, authenticated with a service-user token
 | `POST` | `/v3/organizations/{org_id}/sessions/{devin_id}/messages` | Review-fix loop: feed CI logs and reviewer feedback |
 | `POST` | `/v3/organizations/{org_id}/sessions/{devin_id}/tags` | Append lifecycle tags (`cycle:N`, `outcome:merged`) |
 | `PUT` | `/v3/organizations/{org_id}/tags` | Register the organisation's allowed tag vocabulary at bootstrap |
+| `GET` | `/v3/enterprise/organizations/{org_id}/tags` | Read the vocabulary that registration would replace — `bootstrap_devin.py --dry-run` only |
 | `POST` | `/v3/organizations/{org_id}/knowledge/notes` | Seed repository conventions once at bootstrap |
 | `POST` | `/v3/organizations/{org_id}/schedules` | Nightly vulnerability sweep |
 | `GET` | `/v3/organizations/{org_id}/playbooks` | Read back the ids of the hand-made playbooks — `make devin-playbooks` |
@@ -26,6 +27,25 @@ Base URL `https://api.devin.ai`, authenticated with a service-user token
 The last row requires enterprise scope and the `ViewAccountMetrics` permission. Sentinel treats it
 as an enhancement, not a dependency — see [Degradation](#degradation) and
 [B5](./blockers.md).
+
+**The two tag rows are not a matched pair, and that is unresolved.** The v3 reference documents the
+allowed-tag vocabulary at `/v3/enterprise/organizations/{org_id}/tags` — `GET` to read it, `PUT` to
+*replace the full set*, `POST` to *append* to it, and two `DELETE`s — each requiring
+`ManageEnterpriseSettings`. It documents nothing at `/v3/organizations/{org_id}/tags`, which is
+where the row above registers. So two things are open, neither of them decided here:
+
+1. **The path.** The registration may be writing somewhere the API does not serve, in which case
+   step 2 of `make bootstrap-devin` fails on the first real run rather than doing anything wrong.
+2. **The method.** If it does serve it, `PUT` replaces the whole set: any tag the organisation
+   already allows and `devin/playbooks.py` does not list is removed, on the first run, silently.
+   `POST` would append instead. Which of the two Sentinel should send depends on whether it owns
+   the organisation's vocabulary or only adds to it, and that is the repository owner's call.
+
+Until both are answered, `bootstrap_devin.py --dry-run` reads the documented path and reports what
+the registration would add, keep and **remove** — and says so plainly when the read is refused,
+because a `PUT` whose removals cannot be named is the thing worth knowing before the run. Neither
+the path nor the method of the registration itself is changed by that preview
+([B7](./blockers.md#b7), [B8](./blockers.md#b8)).
 
 ## Creating a session
 
@@ -237,6 +257,7 @@ defined fallback so that a permission gap degrades a panel rather than breaking 
 | ACU spend | `GET /v3/organizations/{org_id}/consumption/daily` | Sum `acus_consumed` across sessions |
 | Playbook creation | `POST /v3/enterprise/playbooks` | Create playbooks in the Devin UI and supply the ids via `PLAYBOOK_IDS` env config |
 | Playbook discovery | `GET /v3/organizations/{org_id}/playbooks` | Open each playbook in the Devin web app and read its id from the page |
+| Tag vocabulary discovery | `GET /v3/enterprise/organizations/{org_id}/tags` | Read the organisation's allowed tags in the Devin web app before registering, since the registration replaces them |
 
 The dashboard labels any figure served by a fallback, so a reader always knows which numbers came
 from Devin and which Sentinel derived itself.
