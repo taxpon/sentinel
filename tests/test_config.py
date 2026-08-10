@@ -8,14 +8,21 @@ strings cannot express."""
 
 from __future__ import annotations
 
+import inspect
 import json
+import os
+import subprocess
+import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from sentinel.config import (
+    ASYNCPG_CONNECT_PARAMETERS,
     ConfigurationError,
     ConfigurationGroup,
     DatabaseSettings,
@@ -28,6 +35,7 @@ from sentinel.config import (
     WebhookSettings,
     get_settings,
     load_config,
+    normalise_database_url,
 )
 from test_env_example import documented_variables
 
@@ -323,14 +331,140 @@ def test_a_database_url_naming_no_driver_has_the_asyncpg_one_applied(
     )
 
 
-def test_applying_the_driver_leaves_the_rest_of_the_url_alone(load: Load) -> None:
-    # The query string carries `sslmode`, which a hosted database needs and which is the part most
-    # easily lost to a naive rewrite.
-    settings = load(DATABASE_URL="postgres://u:p@host:5432/db?sslmode=require&application_name=x")
+def test_a_database_url_with_no_query_string_is_left_alone(load: Load) -> None:
+    # The common case, and the one the translation must not disturb: no `?` is added, nothing is
+    # reordered, and the URL comes back exactly as it went in but for the driver.
+    settings = load(DATABASE_URL="postgres://u:dbpassword@host:5432/db")
 
     assert settings.database_url.get_secret_value() == (
-        "postgresql+asyncpg://u:p@host:5432/db?sslmode=require&application_name=x"
+        "postgresql+asyncpg://u:dbpassword@host:5432/db"
     )
+
+
+@pytest.mark.parametrize(
+    "mode", ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"]
+)
+def test_sslmode_is_translated_to_the_asyncpg_spelling_keeping_its_value(
+    load: Load, mode: str
+) -> None:
+    # What every hosted provider writes, and what broke the first deploy: the dialect forwards the
+    # query string to `asyncpg.connect` as keyword arguments, and asyncpg has no `sslmode` keyword.
+    # It has `ssl`, which takes these six libpq names unchanged — asyncpg's own DSN parser renames
+    # the one to the other and keeps the value, which is why this is a rename and not a guess.
+    #
+    # Every value has to survive, and dropping one is wrong in one of two directions. An absent
+    # `ssl` argument makes asyncpg *attempt* TLS — it defaults to `prefer` for a TCP connection — so
+    # losing `disable` breaks Fly, whose endpoint resets the handshake rather than declining it.
+    # That was this deployment's second failure, after the TypeError. Losing `require` would be
+    # quieter and worse: an unencrypted connection to a database on the public internet, succeeding.
+    # Neither value is interchangeable with the other, or with saying nothing.
+    settings = load(DATABASE_URL=f"postgres://u:dbpassword@host:5432/db?sslmode={mode}")
+
+    assert settings.database_url.get_secret_value() == (
+        f"postgresql+asyncpg://u:dbpassword@host:5432/db?ssl={mode}"
+    )
+
+
+def test_a_query_parameter_asyncpg_accepts_is_carried_across_untouched(load: Load) -> None:
+    # `ssl` is asyncpg's own name for it and `target_session_attrs` is spelled the same in both, so
+    # neither needs renaming — and the rejection below must not catch them.
+    settings = load(
+        DATABASE_URL=(
+            "postgres://u:dbpassword@host:5432/db?ssl=verify-full&target_session_attrs=read-write"
+        )
+    )
+
+    assert settings.database_url.get_secret_value() == (
+        "postgresql+asyncpg://u:dbpassword@host:5432/db?ssl=verify-full"
+        "&target_session_attrs=read-write"
+    )
+
+
+def test_a_parameter_the_dialect_implements_itself_is_carried_across(load: Load) -> None:
+    # Popped by SQLAlchemy's DBAPI shim before `asyncpg.connect` is called, so it is accepted even
+    # though asyncpg does not define it. Rejecting on the asyncpg signature alone would break it.
+    settings = load(
+        DATABASE_URL="postgres://u:dbpassword@host:5432/db?prepared_statement_cache_size=0"
+    )
+
+    assert settings.database_url.get_secret_value() == (
+        "postgresql+asyncpg://u:dbpassword@host:5432/db?prepared_statement_cache_size=0"
+    )
+
+
+@pytest.mark.parametrize(
+    "parameter",
+    [
+        "sslrootcert=%2Fetc%2Fca.pem",
+        "sslcert=%2Fetc%2Fclient.pem",
+        "sslkey=%2Fetc%2Fclient.key",
+        "options=-csearch_path%3Dsentinel",
+        "application_name=sentinel",
+        "connect_timeout=10",
+        "gssencmode=require",
+        "wholly-invented=1",
+    ],
+)
+def test_a_query_parameter_asyncpg_cannot_take_is_rejected_by_name(
+    load: Load, parameter: str
+) -> None:
+    # None of these has an equivalent asyncpg can be given through a URL — the SSL ones exist only
+    # inside an `ssl.SSLContext`, and the session ones inside a `server_settings` dict. Carrying
+    # them across is the `TypeError: connect() got an unexpected keyword argument` that killed the
+    # release command; dropping them would connect less verified than was asked for, silently.
+    with pytest.raises(ConfigurationError) as raised:
+        load(DATABASE_URL=f"postgres://u:dbpassword@host:5432/db?{parameter}")
+
+    message = str(raised.value)
+    assert "DATABASE_URL" in message
+    assert parameter.split("=")[0] in message
+
+
+def test_naming_a_setting_twice_over_is_rejected_rather_than_resolved(load: Load) -> None:
+    # `sslmode` renames onto `ssl`, so a URL carrying both is asking for two different things under
+    # one keyword. Which one wins is not ours to pick.
+    with pytest.raises(ConfigurationError) as raised:
+        load(DATABASE_URL="postgres://u:dbpassword@host:5432/db?sslmode=require&ssl=disable")
+
+    assert "sslmode" in str(raised.value)
+    assert "ssl" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "postgres://u:dbpassword@host:5432/db?sslmode=require",
+        "postgres://u:dbpassword@host:5432/db?sslrootcert=%2Fetc%2Fca.pem",
+        "postgres://u:dbpassword@host:5432/db?sslmode=require&ssl=disable",
+    ],
+    ids=["translated", "rejected", "named-twice"],
+)
+def test_the_query_string_rules_never_put_the_password_in_a_message(load: Load, value: str) -> None:
+    # These messages are raised on the deployment path, where the URL is the one Fly wrote and the
+    # password in it is the real one. A parameter name is safe to report; nothing else is.
+    try:
+        settings = load(DATABASE_URL=value)
+    except ConfigurationError as error:
+        assert "dbpassword" not in str(error)
+        assert value not in str(error)
+        return
+
+    for rendering in (repr(settings), str(settings.model_dump()), settings.model_dump_json()):
+        assert "dbpassword" not in rendering
+
+
+def test_the_accepted_parameters_are_the_ones_asyncpg_actually_defines() -> None:
+    """The transcribed signature, checked against the installed driver rather than against itself.
+
+    `ASYNCPG_CONNECT_PARAMETERS` decides which query parameters are rejected, and it is a copy of
+    something asyncpg owns. A copy that is never compared to its source is a copy that goes stale:
+    an asyncpg release adding a keyword would have us rejecting a URL the operator was entitled to
+    write, with a message saying asyncpg cannot take it. Asserting against the real signature is the
+    only version of this test that can fail for the right reason.
+    """
+    import asyncpg
+
+    assert set(inspect.signature(asyncpg.connect).parameters) == ASYNCPG_CONNECT_PARAMETERS
 
 
 @pytest.mark.parametrize(
@@ -759,3 +893,47 @@ def test_a_narrowed_configuration_is_read_afresh_each_time(
 
     assert first.target_repo == "taxpon/superset"
     assert load_config(TargetSettings).target_repo == "someone/else"
+
+
+# ------------------------------------------------- the driver actually accepts what we hand it
+
+
+async def test_a_normalised_libpq_url_is_one_asyncpg_will_connect_with(database_url: str) -> None:
+    """The assertion the unit tests above cannot make: that the rewrite produces something the
+    driver takes.
+
+    Every other test here compares a string to a string, and a string test would have passed just
+    as happily on the URL that killed the deploy — `sslmode=require` looks fine until asyncpg is
+    asked to accept it. So this one goes all the way to a connection, on the same query parameter
+    the release command died on. The local Postgres serves no TLS, hence `disable` rather than
+    `require`; what is under test is that the parameter survives into a keyword asyncpg defines.
+    """
+    engine = create_async_engine(normalise_database_url(f"{database_url}?sslmode=disable"))
+    try:
+        async with engine.connect() as connection:
+            assert (await connection.execute(text("SELECT 1"))).scalar_one() == 1
+    finally:
+        await engine.dispose()
+
+
+def test_alembic_applies_the_same_rewrite_to_a_provider_issued_url(database_url: str) -> None:
+    """`alembic/env.py` is the process that actually failed, so it is asserted separately.
+
+    It reads `DATABASE_URL` from the environment rather than through `Settings` — deliberately, so
+    that a migration does not require the Devin and GitHub credentials — which means the model's
+    validator never runs for it. It borrows `normalise_database_url` instead, and this is the test
+    that the borrowing is enough. Run as a subprocess with nothing but `DATABASE_URL` set, because
+    that is what Fly's `release_command` is: `alembic upgrade head`, a bare environment, and a URL
+    written by `fly postgres attach` rather than by the operator.
+    """
+    root = Path(__file__).resolve().parents[1]
+    completed = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=root,
+        env={**os.environ, "DATABASE_URL": f"{database_url}?sslmode=disable"},
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "sslmode" not in completed.stderr
