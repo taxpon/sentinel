@@ -22,11 +22,11 @@ Three things this module fixes, which a hand-built dictionary at each call site 
   says our reading of the API is wrong.
 
 Every shape here is now taken from the v3 OpenAPI reference page for its own endpoint, and each
-model says which schema it is. That audit found four names invented rather than read — the
-schedule's id, the note's id, the consumption envelope and the session total — and the comments
-record what the reference says so the next reader checks the page rather than the guess. What
-remains genuinely undocumented is marked *unverified* and still cannot be settled without
-credentials (B8).
+model says which schema it is. That audit found four names invented rather than read — the note's
+id, the consumption envelope, the session total, and the id of a schedule Sentinel no longer creates
+(`docs/05-devin-integration.md#scheduled-sweep`) — and the comments record what the reference says
+so the next reader checks the page rather than the guess. What remains genuinely undocumented is
+marked *unverified* and still cannot be settled without credentials (B8).
 """
 
 from __future__ import annotations
@@ -377,22 +377,6 @@ class TagVocabulary(BaseModel):
         # `TagsResponse` is `{"tags": [...]}` and nothing else; the `allowed_tags`, `data` and
         # `items` envelopes this used to try were guesses at a shape the reference states.
         return {"tags": _unwrap(payload, "tags") or ()}
-
-
-class Schedule(BaseModel):
-    """The nightly vulnerability sweep, created once at bootstrap.
-
-    *Verified against the reference*: `ScheduleResponse` carries no `id` and no `schedule_id`. Its
-    identifier — the one required field that names the schedule — is **`scheduled_session_id`**,
-    and that is what `DEVIN_SCHEDULE_ID` records. Both spellings this model used to accept were
-    invented, so bootstrap step 4 would have failed to parse the very response it succeeded in
-    creating, leaving a sweep running that `.env` had no id for.
-    """
-
-    model_config = ConfigDict(frozen=True)
-
-    id: str = Field(validation_alias="scheduled_session_id")
-    name: str | None = None
 
 
 # --- Consumption and metrics ----------------------------------------------------------------------
