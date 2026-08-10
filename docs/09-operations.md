@@ -330,15 +330,15 @@ Then look at what the run would do, before it does any of it:
 uv run scripts/bootstrap_devin.py --dry-run
 ```
 
-It prints the four steps in the tense of a run that has not happened and writes nothing — no
+It prints the three steps in the tense of a run that has not happened and writes nothing — no
 request that changes anything, and no line in `.env`. Step 1 and the capability probes still run,
 because they are reads: the preview tells you whether the token is accepted and which optional
-endpoints answer. For each of the other three it says what would *change* — which tags the
-registration would keep, add and **remove**, and whether `DEVIN_KNOWLEDGE_IDS` and
-`DEVIN_SCHEDULE_ID` already record ids, which is what decides between "create" and "skip". It
-closes with what it cannot tell you.
+endpoints answer. For each of the other two it says what would *change* — which tags the
+registration would keep, add and **remove**, and how many of the four notes `DEVIN_KNOWLEDGE_IDS`
+already records ids for, which is what decides between "create" and "skip". It closes with what it
+cannot tell you.
 
-Read it rather than skipping it, for three reasons:
+Read it rather than skipping it, for two reasons:
 
 - **Step 2 replaces — if it is allowed at all.** `PUT .../tags` is "replace the full set of allowed
   session tags", so every tag this organisation allows that `devin/playbooks.py` does not list is
@@ -349,11 +349,10 @@ Read it rather than skipping it, for three reasons:
   Devin web app before continuing. Which path and which method the registration should use is itself
   still open: see the note under
   [Endpoints used](./05-devin-integration.md#endpoints-used).
-- **Step 4 recurs.** The sweep is a schedule, so a run made by mistake leaves something that keeps
-  acting on its own every night.
-- **Steps 3 and 4 are idempotent only through `.env`.** A run against a `.env` freshly copied from
-  `.env.example` creates a second set of notes and a second sweep that nothing afterwards can tell
-  apart.
+- **Step 3 is idempotent only through `.env`.** A run against a `.env` freshly copied from
+  `.env.example` creates a second set of four notes that nothing afterwards can tell apart. Nothing
+  detects this any more: the sweep's id used to be the evidence that an organisation had been here
+  before, and it went with the schedule ([B16](./blockers.md#b16)).
 
 ```bash
 make bootstrap-devin
@@ -361,12 +360,15 @@ make bootstrap-devin
 
 - registers the tag vocabulary via `PUT /v3/organizations/{org}/tags` ([05](./05-devin-integration.md));
 - creates the four knowledge notes and writes their ids into `.env`;
-- creates the nightly sweep schedule;
 - verifies the token by listing sessions, and reports which optional enterprise endpoints are
   reachable so the degradation path is known before the demo, not during it.
 
+Three steps. There was a fourth, which created a nightly vulnerability sweep as a Devin scheduled
+session; it is gone, and [05](./05-devin-integration.md#scheduled-sweep) records why and says how
+the sweep is run instead — by hand, with the command written out there.
+
 Every step is idempotent, so a second run repeats nothing that already succeeded — but idempotence
-for the last two *is* the `.env` record, which is why the preview names what it holds.
+for the last one *is* the `.env` record, which is why the preview names what it holds.
 
 **Step 2 may be refused, and that does not stop the run.** Allowed-tag management is documented as
 an enterprise feature — `ManageEnterpriseSettings`, with the session tags feature enabled for the

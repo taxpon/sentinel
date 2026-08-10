@@ -456,9 +456,10 @@ tasks:
     depends_on: [T11, T15]
     adrs: []
     notes: >-
-      Registers the tag vocabulary, seeds knowledge notes, creates the nightly
-      schedule, and probes which enterprise-scoped endpoints are reachable so
-      the degradation path is known before the demo (B5, B6, B7).
+      Registers the tag vocabulary, seeds knowledge notes, and probes which
+      enterprise-scoped endpoints are reachable so the degradation path is known
+      before the demo (B5, B6, B7). The nightly schedule it used to create was
+      removed (B16).
 
   - id: T41
     title: GitHub bootstrap script

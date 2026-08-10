@@ -24,7 +24,6 @@ below says so in as many words.
 | `PUT` | `/v3/organizations/{org_id}/tags` | Register the organisation's allowed tag vocabulary at bootstrap | **undocumented path** — see below |
 | `GET` | `/v3/enterprise/organizations/{org_id}/tags` | Read the vocabulary that registration would replace — `bootstrap_devin.py --dry-run` only | — → `TagsResponse` · `ManageEnterpriseSettings` |
 | `POST` | `/v3/organizations/{org_id}/knowledge/notes` | Seed repository conventions once at bootstrap | `KnowledgeNoteCreateRequest` → `KnowledgeNoteResponse` · `ManageAccountKnowledge` |
-| `POST` | `/v3/organizations/{org_id}/schedules` | Nightly vulnerability sweep | `ScheduleCreateRequest` → `ScheduleResponse` · `ManageOrgSchedules` |
 | `GET` | `/v3/organizations/{org_id}/playbooks` | Read back the ids of the hand-made playbooks — `make devin-playbooks` | — → `PaginatedResponse[PlaybookResponse]` · `ManageAccountPlaybooks` |
 | `GET` | `/v3/organizations/{org_id}/consumption/daily` | Daily ACU spend for the budget guard and cost panel | — → `ConsumptionResponse` · `ViewOrgConsumption` |
 | `GET` | `/v3/enterprise/metrics/sessions` | Merged-PR and ACU aggregates — *enterprise scope, optional* | — → `SessionMetricsResponse` · `ViewAccountMetrics` |
@@ -348,38 +347,73 @@ response is `KnowledgeNoteResponse`, whose identifier is **`note_id`**; that is 
 
 **The reference does document a listing.** `GET /v3/organizations/{org_id}/knowledge/notes` —
 "List org-level notes", `ManageAccountKnowledge`, the same permission the create needs — returns
-`PaginatedResponse[KnowledgeNoteResponse]`, and `GET /v3/organizations/{org_id}/schedules` does the
-same for the sweep. Both are outside [the endpoints Sentinel calls](#endpoints-used) and stay
-outside for now, but the claim they were left out on — that nothing can list what the bootstrap
-created, so `.env` is the only record it exists
-([ADR](./adr/2026-08-08-env-is-the-bootstrap-scripts-record.md)) — is not true of the API. Whether
+`PaginatedResponse[KnowledgeNoteResponse]`. It is outside [the endpoints Sentinel calls](#endpoints-used)
+and stays outside for now, but the claim it was left out on — that nothing can list what the
+bootstrap created, so `.env` is the only record it exists
+([ADR](./adr/2026-08-08-env-is-the-bootstrap-scripts-record.md)) — is not true of the API. It now
+matters more than it did: the schedule's id was the one thing that told the bootstrap script this
+organisation had been through it before, and with [step 4 removed](#scheduled-sweep) a `.env`
+copied from `.env.example` beside four notes that already exist creates four more. Whether
 idempotence should be established by reading the organisation rather than by trusting a file is a
-decision for whoever owns that ADR; this document only records that the option exists.
+decision for whoever owns that ADR; this document only records that the option exists and that the
+cost of not taking it has gone up.
 
-## Scheduled sweep
+## The vulnerability sweep, and why nothing schedules it {#scheduled-sweep}
 
-`POST /v3/organizations/{org_id}/schedules` creates a recurring session that closes the loop back
-into the pipeline:
+The sweep is [`src/sentinel/scanner/audit.py`](./adr/2026-08-08-both-ecosystems-are-resolved-against-osv.md):
+it reads the target's manifests over the GitHub contents API, resolves both dependency trees
+against OSV, and files at most three issues a run carrying the `devin:autofix` label and a `class:`
+label. Those issues re-enter at the top of [the primary flow](./02-architecture.md), so Sentinel is
+both the producer and the consumer of that work.
 
-| Field | Value |
-|---|---|
-| `name` | `sentinel-nightly-vuln-sweep` |
-| `schedule_type` | `recurring` |
-| `frequency` | `0 3 * * *` (UTC) |
-| `prompt` | Run `pip-audit` and `npm audit` on the target repo; for each *new* finding not already tracked, open a GitHub issue with the `devin:autofix` label and the appropriate `class:` label; do not open duplicates |
-| `tags` | `sentinel`, `class:scheduled-sweep` |
-| `notify_on` | `failure` |
+**Nothing invokes it automatically.** This document used to specify a fourth bootstrap step that
+created a recurring Devin session — `POST /v3/organizations/{org_id}/schedules`, `ScheduleCreateRequest`,
+nightly at `0 3 * * *` — and both the step and the endpoint have been removed. Devin's own guide
+carries a banner on Scheduled Sessions:
 
-`ScheduleCreateRequest` requires only `name` and `prompt`; the other four rows are defaults
-Sentinel states rather than assumes. `schedule_type` is `recurring` or `one_time` and a recurring
-schedule is the one that needs `frequency`, a cron expression. `notify_on` is `always`, `failure`
-or `never`.
+> Automations are now the recommended way to run Devin on a schedule. Automations support schedule
+> triggers along with event-driven triggers (Slack, GitHub, Linear, webhooks), conditions,
+> invocation limits, and more. **If you're setting up a new scheduled workflow, use an automation
+> with a Schedule trigger instead.**
+>
+> Existing scheduled sessions will continue to work.
 
-The response is `ScheduleResponse`, and its identifier is **`scheduled_session_id`** — there is no
-`id` and no `schedule_id` on it. That is what `DEVIN_SCHEDULE_ID` records.
+The API still works, so this is not a defect. It is a choice not to build new work on a superseded
+feature, made by the repository owner and recorded in [B16](./blockers.md#b16). Automations were not
+adopted in its place: the v3 reference index lists no endpoint for creating one, so it may be a
+web-app feature, and an automatic sweep is not what Sentinel is for — label → remediate → merge is,
+and the eight issues for this run were chosen by hand and are already filed.
 
-Issues it files re-enter at the top of [the primary flow](./02-architecture.md) — Devin becomes both
-the producer and the consumer of work.
+### How to run it
+
+By hand, deliberately, from the project environment. There is no `make` target and no CLI, because
+a sweep that files issues on a public repository is not something to make one keystroke away:
+
+```bash
+uv run python - <<'PY'
+import asyncio
+
+from sentinel.config import get_settings
+from sentinel.scanner.audit import OsvClient, TargetRepository, sweep
+
+
+async def main() -> None:
+    settings = get_settings()
+    async with TargetRepository(settings) as repository, OsvClient() as osv:
+        report = await sweep(tracker=repository, osv=osv, settings=settings)
+    print(f"scanned {report.scanned}, filed {len(report.filed)}, skipped {len(report.skipped)}")
+
+
+asyncio.run(main())
+PY
+```
+
+It needs `GITHUB_TOKEN` and `TARGET_REPO`, and it **writes to the target repository**. Running it
+twice files nothing twice: every issue it writes carries a fingerprint it reads back off the issues
+it has already filed, open and closed
+([ADR](./adr/2026-08-08-the-filed-issue-is-the-sweeps-memory.md)). That property was what made a
+failed nightly run safe to leave until the next night; with nothing scheduling it, it is what makes
+a re-run by hand safe instead.
 
 ## Degradation
 
