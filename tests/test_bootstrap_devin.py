@@ -71,6 +71,7 @@ ORG = "org-abc123"
 ORGANIZATION = f"/v3/organizations/{ORG}"
 SESSIONS = f"{ORGANIZATION}/sessions"
 TAGS = f"{ORGANIZATION}/tags"
+ALLOWED_TAGS = f"/v3/enterprise/organizations/{ORG}/tags"
 NOTES = f"{ORGANIZATION}/knowledge/notes"
 SCHEDULES = f"{ORGANIZATION}/schedules"
 PLAYBOOKS = f"{ORGANIZATION}/playbooks"
@@ -418,21 +419,28 @@ async def test_running_twice_leaves_four_notes_and_one_schedule(
 
 # --- The preview ---------------------------------------------------------------------------------
 #
-# `--dry-run`. The step it exists for is the fourth: the sweep is recurring, so a run made by
-# mistake leaves something that keeps acting on its own every night. Steps 3 and 4 are idempotent
-# only through what `.env` records, so a run against a `.env` replaced from `.env.example` also
-# duplicates the notes — and that is exactly what a preview has to be able to say out loud.
+# `--dry-run`. Two steps make it worth running. The fourth registers a recurring sweep, so a run
+# made by mistake leaves something that keeps acting on its own every night; and the second is a
+# `PUT` that *replaces* the organisation's whole allowed-tag vocabulary, so the first run removes
+# every tag `devin/playbooks.py` does not list. Steps 3 and 4 are idempotent only through what
+# `.env` records, so a run against a `.env` replaced from `.env.example` duplicates the notes too —
+# and that is the whole of what a preview has to be able to say out loud.
+
+CURRENT_TAGS = ("sentinel", "issue:", "team:platform", "env:prod")
+"""What an organisation that somebody else has also used allows: three of Sentinel's own, and one
+that is not in `VOCABULARY` at all and would therefore be removed."""
 
 
 @pytest.fixture
 def reads_only(devin_api: FakeAPI) -> FakeAPI:
-    """Devin answering the two reads a dry run is allowed to make, and nothing else.
+    """Devin answering the three reads a dry run is allowed to make, and nothing else.
 
     No `PUT` and no `POST` is registered, and an unregistered route raises rather than answering.
     So "a dry run writes nothing" is asserted by the fake itself: a guard that let one through
     would fail here rather than be caught by a request-count assertion that someone could weaken.
     """
     devin_api.responds("GET", SESSIONS, 200, {"sessions": []})
+    devin_api.responds("GET", ALLOWED_TAGS, 200, {"tags": list(CURRENT_TAGS)})
     devin_api.responds("GET", CONSUMPTION, 200, {"days": []})
     return devin_api
 
@@ -440,14 +448,15 @@ def reads_only(devin_api: FakeAPI) -> FakeAPI:
 async def test_a_dry_run_writes_nothing_at_all(
     devin: DevinClient, settings: Settings, env: Any, env_path: Path, reads_only: FakeAPI
 ) -> None:
-    """The whole promise, in one test: the only requests are the reads, and `.env` comes back byte
-    for byte the file it was."""
+    """The whole promise, in one test: the only requests are reads, and `.env` comes back byte for
+    byte the file it was."""
     before = read_bytes(env_path)
 
     await preview(devin, settings, env)
 
     assert [(request.method, request.path) for request in reads_only.requests] == [
         ("GET", SESSIONS),
+        ("GET", ALLOWED_TAGS),
         ("GET", CONSUMPTION),
     ]
     assert read_bytes(env_path) == before
@@ -483,23 +492,103 @@ async def test_a_dry_run_still_probes_the_capabilities(
     assert "nothing was sent" in vocabulary.detail
 
 
-async def test_a_dry_run_names_the_whole_set_the_tag_put_would_replace(
+async def test_a_dry_run_names_the_tags_the_registration_would_remove(
     devin: DevinClient, settings: Settings, env: Any, reads_only: FakeAPI
 ) -> None:
-    """The `PUT` sends the vocabulary as a whole and replaces whatever is registered, so every tag
-    is named and the replacement is stated. Which of them are *new* cannot be: v3 exposes no read
-    of the current vocabulary, and the preview says so under its own limits rather than printing a
-    list that looks like a diff and is not."""
-    out = Out()
-
-    report = await preview(devin, settings, env, out)
+    """The point of reading the vocabulary at all. `PUT` is "replace the full set", so a tag the
+    organisation allows and `devin/playbooks.py` does not list is removed by the first run — and
+    named here before it is, alongside what would be kept and added."""
+    report = await preview(devin, settings, env)
 
     tags = report.steps["tags"]
+    added = [tag for tag in bootstrap_devin.VOCABULARY if tag not in CURRENT_TAGS]
+    assert f"keeps {len(bootstrap_devin.VOCABULARY) - len(added)}" in tags
+    assert f"adds {len(added)} ({', '.join(added)})" in tags
+    assert "REMOVES 2: team:platform, env:prod" in tags
+
+    row = report.capability(Capability.TAG_DISCOVERY.value)
+    assert (row.blocker, row.status) == ("B7", bootstrap_devin.REACHABLE)
+    assert "4 tag(s) allowed today" in row.detail
+
+
+async def test_a_dry_run_says_when_the_registration_would_remove_nothing(
+    devin: DevinClient, settings: Settings, env: Any, devin_api: FakeAPI
+) -> None:
+    """An organisation whose vocabulary is already Sentinel's: the run is a no-op, and saying so is
+    what tells an operator this one is safe to type."""
+    devin_api.responds("GET", SESSIONS, 200, {"sessions": []})
+    devin_api.responds("GET", CONSUMPTION, 200, {"days": []})
+    devin_api.responds("GET", ALLOWED_TAGS, 200, {"tags": list(bootstrap_devin.VOCABULARY)})
+
+    report = await preview(devin, settings, env)
+
+    assert "adds 0" in report.steps["tags"]
+    assert "removes nothing" in report.steps["tags"]
+    assert "REMOVES" not in report.steps["tags"]
+
+
+@pytest.mark.parametrize(("status_code", "reason"), [(403, "forbidden"), (404, "not_found")])
+async def test_a_vocabulary_that_cannot_be_read_is_reported_as_removals_nobody_can_name(
+    devin: DevinClient,
+    settings: Settings,
+    env: Any,
+    devin_api: FakeAPI,
+    status_code: int,
+    reason: str,
+) -> None:
+    """The likely answer, since the documented permission is `ManageEnterpriseSettings`. Silence
+    here would be worse than no preview at all: the `PUT` still replaces the whole set, so what the
+    run cannot name is exactly what it would destroy. It is a refusal, so the preview still exits
+    0 and still previews the other three steps."""
+    devin_api.responds("GET", SESSIONS, 200, {"sessions": []})
+    devin_api.responds("GET", CONSUMPTION, 200, {"days": []})
+    devin_api.responds("GET", ALLOWED_TAGS, status_code, {"detail": "no"})
+
+    report = await preview(devin, settings, env)
+
+    tags = report.steps["tags"]
+    assert f"could not be read ({reason} ({status_code}))" in tags
+    assert "may remove tags nothing here can name" in tags
     for tag in bootstrap_devin.VOCABULARY:
         assert tag in tags
-    assert "would replace the whole vocabulary" in tags
-    assert f"which of the {len(bootstrap_devin.VOCABULARY)} tags are new" in out.text
-    assert "no read of the current one" in out.text
+
+    row = report.capability(Capability.TAG_DISCOVERY.value)
+    assert row.status == bootstrap_devin.DEGRADED
+    assert Capability.TAG_DISCOVERY.fallback in row.detail
+    assert "would create 4 note(s)" in report.steps["knowledge"]
+
+
+async def test_a_fault_reading_the_vocabulary_does_not_exit_zero(
+    devin: DevinClient, settings: Settings, env: Any, devin_api: FakeAPI
+) -> None:
+    """A `500` is not a refusal, and reporting it as one would record "the vocabulary is not
+    readable here" when the answer is "ask again". The whole preview is still printed first."""
+    out = Out()
+    devin_api.responds("GET", SESSIONS, 200, {"sessions": []})
+    devin_api.responds("GET", CONSUMPTION, 200, {"days": []})
+    devin_api.responds("GET", ALLOWED_TAGS, 500, {"detail": "boom"})
+
+    with pytest.raises(bootstrap_devin.BootstrapError) as failure:
+        await preview(devin, settings, env, out)
+
+    assert Capability.TAG_DISCOVERY.value in failure.value.problem
+    assert "Nothing was created" in failure.value.remedy
+    assert "[4/4] schedule" in out.text
+    assert Capability.TAG_DISCOVERY.fallback not in out.text
+
+
+async def test_the_run_itself_does_not_read_the_vocabulary(
+    devin: DevinClient, settings: Settings, env: Any, wired: FakeAPI
+) -> None:
+    """The read belongs to the preview. A real run sends the `PUT` it was always going to send, and
+    `wired` registers no route for the read — so a run that started making it would fail here."""
+    report = await run(devin, settings, env)
+
+    assert wired.sent("GET", ALLOWED_TAGS) == []
+    assert report.steps["tags"] == (
+        f"registered {len(bootstrap_devin.VOCABULARY)} tags: "
+        f"{', '.join(bootstrap_devin.VOCABULARY)}"
+    )
 
 
 async def test_a_dry_run_says_it_would_create_what_env_records_nothing_of(
@@ -585,6 +674,10 @@ async def test_the_preview_says_what_was_and_was_not_done(
     # something the report above does not show.
     assert bootstrap_devin.LIMITS_HEADING.strip() in out.text
     assert all(limit in out.text for limit in bootstrap_devin.DRY_RUN_LIMITS)
+    # The first of them is the one this preview's own evidence depends on: it reads the path the
+    # reference documents, and step 2 writes one the reference does not list.
+    assert "/v3/enterprise/organizations/{org_id}/tags" in out.text
+    assert "step 2 registers at /v3/organizations/{org_id}/tags" in out.text
 
 
 def test_a_dry_run_writes_nothing_and_the_run_after_it_writes(
@@ -599,6 +692,7 @@ def test_a_dry_run_writes_nothing_and_the_run_after_it_writes(
     still sent them would pass unnoticed — and the second half is the assertion that the ordinary
     path was not disabled along with them."""
     monkeypatch.setattr(bootstrap_devin, "load_config", lambda _model: settings)
+    wired.responds("GET", ALLOWED_TAGS, 200, {"tags": list(CURRENT_TAGS)})
     before = read_bytes(env_path)
 
     assert bootstrap_devin.main(["--dry-run", "--env", str(env_path)]) == 0

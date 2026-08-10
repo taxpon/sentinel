@@ -12,7 +12,8 @@ Four steps, in this order:
    already accepted, so this runs first even though the spec lists it last: a `401` discovered
    after three notes exist is three notes to clean up by hand.
 2. **tags** — `PUT /v3/organizations/{org}/tags` with the vocabulary of `devin/playbooks.py`
-   ([B7](../docs/blockers.md)).
+   ([B7](../docs/blockers.md)). A `PUT` **replaces the whole set**: any tag the organisation
+   allows that `devin/playbooks.py` does not list is removed by the first run.
 3. **knowledge** — the four notes of `docs/05-devin-integration.md#knowledge-notes`, whose ids are
    written into `.env` as `DEVIN_KNOWLEDGE_IDS`.
 4. **schedule** — the nightly vulnerability sweep, whose id is written into `.env` as
@@ -22,13 +23,16 @@ And a way to see all four before any of them happens:
 
     uv run scripts/bootstrap_devin.py --dry-run
 
-which reports what the run would create and writes nothing — no request that changes anything, and
-no line in `.env`. Step 1 still runs, and so do the capability probes: they are `GET`s, and a
-preview that could not tell you the token is rejected would be worth much less than one that can.
-What it says about each of the other three is what would *change* — the tag `PUT` sends the whole
-vocabulary and replaces whatever is registered, and the notes and the sweep are created or skipped
-according to what `.env` records, which is the thing that silently duplicates when `.env` has been
-replaced from `.env.example`.
+which reports what the run would do and writes nothing — no request that changes anything, and no
+line in `.env`. Step 1 still runs, and so do the capability probes: they are `GET`s, and a preview
+that could not tell you the token is rejected would be worth much less than one that can. So is one
+read the run itself does not make — the organisation's current allowed tags — because step 2 is a
+replacement and what it would *remove* is the part no operator can undo by re-running.
+
+What it reports for each of the other three steps is a change rather than an intention: which tags
+would be kept, added and removed, and whether `.env` already records ids for the notes and the
+sweep, which is what decides between "create" and "skip" — and the thing that silently duplicates
+when `.env` has been replaced from `.env.example`.
 
 And one thing this file does that is not part of that run:
 
@@ -736,20 +740,96 @@ async def _verify_token(devin: DevinClient) -> str:
     return f"accepted — {len(sessions)} session(s) visible, {ours} of them Sentinel's"
 
 
-async def _register_vocabulary(writer: Writer) -> str:
-    """Register the tag vocabulary. Idempotent because it is a `PUT` of the whole set.
+@dataclass(frozen=True, slots=True)
+class Vocabulary:
+    """What the organisation allows today, read so that a preview can say what it would lose.
 
-    Which is also why a dry run cannot say which of them are new. The `PUT` replaces the
-    organisation's vocabulary with what it carries, and v3 exposes no read of the current one —
-    `docs/05-devin-integration.md#endpoints-used` has this path under `PUT` and nothing else, so
-    there is nothing to compare against. The preview names the whole set and says what sending it
-    means; a tag registered outside this list, by hand in the dashboard, is what a run would drop.
+    `current` is `None` when the read did not answer — refused, or faulted — and the difference
+    matters more here than anywhere else in this file: a registration whose removals cannot be
+    named is exactly the case an operator must not be left to discover afterwards. `row` carries
+    that into the capability table beside B5 and B6.
+    """
+
+    row: Capable
+    current: tuple[str, ...] | None
+    why: str = ""
+    """Why `current` is `None`, short enough for the step line. The table row carries the rest."""
+
+    def change(self) -> str:
+        """The `PUT` as a change to what is there, rather than as a list of what is sent."""
+        listed = ", ".join(VOCABULARY)
+        if self.current is None:
+            return (
+                f"would replace the whole vocabulary with these {len(VOCABULARY)}: {listed} — and "
+                f"the current one could not be read ({self.why}), so this may remove tags nothing "
+                "here can name"
+            )
+        allowed = set(VOCABULARY)
+        present = set(self.current)
+        added = [tag for tag in VOCABULARY if tag not in present]
+        removed = [tag for tag in self.current if tag not in allowed]
+        return (
+            f"would replace the whole vocabulary: keeps {len(VOCABULARY) - len(added)}, "
+            f"adds {len(added)}"
+            + (f" ({', '.join(added)})" if added else "")
+            + (
+                f", and REMOVES {len(removed)}: {', '.join(removed)}"
+                if removed
+                else ", removes nothing"
+            )
+        )
+
+
+async def _read_vocabulary(devin: DevinClient) -> Vocabulary:
+    """Read the allowed tags, the way the probe reads a capability: an answer, or why there is none.
+
+    Not through `Writer` — this is a `GET`, and it is made only by `--dry-run`. A refusal is the
+    likely answer (the documented permission is `ManageEnterpriseSettings`) and it is an answer:
+    the run is still previewed, with the removals stated as unknowable. A fault is not, and leaves
+    the preview non-zero once everything has been printed, exactly as one on the probe does.
+    """
+    capability = Capability.TAG_DISCOVERY
+    try:
+        result = await devin.list_tags()
+    except DevinError as exc:
+        return Vocabulary(_fault("B7", capability, exc), None, "the table below says how")
+    if not result.available:
+        status = f" ({result.status_code})" if result.status_code is not None else ""
+        return Vocabulary(
+            _refused("B7", capability, result.reason.value, result.status_code),
+            None,
+            f"{result.reason.value}{status}",
+        )
+    current = result.value.tags
+    return Vocabulary(
+        Capable(
+            "B7",
+            capability.value,
+            REACHABLE,
+            f"{len(current)} tag(s) allowed today — what step 2 would replace",
+        ),
+        current,
+    )
+
+
+async def _register_vocabulary(writer: Writer, vocabulary: Vocabulary | None) -> str:
+    """Register the tag vocabulary.
+
+    Idempotent, and that word has been carrying more than it should: running this twice changes
+    nothing, but the `PUT` is a **replacement** — "Replace the full set of allowed session tags for
+    an organization" — so the *first* run removes every tag the organisation allows that
+    `devin/playbooks.py` does not list. v3 documents a `POST` that appends instead; which of the
+    two Sentinel should send is an open question `docs/05-devin-integration.md#endpoints-used`
+    records and this script does not answer.
+
+    What it does is make the answer visible before the write: on a dry run `vocabulary` holds what
+    is allowed today, and the summary is a change — kept, added, removed — rather than a list of
+    what would be sent.
     """
     await writer.register_vocabulary()
-    listed = ", ".join(VOCABULARY)
-    if writer.dry_run:
-        return f"would replace the whole vocabulary with these {len(VOCABULARY)}: {listed}"
-    return f"registered {len(VOCABULARY)} tags: {listed}"
+    if vocabulary is None:
+        return f"registered {len(VOCABULARY)} tags: {', '.join(VOCABULARY)}"
+    return vocabulary.change()
 
 
 async def _seed_knowledge(writer: Writer) -> str:
@@ -1110,9 +1190,12 @@ DRY_RUN_FOOTER = (
 
 
 DRY_RUN_LIMITS: tuple[str, ...] = (
-    f"which of the {len(VOCABULARY)} tags are new. The PUT replaces the organisation's vocabulary "
-    "as a whole and v3 exposes no read of the current one, so a tag somebody added in the "
-    "dashboard is dropped without this run naming it.",
+    "whether the vocabulary this preview reads is the one step 2 writes to. It reads "
+    "GET /v3/enterprise/organizations/{org_id}/tags, where the v3 reference documents an "
+    "organisation's allowed tags; step 2 registers at /v3/organizations/{org_id}/tags, which the "
+    "reference does not list at all. If those are two resources rather than one, what step 2 would "
+    "remove is not what was read here — and step 2 fails on the first real run instead "
+    "(docs/05-devin-integration.md#endpoints-used).",
     f"whether the notes and the sweep really exist. {KNOWLEDGE_IDS} and {SCHEDULE_ID} are the only "
     "record — nothing in v3 lists either — so what these steps would skip is what the file says, "
     "not what the organisation holds.",
@@ -1154,11 +1237,16 @@ async def bootstrap(
         print(f"  [{STEPS.index(step) + 1}/{len(STEPS)}] {step:<10} {summary}", file=out)
 
     done("token", await _verify_token(devin))
-    done("tags", await _register_vocabulary(writer))
+    # After step 1 and only on a dry run: the read that turns "what would be sent" into "what would
+    # change", and it is worth nothing if the token behind it was never checked.
+    vocabulary = await _read_vocabulary(devin) if dry_run else None
+    done("tags", await _register_vocabulary(writer, vocabulary))
     done("knowledge", await _seed_knowledge(writer))
     done("schedule", await _create_schedule(writer, settings))
 
     report.capabilities.extend(await _probe(devin, settings))
+    if vocabulary is not None:
+        report.capabilities.append(vocabulary.row)
     report.capabilities.append(_vocabulary_row(dry_run))
     print(CAPABILITY_HEADING, file=out)
     print("\n".join(_table(report.capabilities)), file=out)

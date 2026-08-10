@@ -332,15 +332,25 @@ uv run scripts/bootstrap_devin.py --dry-run
 It prints the four steps in the tense of a run that has not happened and writes nothing — no
 request that changes anything, and no line in `.env`. Step 1 and the capability probes still run,
 because they are reads: the preview tells you whether the token is accepted and which optional
-endpoints answer. For each of the other three it says what would *change* — the whole tag set the
-`PUT` would replace the vocabulary with, and whether `DEVIN_KNOWLEDGE_IDS` and `DEVIN_SCHEDULE_ID`
-already record ids, which is what decides between "create" and "skip". It closes with what it
-cannot tell you.
+endpoints answer. For each of the other three it says what would *change* — which tags the
+registration would keep, add and **remove**, and whether `DEVIN_KNOWLEDGE_IDS` and
+`DEVIN_SCHEDULE_ID` already record ids, which is what decides between "create" and "skip". It
+closes with what it cannot tell you.
 
-Worth reading rather than skipping. Step 4 registers a *recurring* sweep, so a run made by mistake
-leaves something that keeps acting on its own every night; and steps 3 and 4 are idempotent only
-through what `.env` records, so a run against a `.env` freshly copied from `.env.example` creates a
-second set of notes and a second sweep that nothing afterwards can tell apart.
+Read it rather than skipping it, for three reasons:
+
+- **Step 2 replaces.** `PUT .../tags` is "replace the full set of allowed session tags", so every
+  tag this organisation allows that `devin/playbooks.py` does not list is removed by the first run.
+  The preview reads the current vocabulary and names them. If it cannot read it — the documented
+  permission is `ManageEnterpriseSettings` — it says so, and that sentence means the run may remove
+  tags nobody here can name; read them in the Devin web app before continuing. Which path and which
+  method the registration should use is itself still open: see the note under
+  [Endpoints used](./05-devin-integration.md#endpoints-used).
+- **Step 4 recurs.** The sweep is a schedule, so a run made by mistake leaves something that keeps
+  acting on its own every night.
+- **Steps 3 and 4 are idempotent only through `.env`.** A run against a `.env` freshly copied from
+  `.env.example` creates a second set of notes and a second sweep that nothing afterwards can tell
+  apart.
 
 ```bash
 make bootstrap-devin
