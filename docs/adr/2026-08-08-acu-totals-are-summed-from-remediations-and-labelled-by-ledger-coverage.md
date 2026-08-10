@@ -1,6 +1,6 @@
 ---
 title: ACU totals are summed from the window's remediations, and cost.source reports ledger coverage
-status: accepted
+status: superseded
 date: 2026-08-08
 type: architecture
 areas: [analytics, devin]
