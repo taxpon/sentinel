@@ -64,6 +64,10 @@ the path nor the method of the registration itself is changed by that preview
 | `max_acu_limit` | `ACU_CAPS[issue_class]` |
 | `resumable` | `true` — required for the review-fix loop |
 
+`repos` names the repository but does not grant access to it — Devin clones, pushes and opens the
+pull request under its own GitHub connection, which is not `GITHUB_TOKEN` and is configured in Devin
+rather than here ([B15](./blockers.md#b15)).
+
 Response fields consumed: `session_id`, `url`, `status`, `tags`, `acus_consumed`,
 `pull_requests[]`. On `GET`, additionally `structured_output` and `status_detail` — the latter
 distinguishes `working` from `waiting_for_user`, which is how a stalled session is detected. Their
