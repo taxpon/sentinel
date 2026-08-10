@@ -83,3 +83,27 @@ believing a shape a test asserts. Read three things on it: the request schema, t
 and any banner or callout above them. Where the index and the page disagree, the page wins; where
 the page and your own spec disagree, the page wins and the spec gets fixed in the same change.
 Anything left unverified says so in the code, next to the field it is unsure about.
+
+## Where the reference is silent, read the code that will actually run
+
+The page above the code is the first source, not the last one. SQLAlchemy's asyncpg dialect
+documents no SSL handling at all — and a fetched summary of that page confidently described
+`ssl=require` and `ssl=prefer` as though it did, because those values are real in asyncpg and the
+summary joined them up. `grep -n ssl` over the installed dialect returns nothing: it forwards every
+URL query parameter verbatim as a keyword argument and arbitrates none of them, which is a fact only
+the source states.
+
+That mattered because two libraries each did half the job. asyncpg owns a `sslmode` -> `ssl` rename,
+but it lives in its DSN parser, and SQLAlchemy never hands asyncpg a DSN — so a URL every provider
+issues reached a driver with no idea what `sslmode` meant, and a deploy died on it.
+
+**Rule:** when the documentation does not answer the question, read the installed source and say
+which file and line settled it. Where a value transcribes someone else's signature or enum, add a
+test comparing it to the real thing — a transcription nobody checks goes stale in the direction that
+rejects input the user was entitled to write.
+
+**And be honest about what a local test proves.** This deploy failure could not be reproduced
+against the Compose database: that server declines TLS politely and the connection falls back, while
+the deployed one accepts and then resets, which is not recoverable. Both passed locally. A green
+suite was evidence about our code, not about the connection — say so in the test rather than letting
+the tick imply more.
