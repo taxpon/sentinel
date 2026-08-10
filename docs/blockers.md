@@ -225,13 +225,13 @@ scheduled sweep, the demo. Also gates [B5](#b5), [B6](#b6) and [B7](#b7).
 suite (Devin is faked with `respx`), the analytics layer and the dashboard all develop without
 credentials ([08](./08-testing.md)). This blocker gates the runs, not the build.
 
-**Response shapes: one endpoint is now verified, 2026-08-10.** Anything in the code or the specs
-marked *unverified (B8)* means the field names were taken from prose rather than from a call. One
-call has now been made.
+**Response shapes: one endpoint has been called, 2026-08-10.** Every endpoint has since been read
+against its own page of the v3 OpenAPI reference (below), which is a weaker thing than a call: it
+says what the API is documented to send, not what it sent. Exactly one call has been made.
 
 | | |
 |---|---|
-| `GET /v3/organizations/{org_id}/sessions` | **Verified.** `200`. Full field list recorded in [05](./05-devin-integration.md#response-shapes) |
+| `GET /v3/organizations/{org_id}/sessions` | **Verified by a call.** `200`. Full field list recorded in [05](./05-devin-integration.md#response-shapes) |
 | `POST /v3/organizations/{org_id}/sessions` | Not called. The create-session *request* body is still unverified against a real `201` |
 | `POST …/sessions/{id}/messages` | Not called |
 | `POST …/sessions/{id}/tags`, `PUT /v3/organizations/{org_id}/tags` | Not called — and see [B14](#b14) |
@@ -253,6 +253,46 @@ failed the parse outright and would have stalled every remediation holding a pul
 `pr_number` is what resolves a check suite or a review to its remediation — so the review-fix loop
 would have engaged for nothing, silently, while the traceback pointed elsewhere. Both are fixed; the
 number is now derived from `pr_url`.
+
+**What "unverified" now means, after the shape audit.** Every endpoint in
+[the table](./05-devin-integration.md#endpoints-used) has been read back against its own page in
+the v3 OpenAPI reference, in both directions. B8 no longer covers "we do not know the field names":
+we do, for all twelve. Four had been guessed wrong, and each would have failed at a different
+moment — `POST /knowledge/notes` rejected outright for a missing `trigger`; `POST /schedules`
+succeeding and then failing to parse the `scheduled_session_id` it needed to record; the daily
+consumption body silently unreadable, so the budget guard would have run on its fallback for ever;
+and `GET /enterprise/metrics/sessions` raising a `422` for two window parameters nobody had noticed
+were required. All four are fixed, and the fixtures now carry the reference's shapes rather than
+the ones we hoped for.
+
+What B8 still gates is everything the reference does not state, which is now a short list:
+
+1. **Whether `session_id` is already `devin-` prefixed.** The per-session paths take a `devin_id`
+   described as "the session ID prefixed with `devin-`". If `SessionResponse.session_id` is bare,
+   every `GET`, message and tag call is aimed one prefix short. A single live create-then-get
+   settles it, and it is the first thing to check.
+2. **The unit of every epoch integer.** `date`, `created_at` and `updated_at` are typed `integer`
+   with no unit. The consumption date is read as either seconds or milliseconds because both
+   misreadings land in 1970 and would have shown up as a spend of zero rather than as an error.
+3. **The default window of `GET /consumption/daily`.** `time_before` and `time_after` are optional
+   and no default is documented, so what "daily" covers when neither is sent is unknown. The budget
+   guard reads a single day out of it, so a window that excludes today feeds it a wrong number
+   silently. Confirm before the guard is trusted to stop work.
+4. **The billing day is Pacific, not UTC.** The reference is explicit — "midnight PST … corresponds
+   to 08:00:00 UTC" — so a guard comparing a UTC `today` is reading a day up to eight hours out of
+   step with Devin's own.
+5. **The tag registration path**, which is [B14](#b14) and unchanged by this audit.
+
+Two premises turned out to be wrong in the other direction, and both are decisions rather than
+bugs: the organisation scope carries playbook writes as well as reads (so [B6](#b6)'s premise is
+wrong), and `GET /knowledge/notes` and `GET /schedules` both exist — so `.env` is not the only
+possible record of what `make bootstrap-devin` created
+([ADR](./adr/2026-08-08-env-is-the-bootstrap-scripts-record.md)).
+
+The one call and the reference agree, which is worth stating: `pr_url`, `pr_state`, the absent PR
+number, the `items` envelope and the integer timestamps are all in `SessionResponse` and
+`SessionPullRequest` as documented. The reference would have caught all three of the shapes that
+call found, and did catch four more on endpoints nobody has called.
 
 ### B9 — Public URL required for webhook delivery {#b9}
 

@@ -21,9 +21,12 @@ Three things this module fixes, which a hand-built dictionary at each call site 
   field, is a protocol violation and fails the parse. Coercing it would hide the one condition that
   says our reading of the API is wrong.
 
-Field shapes marked *unverified* in the comments below are not documented in the spec and cannot be
-checked until credentials exist (B8). They are the payloads Sentinel sends or reads for endpoints
-the spec names but does not specify field by field.
+Every shape here is now taken from the v3 OpenAPI reference page for its own endpoint, and each
+model says which schema it is. That audit found four names invented rather than read — the
+schedule's id, the note's id, the consumption envelope and the session total — and the comments
+record what the reference says so the next reader checks the page rather than the guess. What
+remains genuinely undocumented is marked *unverified* and still cannot be settled without
+credentials (B8).
 """
 
 from __future__ import annotations
@@ -36,7 +39,6 @@ from enum import StrEnum
 from typing import Annotated, Any, Final, Literal
 
 from pydantic import (
-    AliasChoices,
     BaseModel,
     BeforeValidator,
     ConfigDict,
@@ -227,10 +229,19 @@ class Session(BaseModel):
 def _unwrap(payload: Any, *keys: str) -> Any:
     """A list payload that may arrive bare or wrapped under one of `keys`.
 
-    The spec names the listing endpoints but not their envelope, and guessing one of the two would
-    fail on the first real call for a reason nobody could read off a traceback. That tolerance paid
-    for itself on 2026-08-10: the session listing arrived under `items`, which was not the first
-    guess. The other listings remain unobserved (B8).
+    The envelope used to be guessed, several at a time, because the spec named the listing
+    endpoints but not their shape. That tolerance paid for itself on 2026-08-10, when the session
+    listing arrived under `items` — which was not the first guess.
+
+    Each caller now passes the **one** name its own reference page gives: `items` for the three
+    `PaginatedResponse[...]` listings, `consumption_by_date` for consumption, `tags` for the
+    vocabulary. That is `PullRequest`'s argument for refusing a `url` alias, applied to the
+    envelopes: the tolerance stood in for a fact nobody had, and now the fact is on the page. A
+    second accepted name would only let a rename keep parsing under the name the API had stopped
+    sending.
+
+    What is kept is the tolerance for a **bare** list, which no endpoint sends and which costs
+    nothing — it is what lets a fixture state only the array it is about.
     """
     if isinstance(payload, Mapping):
         for key in keys:
@@ -240,11 +251,12 @@ def _unwrap(payload: Any, *keys: str) -> Any:
 
 
 class SessionPage(BaseModel):
-    """The body of `GET /v3/organizations/{org_id}/sessions`.
+    """The body of `GET /v3/organizations/{org_id}/sessions` — `PaginatedResponse[SessionResponse]`
+    in the v3 reference, and confirmed by the call of 2026-08-10.
 
-    Observed on 2026-08-10: the envelope is `items`, beside `end_cursor`, `has_next_page` and
-    `total`. The three pagination keys are read by nothing and so modelled by nothing — see
-    `DevinClient.list_sessions`, which returns one page.
+    The envelope is `items`, beside `end_cursor`, `has_next_page` and `total`. The three pagination
+    keys are read by nothing and so modelled by nothing — see `DevinClient.list_sessions`, which
+    returns one page.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -254,7 +266,7 @@ class SessionPage(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _accept_bare_list(cls, payload: Any) -> Any:
-        return {"sessions": _unwrap(payload, "sessions", "data", "items")}
+        return {"sessions": _unwrap(payload, "items")}
 
 
 class CreateSessionRequest(BaseModel):
@@ -289,13 +301,15 @@ class CreateSessionRequest(BaseModel):
 class KnowledgeNote(BaseModel):
     """A note seeded once at bootstrap, whose id becomes an entry of `DEVIN_KNOWLEDGE_IDS`.
 
-    *Unverified* (B8): `docs/05-devin-integration.md` lists what the four notes say, not the shape
-    the endpoint returns. `id` is what the bootstrap script needs and the rest is ignored.
+    *Verified against the reference*: `KnowledgeNoteResponse` names the identifier `note_id` and
+    requires it, along with `name`. It is the only field the bootstrap script needs and the rest is
+    ignored. The `id` and `knowledge_id` spellings this model used to accept were guesses at an
+    undocumented shape; the reference documents neither, so they are gone.
     """
 
     model_config = ConfigDict(frozen=True)
 
-    id: str = Field(validation_alias=AliasChoices("id", "note_id", "knowledge_id"))
+    id: str = Field(validation_alias="note_id")
     name: str | None = None
 
 
@@ -307,14 +321,15 @@ class Playbook(BaseModel):
     deliberately not read — the four texts in `docs/playbooks/` are the record of what a playbook
     says, and printing bodies would bury the ids the listing exists to surface.
 
-    The v3 reference spells the id `playbook_id`; `id` is accepted alongside it because every other
-    bootstrap response here returns its id under one name or the other and none of them has been
-    seen for real (B8).
+    *Verified against the reference*: `PlaybookResponse` requires `playbook_id`, `title` and
+    `access_type` (`enterprise` or `org`). The bare `id` accepted here before was a guess carried
+    over from the other bootstrap responses, and those turned out to spell their ids differently
+    again — `note_id` and `scheduled_session_id`. There is no `id` anywhere in v3 to accept.
     """
 
     model_config = ConfigDict(frozen=True)
 
-    playbook_id: str = Field(validation_alias=AliasChoices("playbook_id", "id"))
+    playbook_id: str
     title: str
     access_type: str | None = None
 
@@ -337,7 +352,7 @@ class PlaybookPage(BaseModel):
     def _accept_bare_list(cls, payload: Any) -> Any:
         page = payload if isinstance(payload, Mapping) else {}
         return {
-            "playbooks": _unwrap(payload, "items", "playbooks", "data"),
+            "playbooks": _unwrap(payload, "items"),
             "has_next_page": page.get("has_next_page") or False,
         }
 
@@ -359,39 +374,79 @@ class TagVocabulary(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _accept_bare_list(cls, payload: Any) -> Any:
-        return {"tags": _unwrap(payload, "tags", "allowed_tags", "data", "items") or ()}
+        # `TagsResponse` is `{"tags": [...]}` and nothing else; the `allowed_tags`, `data` and
+        # `items` envelopes this used to try were guesses at a shape the reference states.
+        return {"tags": _unwrap(payload, "tags") or ()}
 
 
 class Schedule(BaseModel):
     """The nightly vulnerability sweep, created once at bootstrap.
 
-    *Unverified* (B8): the spec tabulates the fields sent, not the response.
+    *Verified against the reference*: `ScheduleResponse` carries no `id` and no `schedule_id`. Its
+    identifier — the one required field that names the schedule — is **`scheduled_session_id`**,
+    and that is what `DEVIN_SCHEDULE_ID` records. Both spellings this model used to accept were
+    invented, so bootstrap step 4 would have failed to parse the very response it succeeded in
+    creating, leaving a sweep running that `.env` had no id for.
     """
 
     model_config = ConfigDict(frozen=True)
 
-    id: str = Field(validation_alias=AliasChoices("id", "schedule_id"))
+    id: str = Field(validation_alias="scheduled_session_id")
     name: str | None = None
 
 
 # --- Consumption and metrics ----------------------------------------------------------------------
 
 
-class DailyConsumption(BaseModel):
-    """One day of ACU spend.
+MILLISECONDS_FROM: Final = 1e11
+"""Above this, an epoch is read as milliseconds rather than seconds. `1e11` seconds is the year
+5138 and `1e11` milliseconds is 1973, so no timestamp either side of it is ambiguous."""
 
-    *Unverified* (B8): the spec names the endpoint and what it is for — the budget guard and the
-    cost panel — but not its field names.
+
+def _date_from_epoch(value: Any) -> Any:
+    """`ConsumptionByDateResponse.date` as the day it names.
+
+    The reference types it `integer` and says what the number means — "Billing cycles use midnight
+    PST (Pacific Standard Time) as the day boundary, which corresponds to 08:00:00 UTC" — but not
+    which unit the integer is in. Both readings are handled, because the failure is silent either
+    way round: a millisecond value read as seconds is 1970 and a second value read as milliseconds
+    is 1970 too, and `acus_on(today)` would return 0.0 rather than raise.
+
+    The instant falls at 08:00 UTC on the billing day, so the UTC calendar date *is* the day meant.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return value
+    seconds = value / 1000 if abs(value) >= MILLISECONDS_FROM else value
+    return dt.datetime.fromtimestamp(seconds, dt.UTC).date()
+
+
+class DailyConsumption(BaseModel):
+    """One day of ACU spend — the reference's `ConsumptionByDateResponse`.
+
+    *Verified against the reference*: `date` (an epoch integer, not the ISO string this model used
+    to demand) and `acus`, both required. `acus_by_product` breaks the same total down by product
+    and is ignored. The `acus_consumed` and `acu` spellings accepted here before were guesses at a
+    field the reference names outright.
     """
 
     model_config = ConfigDict(frozen=True)
 
-    date: dt.date
-    acus: float = Field(validation_alias=AliasChoices("acus", "acus_consumed", "acu"))
+    date: Annotated[dt.date, BeforeValidator(_date_from_epoch)]
+    acus: float
 
 
 class Consumption(BaseModel):
-    """The body of `GET /v3/organizations/{org_id}/consumption/daily`."""
+    """The body of `GET /v3/organizations/{org_id}/consumption/daily` — `ConsumptionResponse`.
+
+    *Verified against the reference*: the days arrive under **`consumption_by_date`**, which is not
+    one of the four envelopes this model used to look under. None of them matched, so every real
+    response would have failed to parse and quietly degraded the budget guard to summing
+    `acus_consumed` across sessions — the fallback firing permanently, with nothing but a warning
+    line to say so.
+
+    The reference also returns a `total_acus` for the window. `total_acus` below stays a sum of the
+    days rather than that figure, because it is the days `acus_on` reads and the two must agree.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -400,7 +455,7 @@ class Consumption(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _accept_bare_list(cls, payload: Any) -> Any:
-        return {"days": _unwrap(payload, "days", "consumption", "daily", "data")}
+        return {"days": _unwrap(payload, "consumption_by_date")}
 
     @property
     def total_acus(self) -> float:
@@ -416,27 +471,22 @@ class SessionMetrics(BaseModel):
     """The body of `GET /v3/enterprise/metrics/sessions` — the aggregates B5 names, which the
     dashboard prefers over the ones Sentinel derives from its own tables.
 
-    *Unverified* (B8): the spec asks for "merged-PR and ACU aggregates" and B5 names the two
-    figures, but no credential exists to check the field names against, and this is the one model
-    here whose names were invented rather than quoted. Aliases cover the spellings the same figure
-    plausibly arrives under; a body that still does not parse degrades the panel to the derived
-    figures rather than failing the request, which is the whole point of the capability being
-    optional.
+    *Verified against the reference*: `SessionMetricsResponse` requires all three of these, and the
+    two guessed names were right — `sessions_with_merged_prs_count` and `avg_acus_per_session` are
+    exactly what it calls them. The third was not: the session total is
+    **`sessions_created_count`**, and neither `sessions_count` nor `total_sessions` exists. It
+    stays optional because nothing reads it yet.
+
+    The response carries more than this — counts by origin, by size, with a playbook, with a search
+    — none of which any panel asks for. A body that does not parse still degrades the panel to the
+    derived figures rather than failing the request.
     """
 
     model_config = ConfigDict(frozen=True)
 
-    sessions_with_merged_prs_count: int = Field(
-        validation_alias=AliasChoices(
-            "sessions_with_merged_prs_count", "sessions_with_merged_prs", "merged_pr_count"
-        )
-    )
-    avg_acus_per_session: float = Field(
-        validation_alias=AliasChoices("avg_acus_per_session", "average_acus_per_session")
-    )
-    sessions_count: int | None = Field(
-        default=None, validation_alias=AliasChoices("sessions_count", "total_sessions")
-    )
+    sessions_with_merged_prs_count: int
+    avg_acus_per_session: float
+    sessions_created_count: int | None = None
 
 
 # --- Degradation ----------------------------------------------------------------------------------

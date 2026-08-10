@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime as dt
 import json
 import os
 import re
@@ -90,7 +91,7 @@ from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, TextIO
+from typing import Any, Final, TextIO
 
 from pydantic import Field
 
@@ -684,7 +685,7 @@ class Writer:
 
         async def create() -> None:
             created = await self._devin.create_knowledge_note(
-                name=note.name, body=note.body, trigger_description=note.trigger
+                name=note.name, body=note.body, trigger=note.trigger
             )
             recorded.append(_checked_id(_label("knowledge"), "knowledge note", created.id))
             self.env.record(KNOWLEDGE_IDS, json.dumps(recorded, separators=(",", ":")))
@@ -836,9 +837,15 @@ async def _seed_knowledge(writer: Writer) -> str:
     """Create whichever of the four notes `.env` does not already record the id of.
 
     `DEVIN_KNOWLEDGE_IDS` is positional — the *n*-th id belongs to the *n*-th entry of `NOTES` — so
-    a run that stopped after two notes resumes at the third instead of creating four more. No v3
-    endpoint lists an organisation's knowledge notes, so this record is the only thing standing
-    between a second run and a fifth note.
+    a run that stopped after two notes resumes at the third instead of creating four more. This
+    record is the only thing this script consults before creating a fifth note.
+
+    It was believed to be the only thing that *could* be consulted. That is not so: the v3
+    reference documents `GET /v3/organizations/{org_id}/knowledge/notes`, which lists an
+    organisation's notes under the same `ManageAccountKnowledge` permission the creation needs.
+    Reading the organisation instead of the file would make idempotence a fact rather than a
+    bookkeeping convention, and it would change what this script does — so it is left to whoever
+    owns `docs/adr/2026-08-08-env-is-the-bootstrap-scripts-record.md` rather than taken here.
 
     The record is written after *each* creation rather than once at the end: an id that was not
     recorded belongs to a note nobody can find again, and the point of the record is that a failure
@@ -940,10 +947,24 @@ async def _probe(devin: DevinClient, settings: DevinSettings) -> list[Capable]:
     ]
 
 
+PROBE_WINDOW_DAYS: Final = 30
+"""How far back the B5 probe asks for aggregates over.
+
+`GET /v3/enterprise/metrics/sessions` requires `time_after` and `time_before`, so the probe cannot
+avoid naming a window. What it is probing is whether the token carries `ViewAccountMetrics` — the
+figures it prints are an illustration that it worked, not a figure anything acts on — and thirty
+days is long enough that a working organisation has something in it. Whatever window the dashboard
+panel should use when it is built is a separate decision and does not belong to this probe."""
+
+
 async def _probe_session_metrics(devin: DevinClient) -> Capable:
     capability = Capability.SESSION_METRICS
+    now = dt.datetime.now(dt.UTC)
     try:
-        metrics = await devin.session_metrics()
+        metrics = await devin.session_metrics(
+            time_after=int((now - dt.timedelta(days=PROBE_WINDOW_DAYS)).timestamp()),
+            time_before=int(now.timestamp()),
+        )
     except DevinError as exc:
         return _fault("B5", capability, exc)
     if not metrics.available:
