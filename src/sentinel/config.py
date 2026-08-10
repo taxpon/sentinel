@@ -40,6 +40,18 @@ PLAIN_POSTGRES_SCHEMES = frozenset({"postgres", "postgresql"})
 
 LogLevel = Literal["debug", "info", "warning", "error", "critical"]
 
+# NoDecode turns off the built-in JSON handling so that a malformed value fails as a validation
+# error naming the variable, rather than as a SettingsError raised before validation begins.
+#
+# Held immutably. The map decides which playbook Devin runs for an issue class, on an object every
+# module in the process shares, so a stray write to it would silently redirect the remediation;
+# freezing the model stops a field being rebound but not edited in place.
+#
+# Named rather than written inline because `scripts/bootstrap_devin.py --list-playbooks` restates
+# the field with a default — it is the option that *finds* the ids, so it cannot require them — and
+# a second copy of this annotation is a second thing to keep in step.
+PlaybookIds = Annotated[Mapping[str, str], NoDecode, AfterValidator(MappingProxyType)]
+
 
 class ConfigurationError(RuntimeError):
     """The environment does not describe a usable configuration."""
@@ -150,13 +162,7 @@ class DevinSettings(TargetSettings):
     devin_api_token: SecretStr = Field(min_length=1)
     devin_org_id: str = Field(min_length=1)
     devin_enterprise_id: str | None = None
-    # NoDecode turns off the built-in JSON handling so that a malformed value fails as a validation
-    # error naming the variable, rather than as a SettingsError raised before validation begins.
-    #
-    # Both are held immutably. This map decides which playbook Devin runs for an issue class, on an
-    # object every module in the process shares, so a stray write to it would silently redirect the
-    # remediation; freezing the model above stops a field being rebound but not edited in place.
-    devin_playbook_ids: Annotated[Mapping[str, str], NoDecode, AfterValidator(MappingProxyType)]
+    devin_playbook_ids: PlaybookIds
     devin_knowledge_ids: Annotated[tuple[str, ...], NoDecode] = ()
 
     @field_validator("devin_playbook_ids", mode="before")
