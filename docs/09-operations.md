@@ -340,12 +340,14 @@ closes with what it cannot tell you.
 
 Read it rather than skipping it, for three reasons:
 
-- **Step 2 replaces.** `PUT .../tags` is "replace the full set of allowed session tags", so every
-  tag this organisation allows that `devin/playbooks.py` does not list is removed by the first run.
-  The preview reads the current vocabulary and names them. If it cannot read it — the documented
-  permission is `ManageEnterpriseSettings` — it says so, and that sentence means the run may remove
-  tags nobody here can name; read them in the Devin web app before continuing. Which path and which
-  method the registration should use is itself still open: see the note under
+- **Step 2 replaces — if it is allowed at all.** `PUT .../tags` is "replace the full set of allowed
+  session tags", so every tag this organisation allows that `devin/playbooks.py` does not list is
+  removed by the first run. The preview reads the current vocabulary and names them. If it cannot
+  read it — the documented permission is `ManageEnterpriseSettings`, and on this organisation the
+  read answers `403` ([B7](./blockers.md#b7)) — it says the write is likely to be refused too, and
+  that if it is accepted instead the run may remove tags nobody here can name; read them in the
+  Devin web app before continuing. Which path and which method the registration should use is itself
+  still open: see the note under
   [Endpoints used](./05-devin-integration.md#endpoints-used).
 - **Step 4 recurs.** The sweep is a schedule, so a run made by mistake leaves something that keeps
   acting on its own every night.
@@ -365,6 +367,20 @@ make bootstrap-devin
 
 Every step is idempotent, so a second run repeats nothing that already succeeded — but idempotence
 for the last two *is* the `.env` record, which is why the preview names what it holds.
+
+**Step 2 may be refused, and that does not stop the run.** Allowed-tag management is documented as
+an enterprise feature — `ManageEnterpriseSettings`, with the session tags feature enabled for the
+enterprise — and this organisation appears not to have it ([B7](./blockers.md#b7)). A `403` or a
+`404` on the registration is therefore reported rather than fatal: step 2 prints one line saying the
+vocabulary was **not** registered, and steps 3 and 4 create the knowledge notes and the nightly
+sweep as normal. Nothing else needs the registration to have succeeded — Sentinel *applies* tags to
+sessions, which is a different call.
+
+Read that line rather than skipping past it. It is not "handled": if Devin does validate session
+tags against a registered vocabulary, the first `POST /sessions` fails `422`, and that is the moment
+B7 is answered. Any other answer to the registration — a `401`, a `5xx`, a body that will not parse
+— still fails the run at step 2, because a rejected token is something to fix rather than a
+capability to work around.
 
 ### 3. Webhook
 
@@ -429,7 +445,7 @@ Step 5 is not optional. Unresolved and stalled work stays visible by design
 | Deliveries succeed, nothing happens | Label name mismatch, or the event was mapped to `ignored` | `select event, action, handler_result from webhook_delivery order by id desc limit 10;` |
 | Sessions created but state never advances | Poller is down, or the session is `waiting_for_user` | `docker compose logs poller`; check `status_detail` on the session |
 | Jobs stuck in `deferred` | Concurrency cap or ACU budget | `select kind, status, count(*) from job group by 1,2;`, then check `acu_ledger` |
-| `422` creating a session | Tag not registered in the organisation vocabulary | Re-run `make bootstrap-devin` ([B7](./blockers.md)) |
+| `422` creating a session | Tag not registered in the organisation vocabulary | This answers [B7](./blockers.md#b7) — record it there. Re-run `make bootstrap-devin` and read step 2's line: if it says the vocabulary was **not** registered, the registration is refused and re-running cannot fix it |
 | Cost panel labelled `derived` | Enterprise metrics endpoint unavailable | Expected without enterprise scope ([B5](./blockers.md)) — the figure is computed locally |
 
 ## Before making the repository public
