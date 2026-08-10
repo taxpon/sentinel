@@ -68,7 +68,7 @@ seed-issues:  ## Create or update the GitHub task issues from docs/tasks.yaml
 
 bootstrap: bootstrap-github bootstrap-devin  ## One-time setup of the target repo and Devin org
 
-bootstrap-devin:  ## Register tags, knowledge and the nightly schedule in the Devin org
+bootstrap-devin:  ## Register the tag vocabulary and the knowledge notes in the Devin org
 	$(UV) run scripts/bootstrap_devin.py
 
 devin-playbooks:  ## List the Devin playbooks and print the DEVIN_PLAYBOOK_IDS to paste into .env

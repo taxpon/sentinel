@@ -12,6 +12,22 @@ supersedes:
 
 # The bootstrap capability probe reports a refusal and fails on a fault
 
+> **Amended 2026-08-10.** Two of the facts this record rests on have changed. What follows is kept
+> as written rather than rewritten, because it is what was decided at the time — read it with these
+> two corrections in hand.
+>
+> - **Tag registration is no longer one of the fatal steps.** The live organisation answered `403`
+>   to the vocabulary read, allowed-tag management appears to be an enterprise feature it does not
+>   have, and failing there stopped the steps that follow over a product that is optional. A `403`
+>   or `404` on it is now a reported degradation, like the optional capabilities ([B7](../blockers.md#b7),
+>   [B14](../blockers.md#b14)). `401` and everything else still fail the run, which is the line this
+>   record drew and it still holds.
+> - **There are three steps, not four.** The nightly sweep schedule was removed
+>   ([B16](../blockers.md#b16)).
+>
+> What is unchanged is the decision itself: a refusal is reported, a fault is not.
+
+
 ## Context
 
 The fourth thing `docs/09-operations.md#bootstrap` asks of `make bootstrap-devin` is that it
@@ -71,10 +87,11 @@ Per blocker:
   rejects an unregistered tag is only observable at session creation, which this script does not
   do. B7's own verification step says as much.
 
-The four steps remain fatal to each other — a failed tag registration stops the run before the
-notes are created. That is not in tension with the above: they are what `docs/09-operations.md`
-*requires* the script to do, and a half-registered organisation is a state to fix rather than a
-capability to work around. Only the optional capabilities are reported and moved past.
+The steps remain fatal to each other — a failed one stops the run before the later ones. That is
+not in tension with the above: they are what `docs/09-operations.md` *requires* the script to do,
+and a half-bootstrapped organisation is a state to fix rather than a capability to work around.
+Only the optional capabilities are reported and moved past.
+
 
 ## Alternatives considered
 

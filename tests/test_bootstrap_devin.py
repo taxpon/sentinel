@@ -6,10 +6,12 @@ request body** or on the bytes of the `.env` it wrote, and nothing reaches the n
 
 Three properties carry the weight.
 
-**Idempotence.** The script is run more than once by design, and `POST /knowledge/notes` and
-`POST /schedules` create something new every time they are called. Running the whole thing twice
-must leave four notes and one schedule, not eight and two — so the double run is a test, not a
-paragraph, and so is resuming after a failure part-way through the notes.
+**Idempotence.** The script is run more than once by design, and `POST /knowledge/notes` creates
+something new every time it is called. Running the whole thing twice must leave four notes, not
+eight — so the double run is a test, not a paragraph, and so is resuming after a failure part-way
+through them. What that idempotence rests on is `.env` alone, and the one case it no longer covers
+— a `.env` blanked from `.env.example` — is pinned here as the accepted loss it is
+([B16](../docs/blockers.md#b16)).
 
 **`.env` survives.** It holds real credentials and this script rewrites it. The tests pin what a
 rewrite may touch (one assignment line), what it may not (every other byte, the ordering, the file
@@ -75,16 +77,14 @@ SESSIONS = f"{ORGANIZATION}/sessions"
 TAGS = f"{ORGANIZATION}/tags"
 ALLOWED_TAGS = f"/v3/enterprise/organizations/{ORG}/tags"
 NOTES = f"{ORGANIZATION}/knowledge/notes"
-SCHEDULES = f"{ORGANIZATION}/schedules"
 PLAYBOOKS = f"{ORGANIZATION}/playbooks"
 CONSUMPTION = f"{ORGANIZATION}/consumption/daily"
 ENTERPRISE_METRICS = "/v3/enterprise/metrics/sessions"
 
 NOTE_IDS = ("note-tests", "note-lint", "note-pr", "note-paths")
-SCHEDULE = "sched-nightly-1"
 
 # A `.env` shaped like the one `make db` copies from `.env.example`: comments, blank lines, a
-# required value already filled in, and the two variables this script writes.
+# required value already filled in, and the one variable this script writes.
 ENV_TEXT = """\
 # Sentinel configuration.
 
@@ -149,17 +149,15 @@ def wired(devin_api: FakeAPI) -> FakeAPI:
     devin_api.responds("GET", SESSIONS, 200, {"items": []})
     devin_api.responds("PUT", TAGS, 200, {})
     respond_with_notes(devin_api, NOTE_IDS)
-    devin_api.responds("POST", SCHEDULES, 200, {"scheduled_session_id": SCHEDULE})
     devin_api.responds("GET", CONSUMPTION, 200, a_consumption_body((dt.date(2026, 8, 8), 12.5)))
     return devin_api
 
 
 @pytest.fixture
 def no_recorded_ids(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """`main()` reads the real environment; a developer who exported either variable would
-    otherwise change what the script decides to create."""
-    for name in (bootstrap_devin.KNOWLEDGE_IDS, bootstrap_devin.SCHEDULE_ID):
-        monkeypatch.delenv(name, raising=False)
+    """`main()` reads the real environment; a developer who exported the variable would otherwise
+    change what the script decides to create."""
+    monkeypatch.delenv(bootstrap_devin.KNOWLEDGE_IDS, raising=False)
     yield
 
 
@@ -280,20 +278,19 @@ async def test_a_refused_registration_is_reported_and_the_run_goes_on(
 ) -> None:
     """The organisation the owner ran this against answered `403` to the *read* of its allowed
     tags, and allowed-tag management is documented as an enterprise feature — so a refused write is
-    an ordinary outcome here, not a fault. Failing on it would cost steps 3 and 4, whose product is
-    the knowledge notes and the nightly sweep, over a step nothing downstream reads: Sentinel
-    depends on *applying* tags to a session, not on the vocabulary being pre-registered."""
+    an ordinary outcome here, not a fault. Failing on it would cost step 3, whose product is the
+    knowledge notes, over a step nothing downstream reads: Sentinel depends on *applying* tags to a
+    session, not on the vocabulary being pre-registered."""
     wired.responds("PUT", TAGS, status_code, {"detail": "no"})
 
     report = await run(devin, settings, env)
 
     assert len(wired.sent("POST", NOTES)) == 4
-    assert len(wired.sent("POST", SCHEDULES)) == 1
-    assert env_value(env_path, bootstrap_devin.SCHEDULE_ID) == SCHEDULE
+    assert json.loads(env_value(env_path, bootstrap_devin.KNOWLEDGE_IDS) or "") == list(NOTE_IDS)
 
     tags = report.steps["tags"]
     assert tags.startswith(f"NOT registered — Devin refused the PUT ({reason} ({status_code}))")
-    assert "Steps 3 and 4 continue" in tags
+    assert "Step 3 continues" in tags
 
 
 @pytest.mark.parametrize("status_code", [403, 404])
@@ -343,10 +340,10 @@ async def test_a_registration_that_faults_still_fails_the_run(
     with pytest.raises(bootstrap_devin.BootstrapError) as failure:
         await run(devin, settings, env)
 
-    assert failure.value.step == "step 2 of 4 (tags)"
+    assert failure.value.step == "step 2 of 3 (tags)"
     assert str(status_code) in failure.value.problem
     assert remedy in failure.value.remedy
-    assert wired.sent("POST", NOTES) == [] and wired.sent("POST", SCHEDULES) == []
+    assert wired.sent("POST", NOTES) == []
 
 
 async def test_a_registration_answered_with_something_that_is_not_json_still_fails_the_run(
@@ -359,7 +356,7 @@ async def test_a_registration_answered_with_something_that_is_not_json_still_fai
     with pytest.raises(bootstrap_devin.BootstrapError) as failure:
         await run(devin, settings, env)
 
-    assert failure.value.step == "step 2 of 4 (tags)"
+    assert failure.value.step == "step 2 of 3 (tags)"
     assert "not JSON" in failure.value.problem
     assert wired.sent("POST", NOTES) == []
 
@@ -409,7 +406,7 @@ async def test_creates_nothing_when_all_four_are_already_recorded(
 
     assert wired.sent("POST", NOTES) == []
     assert f"{len(NOTE_IDS)} note(s) already recorded" in report.steps["knowledge"]
-    assert read_lines(env_path) == [*before, f"DEVIN_SCHEDULE_ID={SCHEDULE}"]
+    assert read_lines(env_path) == before
 
 
 async def test_resumes_at_the_note_after_the_last_recorded_one(
@@ -433,76 +430,30 @@ async def test_resumes_at_the_note_after_the_last_recorded_one(
     ]
 
 
-# --- Step 4: the nightly sweep -------------------------------------------------------------------
-
-
-async def test_creates_the_sweep_exactly_as_the_spec_tabulates_it(
-    devin: DevinClient, settings: Settings, env: Any, wired: FakeAPI
-) -> None:
-    """Every row of `docs/05-devin-integration.md#scheduled-sweep`, and the prompt closing the loop
-    back into the pipeline: an issue carrying the trigger label, and no pull request."""
-    await run(devin, settings, env)
-
-    body = wired.only("POST", SCHEDULES).json
-    assert body["name"] == "sentinel-nightly-vuln-sweep"
-    assert body["schedule_type"] == "recurring"
-    assert body["frequency"] == "0 3 * * *"
-    assert body["tags"] == ["sentinel", "class:scheduled-sweep"]
-    assert body["notify_on"] == "failure"
-
-    prompt = body["prompt"]
-    assert "pip-audit" in prompt and "npm audit" in prompt
-    assert "taxpon/superset" in prompt and "devin:autofix" in prompt
-    assert "class:security-dep" in prompt and "class:frontend-dep" in prompt
-    assert "Do not open duplicates." in prompt
-    assert "Do not open a pull request" in prompt
-
-
-async def test_records_the_schedule_id_and_creates_no_second_sweep(
-    devin: DevinClient, settings: Settings, env: Any, env_path: Path, wired: FakeAPI
-) -> None:
-    """Two sweeps would file the same issues every night, and v3 has no endpoint that lists
-    schedules to notice it."""
-    first = await run(devin, settings, env)
-    assert env_value(env_path, bootstrap_devin.SCHEDULE_ID) == SCHEDULE
-
-    second = await run(devin, settings, env)
-
-    assert len(wired.sent("POST", SCHEDULES)) == 1
-    assert SCHEDULE in second.steps["schedule"]
-    assert "nothing created" in second.steps["schedule"]
-    assert "created sentinel-nightly-vuln-sweep" in first.steps["schedule"]
-
-
 async def test_an_exported_variable_counts_as_recorded(
     devin: DevinClient, settings: Settings, env_path: Path, wired: FakeAPI
 ) -> None:
     """`pydantic-settings` resolves the environment before `.env`, so a variable exported in the
-    shell is what the worker will use — and therefore what tells this script the sweep exists.
+    shell is what the worker will use — and therefore what tells this script the notes exist.
 
     The file says something else on purpose: when the two disagree, the exported value is the one
-    in force, and reporting the file's would name a schedule nothing is actually running.
+    in force, and reading the file's would create notes on top of ones that already exist.
     """
-    write(
-        env_path,
-        ENV_TEXT.replace(
-            "DEVIN_KNOWLEDGE_IDS=", f"DEVIN_KNOWLEDGE_IDS={json.dumps(list(NOTE_IDS))}"
-        )
-        + "DEVIN_SCHEDULE_ID=sched-in-the-file\n",
+    write(env_path, ENV_TEXT.replace("DEVIN_KNOWLEDGE_IDS=", 'DEVIN_KNOWLEDGE_IDS=["in-the-file"]'))
+    env = bootstrap_devin.EnvFile(
+        env_path, {bootstrap_devin.KNOWLEDGE_IDS: json.dumps(list(NOTE_IDS))}
     )
-    env = bootstrap_devin.EnvFile(env_path, {bootstrap_devin.SCHEDULE_ID: "sched-from-the-shell"})
 
     report = await run(devin, settings, env)
 
-    assert wired.sent("POST", SCHEDULES) == []
-    assert "sched-from-the-shell" in report.steps["schedule"]
-    assert "sched-in-the-file" not in report.steps["schedule"]
+    assert wired.sent("POST", NOTES) == []
+    assert "4 note(s) already recorded" in report.steps["knowledge"]
 
 
 # --- Idempotence, end to end ---------------------------------------------------------------------
 
 
-async def test_running_twice_leaves_four_notes_and_one_schedule(
+async def test_running_twice_leaves_four_notes(
     devin: DevinClient, settings: Settings, env: Any, env_path: Path, wired: FakeAPI
 ) -> None:
     await run(devin, settings, env)
@@ -511,18 +462,39 @@ async def test_running_twice_leaves_four_notes_and_one_schedule(
     await run(devin, settings, env)
 
     assert len(wired.sent("POST", NOTES)) == 4
-    assert len(wired.sent("POST", SCHEDULES)) == 1
     assert read_bytes(env_path) == after_first
+
+
+async def test_a_record_blanked_from_the_example_creates_a_second_set_of_notes(
+    devin: DevinClient, settings: Settings, env_path: Path, wired: FakeAPI
+) -> None:
+    """The one thing dropping step 4 cost, pinned so it is a decision rather than a surprise.
+
+    `DEVIN_SCHEDULE_ID` was written after the four notes and could not exist without them, so a
+    blank `DEVIN_KNOWLEDGE_IDS` beside it was proof the record had been lost rather than never
+    written — and the script refused to create a second set. With the schedule gone nothing in
+    `.env` carries that proof, and `cp .env.example .env` — which is what the missing-file remedy
+    tells an operator to run — reads as a first run ([B16](../docs/blockers.md#b16)).
+    """
+    respond_with_notes(wired, (*NOTE_IDS, *(f"{note}-again" for note in NOTE_IDS)))
+
+    await run(devin, settings, bootstrap_devin.EnvFile(env_path, {}))
+    assert len(wired.sent("POST", NOTES)) == 4
+
+    write(env_path, ENV_TEXT)
+
+    await run(devin, settings, bootstrap_devin.EnvFile(env_path, {}))
+
+    assert len(wired.sent("POST", NOTES)) == 8
 
 
 # --- The preview ---------------------------------------------------------------------------------
 #
-# `--dry-run`. Two steps make it worth running. The fourth registers a recurring sweep, so a run
-# made by mistake leaves something that keeps acting on its own every night; and the second is a
-# `PUT` that *replaces* the organisation's whole allowed-tag vocabulary, so the first run removes
-# every tag `devin/playbooks.py` does not list. Steps 3 and 4 are idempotent only through what
-# `.env` records, so a run against a `.env` replaced from `.env.example` duplicates the notes too —
-# and that is the whole of what a preview has to be able to say out loud.
+# `--dry-run`. Two steps make it worth running. The second is a `PUT` that *replaces* the
+# organisation's whole allowed-tag vocabulary, so the first run removes every tag
+# `devin/playbooks.py` does not list. The third is idempotent only through what `.env` records, so a
+# run against a `.env` replaced from `.env.example` duplicates the notes — and that is the whole of
+# what a preview has to be able to say out loud.
 
 CURRENT_TAGS = ("sentinel", "issue:", "team:platform", "env:prod")
 """What an organisation that somebody else has also used allows: three of Sentinel's own, and one
@@ -564,13 +536,13 @@ async def test_a_dry_run_still_verifies_the_token(
     devin: DevinClient, settings: Settings, env: Any, devin_api: FakeAPI
 ) -> None:
     """Step 1 is a `GET`, and a preview that cannot tell an operator their token is rejected is
-    worth much less than one that can: it would report four steps that could not happen."""
+    worth much less than one that can: it would report three steps that could not happen."""
     devin_api.responds("GET", SESSIONS, 401, {"detail": "invalid token"})
 
     with pytest.raises(bootstrap_devin.BootstrapError) as failure:
         await preview(devin, settings, env)
 
-    assert failure.value.step == "step 1 of 4 (token)"
+    assert failure.value.step == "step 1 of 3 (token)"
     assert "DEVIN_API_TOKEN" in failure.value.remedy
 
 
@@ -637,7 +609,7 @@ async def test_a_refused_read_previews_a_write_that_is_likely_to_be_refused_too(
     """The answer the owner's own run got. The read and the write want the same enterprise
     permission, so a refused read is evidence about step 2 and not merely a gap in the preview:
     promising a replacement that will not happen would be worse than saying nothing. It stays a
-    refusal, so the preview exits 0 and still previews the other three steps — and it still says
+    refusal, so the preview exits 0 and still previews the other two steps — and it still says
     what an accepted `PUT` would destroy, because that outcome is not ruled out."""
     devin_api.responds("GET", SESSIONS, 200, {"items": []})
     devin_api.responds("GET", CONSUMPTION, 200, a_consumption_body())
@@ -674,7 +646,7 @@ async def test_a_fault_reading_the_vocabulary_does_not_exit_zero(
 
     assert Capability.TAG_DISCOVERY.value in failure.value.problem
     assert "Nothing was created" in failure.value.remedy
-    assert "[4/4] schedule" in out.text
+    assert "[3/3] knowledge" in out.text
     assert Capability.TAG_DISCOVERY.fallback not in out.text
 
 
@@ -695,7 +667,7 @@ async def test_the_run_itself_does_not_read_the_vocabulary(
 async def test_a_dry_run_says_it_would_create_what_env_records_nothing_of(
     devin: DevinClient, settings: Settings, env: Any, reads_only: FakeAPI
 ) -> None:
-    """The first run, previewed: nothing is recorded, so all four notes and the sweep are new."""
+    """The first run, previewed: nothing is recorded, so all four notes are new."""
     report = await preview(devin, settings, env)
 
     assert "would create 4 note(s)" in report.steps["knowledge"]
@@ -703,9 +675,6 @@ async def test_a_dry_run_says_it_would_create_what_env_records_nothing_of(
         f"{bootstrap_devin.KNOWLEDGE_IDS} records 0 of {len(bootstrap_devin.NOTES)}"
         in (report.steps["knowledge"])
     )
-    assert f"would create {bootstrap_devin.SCHEDULE_NAME}" in report.steps["schedule"]
-    assert "a recurring sweep" in report.steps["schedule"]
-    assert f"{bootstrap_devin.SCHEDULE_ID} records nothing" in report.steps["schedule"]
 
 
 async def test_a_dry_run_resumes_at_the_note_after_the_last_recorded_one_too(
@@ -731,14 +700,12 @@ async def test_a_dry_run_names_what_env_already_records_as_what_would_be_skipped
     devin: DevinClient, settings: Settings, env_path: Path, reads_only: FakeAPI
 ) -> None:
     """The other half of what decides between "create" and "skip". A recorded id is why nothing
-    would be created — and it is the line that, blanked, silently makes a second set of notes and a
-    second nightly sweep."""
+    would be created — and it is the line that, blanked, silently makes a second set of notes."""
     write(
         env_path,
         ENV_TEXT.replace(
             "DEVIN_KNOWLEDGE_IDS=", f"DEVIN_KNOWLEDGE_IDS={json.dumps(list(NOTE_IDS))}"
-        )
-        + f"DEVIN_SCHEDULE_ID={SCHEDULE}\n",
+        ),
     )
     before = read_bytes(env_path)
 
@@ -749,11 +716,6 @@ async def test_a_dry_run_names_what_env_already_records_as_what_would_be_skipped
         in (report.steps["knowledge"])
     )
     assert "none would be created" in report.steps["knowledge"]
-    assert (
-        f"already recorded in {bootstrap_devin.SCHEDULE_ID} ({SCHEDULE})"
-        in (report.steps["schedule"])
-    )
-    assert "none would be created" in report.steps["schedule"]
     assert read_bytes(env_path) == before
 
 
@@ -769,7 +731,7 @@ async def test_the_preview_says_what_was_and_was_not_done(
     assert bootstrap_devin.DRY_RUN_HEADING.strip() in out.text
     assert f"{env_path} was not touched" in out.text
     assert "Re-run without --dry-run" in out.text
-    assert "[4/4] schedule" in out.text
+    assert "[3/3] knowledge" in out.text
     assert bootstrap_devin.CAPABILITY_HEADING.strip() in out.text
     # The limits are printed, not left to be discovered: each is a way the real run could do
     # something the report above does not show.
@@ -805,8 +767,7 @@ def test_a_dry_run_writes_nothing_and_the_run_after_it_writes(
     assert bootstrap_devin.main(["--env", str(env_path)]) == 0
 
     assert len(wired.sent("POST", NOTES)) == 4
-    assert len(wired.sent("POST", SCHEDULES)) == 1
-    assert env_value(env_path, bootstrap_devin.SCHEDULE_ID) == SCHEDULE
+    assert json.loads(env_value(env_path, bootstrap_devin.KNOWLEDGE_IDS) or "") == list(NOTE_IDS)
 
 
 def test_a_dry_run_and_the_playbook_listing_are_alternatives(
@@ -859,7 +820,7 @@ async def test_a_rejected_token_creates_nothing_at_all(
     assert devin_api.sent("PUT") == []
     assert devin_api.sent("POST") == []
     assert read_bytes(env_path) == before
-    assert failure.value.step == "step 1 of 4 (token)"
+    assert failure.value.step == "step 1 of 3 (token)"
     assert "DEVIN_API_TOKEN" in failure.value.remedy
 
 
@@ -873,7 +834,6 @@ async def test_a_rejected_note_keeps_what_was_already_created_and_resumes(
     and the next run picks up at the third rather than creating four more."""
     devin_api.responds("GET", SESSIONS, 200, {"items": []})
     devin_api.responds("PUT", TAGS, 200, {})
-    devin_api.responds("POST", SCHEDULES, 200, {"scheduled_session_id": SCHEDULE})
     devin_api.responds("GET", CONSUMPTION, 200, a_consumption_body())
     respond_with_notes(
         devin_api,
@@ -885,18 +845,16 @@ async def test_a_rejected_note_keeps_what_was_already_created_and_resumes(
     with pytest.raises(bootstrap_devin.BootstrapError) as failure:
         await run(devin, settings, env)
 
-    assert failure.value.step == "step 3 of 4 (knowledge)"
+    assert failure.value.step == "step 3 of 3 (knowledge)"
     assert json.loads(env_value(env_path, bootstrap_devin.KNOWLEDGE_IDS) or "") == list(
         NOTE_IDS[:2]
     )
-    assert devin_api.sent("POST", SCHEDULES) == []
     assert ENV_TEXT.splitlines()[4] in read_lines(env_path)
 
     await run(devin, settings, env)
 
     assert len(devin_api.sent("POST", NOTES)) == 5
     assert json.loads(env_value(env_path, bootstrap_devin.KNOWLEDGE_IDS) or "") == list(NOTE_IDS)
-    assert env_value(env_path, bootstrap_devin.SCHEDULE_ID) == SCHEDULE
 
 
 async def test_the_failure_report_names_the_step_the_answer_and_the_remedy(
@@ -915,7 +873,7 @@ async def test_the_failure_report_names_the_step_the_answer_and_the_remedy(
         await run(devin, settings, env)
 
     report = failure.value.report()
-    assert "step 3 of 4 (knowledge)" in report
+    assert "step 3 of 3 (knowledge)" in report
     assert "403" in report and "missing ManageOrgSessions" in report
     assert "ManageOrgSessions at the organisation level" in report.replace("`", "")
     assert "what to do:" in report
@@ -939,12 +897,12 @@ async def test_an_unreadable_answer_points_at_the_schemas_not_the_script(
 ) -> None:
     """The bootstrap response shapes are unverified (B8), so a body that will not parse is the
     likeliest real failure — and it is `devin/schemas.py` that would need fixing."""
-    devin_api.responds("POST", SCHEDULES, 200, {"nothing": "recognisable"})
+    respond_with_notes(devin_api, [], httpx.Response(200, json={"nothing": "recognisable"}))
 
     with pytest.raises(bootstrap_devin.BootstrapError) as failure:
         await run(devin, settings, env)
 
-    assert failure.value.step == "step 4 of 4 (schedule)"
+    assert failure.value.step == "step 3 of 3 (knowledge)"
     assert "devin/schemas.py" in failure.value.remedy
 
 
@@ -955,19 +913,20 @@ async def test_nothing_but_the_recorded_lines_changes(
     devin: DevinClient, settings: Settings, env: Any, env_path: Path, wired: FakeAPI
 ) -> None:
     """Comments, blank lines, ordering, the operator's own variables and the credentials all
-    survive; the file grows by exactly the one line that was not already there."""
+    survive; exactly one line changes, and the file grows by nothing."""
     await run(devin, settings, env)
 
     before = ENV_TEXT.splitlines()
     after = read_lines(env_path)
-    assert after[: len(before)] == [
-        line if not line.startswith("DEVIN_KNOWLEDGE_IDS=") else after[before.index(line)]
-        for line in before
+    assert len(after) == len(before)
+    assert [line for line in after if not line.startswith("DEVIN_KNOWLEDGE_IDS=")] == [
+        line for line in before if not line.startswith("DEVIN_KNOWLEDGE_IDS=")
     ]
     assert [line for line in after if line.startswith("DEVIN_KNOWLEDGE_IDS=")] == [
         f"DEVIN_KNOWLEDGE_IDS={json.dumps(list(NOTE_IDS), separators=(',', ':'))}"
     ]
-    assert after[len(before) :] == [f"DEVIN_SCHEDULE_ID={SCHEDULE}"]
+    # Rewritten in place, not appended: the line keeps the position the operator's file gave it.
+    assert after[before.index("DEVIN_KNOWLEDGE_IDS=")].startswith("DEVIN_KNOWLEDGE_IDS=")
     assert "DEVIN_API_TOKEN=cog_live_9f3a1c7d2b4e6f8a0c5d" in after
     assert after.count("POSTGRES_PORT=54340") == 1
 
@@ -977,42 +936,44 @@ def test_the_effective_assignment_is_the_one_replaced(tmp_path: Path) -> None:
     the first would leave the stale one winning; deleting either would be an edit nobody asked
     for."""
     path = tmp_path / ".env"
-    path.write_text("DEVIN_SCHEDULE_ID=old-1\nOTHER=x\nDEVIN_SCHEDULE_ID=old-2\n", encoding="utf-8")
+    path.write_text(
+        "DEVIN_KNOWLEDGE_IDS=old-1\nOTHER=x\nDEVIN_KNOWLEDGE_IDS=old-2\n", encoding="utf-8"
+    )
 
-    bootstrap_devin.EnvFile(path, {}).record(bootstrap_devin.SCHEDULE_ID, "new")
+    bootstrap_devin.EnvFile(path, {}).record(bootstrap_devin.KNOWLEDGE_IDS, "new")
 
     assert path.read_text(encoding="utf-8") == (
-        "DEVIN_SCHEDULE_ID=old-1\nOTHER=x\nDEVIN_SCHEDULE_ID=new\n"
+        "DEVIN_KNOWLEDGE_IDS=old-1\nOTHER=x\nDEVIN_KNOWLEDGE_IDS=new\n"
     )
 
 
 def test_a_commented_out_variable_is_not_the_assignment(tmp_path: Path) -> None:
     path = tmp_path / ".env"
-    path.write_text("# DEVIN_SCHEDULE_ID=commented\nOTHER=x", encoding="utf-8")
+    path.write_text("# DEVIN_KNOWLEDGE_IDS=commented\nOTHER=x", encoding="utf-8")
 
-    bootstrap_devin.EnvFile(path, {}).record(bootstrap_devin.SCHEDULE_ID, "new")
+    bootstrap_devin.EnvFile(path, {}).record(bootstrap_devin.KNOWLEDGE_IDS, "new")
 
     assert path.read_text(encoding="utf-8") == (
-        "# DEVIN_SCHEDULE_ID=commented\nOTHER=x\nDEVIN_SCHEDULE_ID=new\n"
+        "# DEVIN_KNOWLEDGE_IDS=commented\nOTHER=x\nDEVIN_KNOWLEDGE_IDS=new\n"
     )
 
 
 def test_an_exported_assignment_is_rewritten_in_place(tmp_path: Path) -> None:
     path = tmp_path / ".env"
-    path.write_text("export DEVIN_SCHEDULE_ID=old\n", encoding="utf-8")
+    path.write_text("export DEVIN_KNOWLEDGE_IDS=old\n", encoding="utf-8")
 
-    bootstrap_devin.EnvFile(path, {}).record(bootstrap_devin.SCHEDULE_ID, "new")
+    bootstrap_devin.EnvFile(path, {}).record(bootstrap_devin.KNOWLEDGE_IDS, "new")
 
-    assert path.read_text(encoding="utf-8") == "DEVIN_SCHEDULE_ID=new\n"
+    assert path.read_text(encoding="utf-8") == "DEVIN_KNOWLEDGE_IDS=new\n"
 
 
 def test_line_endings_are_left_as_they_were(tmp_path: Path) -> None:
     path = tmp_path / ".env"
-    path.write_bytes(b"A=1\r\nDEVIN_SCHEDULE_ID=old\r\nB=2\r\n")
+    path.write_bytes(b"A=1\r\nDEVIN_KNOWLEDGE_IDS=old\r\nB=2\r\n")
 
-    bootstrap_devin.EnvFile(path, {}).record(bootstrap_devin.SCHEDULE_ID, "new")
+    bootstrap_devin.EnvFile(path, {}).record(bootstrap_devin.KNOWLEDGE_IDS, "new")
 
-    assert path.read_bytes() == b"A=1\r\nDEVIN_SCHEDULE_ID=new\r\nB=2\r\n"
+    assert path.read_bytes() == b"A=1\r\nDEVIN_KNOWLEDGE_IDS=new\r\nB=2\r\n"
 
 
 @pytest.mark.parametrize("mode", [0o600, 0o640, 0o644])
@@ -1024,25 +985,25 @@ def test_the_file_mode_is_carried_over(tmp_path: Path, mode: int) -> None:
     write(path, "A=1\n")
     path.chmod(mode)
 
-    bootstrap_devin.EnvFile(path, {}).record(bootstrap_devin.SCHEDULE_ID, "new")
+    bootstrap_devin.EnvFile(path, {}).record(bootstrap_devin.KNOWLEDGE_IDS, "new")
 
     assert stat.S_IMODE(path.stat().st_mode) == mode
 
 
 def test_recording_the_same_value_does_not_rewrite_the_file(tmp_path: Path) -> None:
     path = tmp_path / ".env"
-    path.write_text("DEVIN_SCHEDULE_ID=same\n", encoding="utf-8")
+    path.write_text("DEVIN_KNOWLEDGE_IDS=same\n", encoding="utf-8")
     record = bootstrap_devin.EnvFile(path, {})
 
-    assert record.record(bootstrap_devin.SCHEDULE_ID, "same") is False
-    assert record.record(bootstrap_devin.SCHEDULE_ID, "other") is True
+    assert record.record(bootstrap_devin.KNOWLEDGE_IDS, "same") is False
+    assert record.record(bootstrap_devin.KNOWLEDGE_IDS, "other") is True
 
 
 def test_no_temporary_file_is_left_behind(tmp_path: Path) -> None:
     path = tmp_path / ".env"
     write(path, "A=1\n")
 
-    bootstrap_devin.EnvFile(path, {}).record(bootstrap_devin.SCHEDULE_ID, "new")
+    bootstrap_devin.EnvFile(path, {}).record(bootstrap_devin.KNOWLEDGE_IDS, "new")
 
     assert [child.name for child in tmp_path.iterdir()] == [".env"]
 
@@ -1054,17 +1015,17 @@ def test_a_write_that_fails_leaves_the_previous_file_whole(
     interrupted write cannot leave half a `.env` behind. Writing the new text over the file in
     place would pass every other test here and fail this one."""
     path = tmp_path / ".env"
-    write(path, "DEVIN_SCHEDULE_ID=old\nDEVIN_API_TOKEN=cog_live_secret\n")
+    write(path, "DEVIN_KNOWLEDGE_IDS=old\nDEVIN_API_TOKEN=cog_live_secret\n")
     monkeypatch.setattr(
         bootstrap_devin.os, "replace", _raise(OSError(28, "No space left on device"))
     )
 
     with pytest.raises(bootstrap_devin.BootstrapError) as failure:
-        bootstrap_devin.EnvFile(path, {}).record(bootstrap_devin.SCHEDULE_ID, "new")
+        bootstrap_devin.EnvFile(path, {}).record(bootstrap_devin.KNOWLEDGE_IDS, "new")
 
-    assert read_lines(path) == ["DEVIN_SCHEDULE_ID=old", "DEVIN_API_TOKEN=cog_live_secret"]
+    assert read_lines(path) == ["DEVIN_KNOWLEDGE_IDS=old", "DEVIN_API_TOKEN=cog_live_secret"]
     assert [child.name for child in tmp_path.iterdir()] == [".env"]
-    assert "DEVIN_SCHEDULE_ID=new" in failure.value.remedy
+    assert "DEVIN_KNOWLEDGE_IDS=new" in failure.value.remedy
 
 
 def test_the_temporary_file_is_written_beside_the_original(
@@ -1084,7 +1045,7 @@ def test_the_temporary_file_is_written_beside_the_original(
 
     monkeypatch.setattr(bootstrap_devin.tempfile, "mkstemp", spy)
 
-    bootstrap_devin.EnvFile(path, {}).record(bootstrap_devin.SCHEDULE_ID, "new")
+    bootstrap_devin.EnvFile(path, {}).record(bootstrap_devin.KNOWLEDGE_IDS, "new")
 
     assert directories == [tmp_path]
 
@@ -1098,10 +1059,10 @@ def test_a_symlinked_env_is_followed_rather_than_replaced(tmp_path: Path) -> Non
     link = tmp_path / ".env"
     link.symlink_to(target)
 
-    bootstrap_devin.EnvFile(link, {}).record(bootstrap_devin.SCHEDULE_ID, "new")
+    bootstrap_devin.EnvFile(link, {}).record(bootstrap_devin.KNOWLEDGE_IDS, "new")
 
     assert link.is_symlink()
-    assert read_lines(target) == ["DEVIN_API_TOKEN=cog_live_secret", "DEVIN_SCHEDULE_ID=new"]
+    assert read_lines(target) == ["DEVIN_API_TOKEN=cog_live_secret", "DEVIN_KNOWLEDGE_IDS=new"]
     assert sorted(child.name for child in tmp_path.iterdir()) == [".env", "real.env"]
 
 
@@ -1129,7 +1090,7 @@ def test_an_env_that_is_not_utf8_is_reported_without_quoting_it(tmp_path: Path) 
     path.write_bytes(b"DEVIN_API_TOKEN=cog_\xff\xfe_secret\n")
 
     with pytest.raises(bootstrap_devin.BootstrapError) as failure:
-        bootstrap_devin.EnvFile(path, {}).recorded(bootstrap_devin.SCHEDULE_ID)
+        bootstrap_devin.EnvFile(path, {}).recorded(bootstrap_devin.KNOWLEDGE_IDS)
 
     assert "not valid UTF-8" in failure.value.problem
     assert "cog_" not in failure.value.problem + failure.value.remedy
@@ -1160,7 +1121,7 @@ async def test_an_id_that_would_corrupt_env_is_refused_and_reported(
 
     assert read_bytes(env_path) == before
     assert repr(note_id) in failure.value.problem
-    assert failure.value.step == "step 3 of 4 (knowledge)"
+    assert failure.value.step == "step 3 of 3 (knowledge)"
 
 
 async def test_a_missing_env_file_is_not_created(
@@ -1195,45 +1156,24 @@ async def test_a_record_that_is_not_a_json_array_of_ids_stops_the_run(
     assert bootstrap_devin.KNOWLEDGE_IDS in failure.value.problem
 
 
-async def test_a_blanked_record_beside_a_recorded_schedule_refuses_to_create_a_second_set(
-    devin: DevinClient, settings: Settings, env_path: Path, wired: FakeAPI
-) -> None:
-    """`cp .env.example .env` — which is what the missing-file remedy tells an operator to run —
-    ships DEVIN_KNOWLEDGE_IDS blank. Read as a first run, that silently makes a second set of four
-    notes with nothing able to tell them apart afterwards.
-
-    The schedule is created *after* the notes, so a recorded schedule id cannot predate them: it is
-    the evidence that this organisation has been here before.
-    """
-    write(env_path, f"{ENV_TEXT}DEVIN_SCHEDULE_ID={SCHEDULE}\n")
-
-    with pytest.raises(bootstrap_devin.BootstrapError) as failure:
-        await run(devin, settings, bootstrap_devin.EnvFile(env_path, {}))
-
-    assert wired.sent("POST", NOTES) == []
-    assert failure.value.step == "step 3 of 4 (knowledge)"
-    assert bootstrap_devin.KNOWLEDGE_IDS in failure.value.remedy
-    assert bootstrap_devin.SCHEDULE_ID in failure.value.remedy
-
-
 def test_the_effective_assignment_is_the_one_read(tmp_path: Path) -> None:
     """The read and the write must agree on which duplicate counts. Reading the first while
-    replacing the last would report a stale schedule id as current — and a schedule id read stale
-    is a second nightly sweep."""
+    replacing the last would report a stale record as current — and a record read stale is a second
+    set of notes."""
     path = tmp_path / ".env"
-    write(path, "DEVIN_SCHEDULE_ID=first\nOTHER=x\nDEVIN_SCHEDULE_ID=second\n")
+    write(path, "DEVIN_KNOWLEDGE_IDS=first\nOTHER=x\nDEVIN_KNOWLEDGE_IDS=second\n")
 
-    assert bootstrap_devin.EnvFile(path, {}).recorded(bootstrap_devin.SCHEDULE_ID) == "second"
+    assert bootstrap_devin.EnvFile(path, {}).recorded(bootstrap_devin.KNOWLEDGE_IDS) == "second"
 
 
 @pytest.mark.parametrize(
     ("line", "expected"),
     [
-        ("DEVIN_SCHEDULE_ID=sched-9", "sched-9"),
-        ('DEVIN_SCHEDULE_ID="sched-9"', "sched-9"),
-        ("DEVIN_SCHEDULE_ID='sched-9'", "sched-9"),
-        ("DEVIN_SCHEDULE_ID=sched-9  # the nightly sweep", "sched-9"),
-        ('DEVIN_SCHEDULE_ID="sched-9"  # the nightly sweep', "sched-9"),
+        ("DEVIN_KNOWLEDGE_IDS=note-9", "note-9"),
+        ('DEVIN_KNOWLEDGE_IDS="note-9"', "note-9"),
+        ("DEVIN_KNOWLEDGE_IDS='note-9'", "note-9"),
+        ("DEVIN_KNOWLEDGE_IDS=note-9  # the four knowledge notes", "note-9"),
+        ('DEVIN_KNOWLEDGE_IDS="note-9"  # the four knowledge notes', "note-9"),
     ],
 )
 def test_a_value_is_read_the_way_dotenv_reads_it(tmp_path: Path, line: str, expected: str) -> None:
@@ -1242,7 +1182,7 @@ def test_a_value_is_read_the_way_dotenv_reads_it(tmp_path: Path, line: str, expe
     path = tmp_path / ".env"
     write(path, f"{line}\n")
 
-    assert bootstrap_devin.EnvFile(path, {}).recorded(bootstrap_devin.SCHEDULE_ID) == expected
+    assert bootstrap_devin.EnvFile(path, {}).recorded(bootstrap_devin.KNOWLEDGE_IDS) == expected
 
 
 # --- The capability probe ------------------------------------------------------------------------
@@ -1369,13 +1309,13 @@ async def test_a_fault_on_the_probe_claims_no_fallback_and_does_not_exit_zero(
     # The remedy is the one diagnosed from what came back, not a sentence about faults in general.
     assert advice in failure.value.remedy
 
-    # Raised *after* the whole table, not instead of it: the four steps did succeed, and the rows
+    # Raised *after* the whole table, not instead of it: the three steps did succeed, and the rows
     # that were answered are the answer the run was for. Only the exit status changes.
     assert bootstrap_devin.CAPABILITY_HEADING.strip() in out.text
     for name in ("session_metrics", "acu_spend", "playbook_creation", "tag_vocabulary"):
         assert name in out.text
-    assert "[4/4] schedule" in out.text
-    assert env_value(env_path, bootstrap_devin.SCHEDULE_ID) == SCHEDULE
+    assert "[3/3] knowledge" in out.text
+    assert json.loads(env_value(env_path, bootstrap_devin.KNOWLEDGE_IDS) or "") == list(NOTE_IDS)
 
 
 async def test_a_rejected_token_on_the_enterprise_probe_names_the_token(
@@ -1423,7 +1363,7 @@ async def test_the_report_prints_a_row_for_every_open_blocker(
         assert f"{row.blocker}" in out.text
         assert row.name in out.text
         assert row.status in out.text
-    assert "[4/4] schedule" in out.text
+    assert "[3/3] knowledge" in out.text
     assert report.capability("tag_vocabulary").status == bootstrap_devin.REGISTERED
 
 
@@ -1631,7 +1571,7 @@ def test_the_listing_starts_without_the_ids_it_exists_to_find(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The chicken and the egg. `DEVIN_PLAYBOOK_IDS` is required of the four steps, of `api`, of
+    """The chicken and the egg. `DEVIN_PLAYBOOK_IDS` is required of the three steps, of `api`, of
     `worker` and of `poller` — and requiring it of the thing that finds it would make this option
     unusable at the only moment anyone wants it. Nothing is patched: which variables the read
     demands is the whole subject."""
@@ -1675,10 +1615,10 @@ def test_main_reports_success_without_touching_stdout_with_diagnostics(
     assert bootstrap_devin.main(["--env", str(env_path)]) == 0
 
     captured = capsys.readouterr()
-    assert "[1/4] token" in captured.out
+    assert "[1/3] token" in captured.out
     assert Capability.SESSION_METRICS.value in captured.out
     assert DEVIN_TOKEN not in captured.out + captured.err
-    assert env_value(env_path, bootstrap_devin.SCHEDULE_ID) == SCHEDULE
+    assert json.loads(env_value(env_path, bootstrap_devin.KNOWLEDGE_IDS) or "") == list(NOTE_IDS)
 
 
 def test_main_records_into_dot_env_when_no_path_is_given(
@@ -1696,7 +1636,9 @@ def test_main_records_into_dot_env_when_no_path_is_given(
 
     assert bootstrap_devin.main([]) == 0
 
-    assert env_value(tmp_path / ".env", bootstrap_devin.SCHEDULE_ID) == SCHEDULE
+    assert json.loads(env_value(tmp_path / ".env", bootstrap_devin.KNOWLEDGE_IDS) or "") == list(
+        NOTE_IDS
+    )
 
 
 def test_main_reports_an_unwritable_record_without_a_traceback(
@@ -1738,7 +1680,7 @@ def test_main_exits_nonzero_with_a_legible_failure_and_no_traceback(
     assert bootstrap_devin.main(["--env", str(env_path)]) == 1
 
     captured = capsys.readouterr()
-    assert "make bootstrap-devin failed at step 1 of 4 (token)" in captured.err
+    assert "make bootstrap-devin failed at step 1 of 3 (token)" in captured.err
     assert "what to do:" in captured.err
     assert "Traceback" not in captured.err
     assert DEVIN_TOKEN not in captured.out + captured.err
@@ -1794,7 +1736,7 @@ def test_it_starts_with_the_devin_variables_and_nothing_else(
 
     assert bootstrap_devin.main(["--env", str(record / ".env")]) == 0
 
-    assert "[1/4] token" in capsys.readouterr().out
+    assert "[1/3] token" in capsys.readouterr().out
 
 
 def test_a_missing_devin_variable_is_still_named(

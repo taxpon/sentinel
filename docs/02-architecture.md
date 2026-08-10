@@ -17,6 +17,7 @@ flowchart TB
         WRK["worker"]
         POL["poller"]
         DB[("Postgres")]
+        SWEEP["scanner sweep<br/>run on demand"]
     end
 
     DASH["dashboard<br/>React SPA"]
@@ -24,7 +25,6 @@ flowchart TB
     subgraph DEV["Devin — API v3"]
         SESS["Sessions"]
         CONS["Consumption"]
-        SCHED["Scheduled sessions"]
     end
 
     ISS -- "webhook, HMAC-signed" --> API
@@ -38,7 +38,7 @@ flowchart TB
     POL -- "poll ACU spend" --> CONS
     POL --> DB
     SESS -- "pushes branch, opens PR" --> PRS
-    SCHED -- "files new issues" --> ISS
+    SWEEP -- "files new issues" --> ISS
     DASH -- "GET /api/analytics" --> API
 ```
 

@@ -39,6 +39,7 @@ A working register, updated throughout implementation.
 | [B13](#b13) | Delivery | Assignment brief must not leak into a public repository | Publication | Open |
 | [B14](#b14) | Devin API | Tag registration writes an undocumented path, and the documented one is enterprise-scoped | Bootstrap step 2; any organisation shared with anyone else | Open |
 | [B15](#b15) | Credentials | Devin needs its own GitHub access to the fork; nothing ever documented it as a prerequisite | Every session's push and pull request | Open |
+| [B16](#b16) | Devin API | Scheduled sessions are superseded by Automations, so the nightly sweep is not scheduled at all | Nothing invokes the sweep automatically | Accepted |
 
 ---
 
@@ -188,8 +189,8 @@ about the write, not a measurement of it.
 **Mitigation, and what it is now worth.** The vocabulary is registered at bootstrap before any
 session is created — *when the organisation allows it*. Since 2026-08-10 a `403` or `404` on that
 `PUT` is a reported degradation rather than a failed run: step 2 says in one line that the
-vocabulary was **not** registered and that this is unresolved, and steps 3 and 4 go on to create the
-knowledge notes and the nightly sweep. Nothing else depends on the registration having succeeded —
+vocabulary was **not** registered and that this is unresolved, and step 3 goes on to create the
+knowledge notes. Nothing else depends on the registration having succeeded —
 `create_session` sends tags, `handlers.py` adds `cycle:N` on a resume, and the session listing is
 filtered by tag, none of which reads the registered vocabulary. What is unknown is whether Devin
 *accepts* those tags without it.
@@ -200,11 +201,11 @@ session tags against a registered vocabulary, or this organisation's vocabulary 
 or fails `422`, which answers B7 in the affirmative and makes registering the vocabulary a
 prerequisite that this organisation cannot currently satisfy. Record the outcome here either way.
 
-**One weaker signal arrives first.** Step 4 of the same bootstrap run sends
-`POST /schedules` with `sentinel` and `class:scheduled-sweep` on it. So a run that reports step 2 as
-*not registered* and still creates the sweep has had unregistered tags accepted **on a schedule** —
-which is not the same object as a session, and the reference ties the feature to *session* tags. It
-is evidence, not the answer.
+**There used to be a weaker signal, and it has gone.** Step 4 sent `POST /schedules` with `sentinel`
+and `class:scheduled-sweep` on it, so a run that reported step 2 as *not registered* and still
+created the sweep had had unregistered tags accepted on a schedule — evidence, not the answer, since
+a schedule is not a session and the reference ties the feature to *session* tags. That step is
+removed ([B16](#b16)), so the first `POST /sessions` is now the only measurement B7 gets.
 
 ### B14 — The tag path we write is undocumented, and the documented one is enterprise-scoped {#b14}
 
@@ -256,7 +257,7 @@ says whether the write was accepted or refused.
 ### B8 — Devin credentials not yet obtained {#b8}
 
 **Impact.** Blocks all live execution: session creation, the review-fix loop, ACU accounting, the
-scheduled sweep, the demo. Also gates [B5](#b5), [B6](#b6) and [B7](#b7).
+demo. Also gates [B5](#b5), [B6](#b6) and [B7](#b7).
 
 **Needed.** `DEVIN_ORG_ID` (`org-…`) and a service-user token (`cog_…`) with at least
 `ManageOrgSessions`; enterprise scope if the metrics panel is to use Devin's own figures.
@@ -276,7 +277,6 @@ says what the API is documented to send, not what it sent. Exactly one call has 
 | `POST …/sessions/{id}/messages` | Not called |
 | `POST …/sessions/{id}/tags`, `PUT /v3/organizations/{org_id}/tags` | Not called — and see [B14](#b14) |
 | `POST …/knowledge/notes` | Not called |
-| `POST …/schedules` | Not called |
 | `GET …/consumption/daily` | Not called |
 | `GET /v3/enterprise/metrics/sessions` | Not called — see [B5](#b5) |
 | `GET /v3/organizations/{org_id}/playbooks` | Verified separately, see [B6](#b6) |
@@ -297,7 +297,7 @@ number is now derived from `pr_url`.
 **What "unverified" now means, after the shape audit.** Every endpoint in
 [the table](./05-devin-integration.md#endpoints-used) has been read back against its own page in
 the v3 OpenAPI reference, in both directions. B8 no longer covers "we do not know the field names":
-we do, for all twelve. Four had been guessed wrong, and each would have failed at a different
+we do, for every row. Four had been guessed wrong, and each would have failed at a different
 moment — `POST /knowledge/notes` rejected outright for a missing `trigger`; `POST /schedules`
 succeeding and then failing to parse the `scheduled_session_id` it needed to record; the daily
 consumption body silently unreadable, so the budget guard would have run on its fallback for ever;
@@ -424,3 +424,33 @@ endpoints do report repository reach, and neither replaces looking:
 Nothing reports what a given *session* was able to reach. **Do not spend a real session finding
 out**: a live check costs a session and its ACUs, and the first real remediation is that check
 anyway ([B8](#b8)).
+
+### B16 — Scheduled sessions are superseded, so nothing schedules the sweep {#b16}
+
+**Evidence.** Devin's guide carries a banner on Scheduled Sessions: *"Automations are now the
+recommended way to run Devin on a schedule … **If you're setting up a new scheduled workflow, use an
+automation with a Schedule trigger instead.**"* — followed by *"Existing scheduled sessions will
+continue to work."* Bootstrap step 4 set up a new scheduled workflow, which is the case the banner
+names.
+
+**Chosen.** Step 4 is removed, with `POST /v3/organizations/{org_id}/schedules`, the client method,
+the `Schedule` response model, `DEVIN_SCHEDULE_ID` and their tests. The API still works, so this is
+not a defect: it is a decision not to build new work on a superseded feature.
+
+Automations were not adopted instead. No v3 endpoint for creating one appears in the reference
+index, so it may be a web-app feature — and an automatic sweep is not what Sentinel is for. Its
+substance is label → remediate → merge; the sweep was one way of *finding* candidates, and the eight
+for this run were chosen by hand and are already filed ([B1](#b1)).
+
+**Given up.** Two things, both stated rather than mitigated:
+
+| | |
+|---|---|
+| Nothing runs the sweep | `src/sentinel/scanner/audit.py` is invoked by hand — the command is in [05](./05-devin-integration.md#scheduled-sweep). New advisories are noticed when somebody runs it, not overnight |
+| The bootstrap's "have I been here before?" evidence | `DEVIN_SCHEDULE_ID` was written after the four knowledge notes and could not exist without them, so a blank `DEVIN_KNOWLEDGE_IDS` beside it meant the record had been lost. With it gone, a `.env` copied from `.env.example` creates a second set of four notes silently. `uv run scripts/bootstrap_devin.py --dry-run` says so; nothing detects it |
+
+**What would change the decision.** An Automations API appearing under `/v3` — a create endpoint for
+an automation with a Schedule trigger. That is the shape the banner points at, and the sweep would
+be worth putting behind it. `GET /v3/organizations/{org_id}/knowledge/notes` already exists and
+would close the second row above on its own, independently of this entry
+([ADR](./adr/2026-08-08-env-is-the-bootstrap-scripts-record.md)).

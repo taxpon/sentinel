@@ -71,7 +71,6 @@ from sentinel.devin.schemas import (
     Degradable,
     KnowledgeNote,
     PlaybookPage,
-    Schedule,
     Session,
     SessionMetrics,
     SessionPage,
@@ -111,7 +110,6 @@ write is a change to what `make bootstrap-devin` does to a real organisation, an
 whoever owns that decision rather than to the preview that surfaced it —
 `scripts/bootstrap_devin.py --dry-run` reports the discrepancy where an operator will see it."""
 KNOWLEDGE_NOTES: Final = f"{_ORGANIZATION}/knowledge/notes"
-SCHEDULES: Final = f"{_ORGANIZATION}/schedules"
 PLAYBOOKS: Final = f"{_ORGANIZATION}/playbooks"
 CONSUMPTION_DAILY: Final = f"{_ORGANIZATION}/consumption/daily"
 ENTERPRISE_SESSION_METRICS: Final = "/v3/enterprise/metrics/sessions"
@@ -125,7 +123,6 @@ ENDPOINTS: Final[frozenset[str]] = frozenset(
         ORGANIZATION_TAGS,
         ALLOWED_TAGS,
         KNOWLEDGE_NOTES,
-        SCHEDULES,
         PLAYBOOKS,
         CONSUMPTION_DAILY,
         ENTERPRISE_SESSION_METRICS,
@@ -163,10 +160,10 @@ def registered_tag(tag: str) -> str:
     What is registered with Devin is only the namespace tag and the bare prefixes of
     `TAG_PREFIXES`, which is a wider net: Devin accepts any value behind a registered prefix.
 
-    The difference is not hypothetical: `docs/05-devin-integration.md#scheduled-sweep` tags the
-    nightly sweep `class:scheduled-sweep`, which Devin accepts and `validate_tag` rejects, because
-    the sweep is not a remediation and "scheduled-sweep" is not an issue class. Anything that is not
-    creating a session is checked here instead.
+    The difference is not hypothetical: a `class:` value naming something that is not one of
+    Sentinel's issue classes — a session somebody else in the organisation created under the same
+    registered prefix — is a legitimate thing to *search* for and an illegitimate thing to create a
+    session with. Anything that is not creating a session is checked here instead.
 
     Derived from the same two exports the bootstrap registration sends, so the check and the
     registration cannot drift apart.
@@ -427,7 +424,7 @@ class DevinClient:
         `tags` filters server-side where the organisation supports it; every session Sentinel
         creates carries the `sentinel` namespace tag, which is what makes ours findable among an
         organisation's own. Filters are checked against the registered vocabulary rather than the
-        session rule: `class:scheduled-sweep` is a legitimate thing to search for.
+        session rule: a search may name a `class:` value Sentinel would never create a session with.
 
         `tags` is a **repeated** query parameter — `SessionsQueryParams.tags` is an array of
         strings — not the comma-joined string this sent, which would have asked for one tag whose
@@ -522,32 +519,6 @@ class DevinClient:
             path=self._org(),
         )
         return self._parse(KnowledgeNote, payload, "POST", KNOWLEDGE_NOTES)
-
-    async def create_schedule(
-        self,
-        *,
-        name: str,
-        prompt: str,
-        frequency: str,
-        tags: Sequence[str],
-        schedule_type: str = "recurring",
-        notify_on: str = "failure",
-    ) -> Schedule:
-        """Create the nightly vulnerability sweep, whose issues re-enter at the top of the flow."""
-        payload = await self._request(
-            "POST",
-            SCHEDULES,
-            json={
-                "name": name,
-                "schedule_type": schedule_type,
-                "frequency": frequency,
-                "prompt": prompt,
-                "tags": [registered_tag(tag) for tag in tags],
-                "notify_on": notify_on,
-            },
-            path=self._org(),
-        )
-        return self._parse(Schedule, payload, "POST", SCHEDULES)
 
     # --- Degradable ------------------------------------------------------------------------------
 

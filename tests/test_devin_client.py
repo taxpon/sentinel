@@ -44,7 +44,6 @@ from sentinel.devin.client import (
     KNOWLEDGE_NOTES,
     ORGANIZATION_TAGS,
     PLAYBOOKS,
-    SCHEDULES,
     SESSION,
     SESSION_MESSAGES,
     SESSION_TAGS,
@@ -120,7 +119,6 @@ SPEC_CREATE_FIELDS = [backticked(row[0])[0] for row in SPEC_CREATE_ROWS]
 # Column two — what Sentinel puts in each field — which is half the mapping and was previously
 # never read: the field names alone cannot tell a `title` template or a target repository apart.
 SPEC_CREATE_VALUES = {backticked(row[0])[0]: row[1] for row in SPEC_CREATE_ROWS}
-SPEC_SWEEP = {backticked(row[0])[0]: row[1] for row in table_rows(section("Scheduled sweep"))}
 
 
 def bullet(name: str, text: str) -> str:
@@ -151,11 +149,10 @@ SPEC_WORKING_STATUSES = set(backticked(_working_phrase.group(1)))
 
 def test_the_spec_tables_were_parsed() -> None:
     """A parsing bug would silently turn every table-driven test below into a no-op."""
-    assert len(SPEC_ENDPOINT_ROWS) == 12
+    assert len(SPEC_ENDPOINT_ROWS) == 11
     assert len(SPEC_CREATE_FIELDS) == 10
     assert len(SPEC_DEGRADATION_ROWS) == 5
     assert len(SPEC_STATUSES) == 7
-    assert len(SPEC_SWEEP) == 6
     assert SPEC_RETRIES.startswith("exponential backoff")
     assert SPEC_TIMEOUT_SECONDS == 30.0
     assert {"claimed", "running", "resuming"} == SPEC_WORKING_STATUSES
@@ -178,7 +175,6 @@ SESSION_TAGS_URL = SESSION_TAGS.format(org_id=ORG, session_id=SESSION_ID)
 ORG_TAGS_URL = ORGANIZATION_TAGS.format(org_id=ORG)
 ALLOWED_TAGS_URL = ALLOWED_TAGS.format(org_id=ORG)
 KNOWLEDGE_URL = KNOWLEDGE_NOTES.format(org_id=ORG)
-SCHEDULES_URL = SCHEDULES.format(org_id=ORG)
 PLAYBOOKS_URL = PLAYBOOKS.format(org_id=ORG)
 CONSUMPTION_URL = CONSUMPTION_DAILY.format(org_id=ORG)
 
@@ -797,44 +793,14 @@ async def test_create_knowledge_note_returns_the_id_config_needs(
     }
 
 
-async def test_create_schedule_sends_the_nightly_sweep_as_specified(
-    client: DevinClient, devin_api: FakeAPI
-) -> None:
-    """Every field from the `Scheduled sweep` table, tags included.
-
-    The tags are the point. `class:scheduled-sweep` is in that table and is *not* an issue class,
-    so the session tag rule rejects it while Devin — which registered the bare `class:` prefix —
-    accepts it. A test that passed only the namespace tag left the bootstrap call unbuildable.
-    """
-    devin_api.responds("POST", SCHEDULES_URL, 201, {"scheduled_session_id": "sched-1"})
-    prompt = "Run pip-audit and npm audit on the target repo."
-
-    schedule = await client.create_schedule(
-        name=backticked(SPEC_SWEEP["name"])[0],
-        prompt=prompt,
-        frequency=backticked(SPEC_SWEEP["frequency"])[0],
-        tags=backticked(SPEC_SWEEP["tags"]),
-        schedule_type=backticked(SPEC_SWEEP["schedule_type"])[0],
-        notify_on=backticked(SPEC_SWEEP["notify_on"])[0],
-    )
-
-    assert schedule.id == "sched-1"
-    assert devin_api.only("POST", SCHEDULES_URL).json == {
-        "name": "sentinel-nightly-vuln-sweep",
-        "schedule_type": "recurring",
-        "frequency": "0 3 * * *",
-        "prompt": prompt,
-        "tags": ["sentinel", "class:scheduled-sweep"],
-        "notify_on": "failure",
-    }
-
-
 def test_the_two_tag_rules_differ_only_where_they_must() -> None:
     """`registered_tag` is the vocabulary Devin was given; `validate_tag` is the stricter rule a
-    session needs. The sweep's class tag is exactly the case that separates them."""
-    assert registered_tag("class:scheduled-sweep") == "class:scheduled-sweep"
+    session needs. A `class:` value that is not one of Sentinel's eight issue classes is exactly the
+    case that separates them: Devin registered the bare prefix and accepts anything behind it, and
+    a session created for a class with no playbook is a remediation nothing can finish."""
+    assert registered_tag("class:someone-elses") == "class:someone-elses"
     with pytest.raises(pb.UnregisteredTag):
-        pb.validate_tag("class:scheduled-sweep")
+        pb.validate_tag("class:someone-elses")
 
     for tag in pb.session_tags(
         repo="taxpon/superset", issue_number=42, issue_class="security", delivery_id=DELIVERY_ID
@@ -846,17 +812,6 @@ def test_the_two_tag_rules_differ_only_where_they_must() -> None:
             registered_tag(outside)
 
 
-async def test_a_schedule_tag_outside_the_vocabulary_never_reaches_devin(
-    client: DevinClient, devin_api: FakeAPI
-) -> None:
-    with pytest.raises(pb.UnregisteredTag):
-        await client.create_schedule(
-            name="sweep", prompt="…", frequency="0 3 * * *", tags=["priority:high"]
-        )
-
-    assert devin_api.requests == []
-
-
 async def test_a_listing_filter_outside_the_vocabulary_never_reaches_devin(
     client: DevinClient, devin_api: FakeAPI
 ) -> None:
@@ -866,10 +821,10 @@ async def test_a_listing_filter_outside_the_vocabulary_never_reaches_devin(
     assert devin_api.requests == []
 
 
-async def test_a_listing_can_filter_on_the_sweep_tag(
+async def test_a_listing_can_filter_on_a_class_no_session_of_ours_carries(
     client: DevinClient, devin_api: FakeAPI
 ) -> None:
-    """Searching for the sweep's own sessions is legitimate, so the filter takes the wider rule.
+    """Searching an organisation Sentinel shares is legitimate, so the filter takes the wider rule.
 
     `SessionsQueryParams.tags` is an array, so the tags go out as a repeated parameter. Joined with
     a comma — which is what this sent — they are one tag with a comma in its name, and match
@@ -877,10 +832,10 @@ async def test_a_listing_can_filter_on_the_sweep_tag(
     """
     devin_api.responds("GET", SESSIONS_URL, 200, {"items": []})
 
-    await client.list_sessions(tags=[pb.NAMESPACE_TAG, "class:scheduled-sweep"])
+    await client.list_sessions(tags=[pb.NAMESPACE_TAG, "class:someone-elses"])
 
     sent = devin_api.only("GET", SESSIONS_URL)
-    assert sent.url.params.get_list("tags") == ["sentinel", "class:scheduled-sweep"]
+    assert sent.url.params.get_list("tags") == ["sentinel", "class:someone-elses"]
 
 
 # --- Retries --------------------------------------------------------------------------------------
@@ -1433,45 +1388,22 @@ async def test_a_knowledge_note_id_is_read_from_note_id(
     assert note.id == "note-tests"
 
 
-async def test_a_schedule_id_is_read_from_scheduled_session_id(
-    client: DevinClient, devin_api: FakeAPI
-) -> None:
-    devin_api.responds("POST", SCHEDULES_URL, 201, {"scheduled_session_id": "sched-1"})
-
-    schedule = await client.create_schedule(
-        name="sweep", prompt="…", frequency="0 3 * * *", tags=[pb.NAMESPACE_TAG]
-    )
-
-    assert schedule.id == "sched-1"
-
-
 @pytest.mark.parametrize(
-    ("url", "body"),
-    [
-        (KNOWLEDGE_URL, {"id": "note-tests"}),
-        (KNOWLEDGE_URL, {"knowledge_id": "note-tests"}),
-        (SCHEDULES_URL, {"id": "sched-1"}),
-        (SCHEDULES_URL, {"schedule_id": "sched-1"}),
-    ],
-    ids=["note.id", "note.knowledge_id", "schedule.id", "schedule.schedule_id"],
+    "body",
+    [{"id": "note-tests"}, {"knowledge_id": "note-tests"}],
+    ids=["note.id", "note.knowledge_id"],
 )
 async def test_a_bootstrap_id_under_a_name_v3_does_not_use_is_a_fault(
-    client: DevinClient, devin_api: FakeAPI, url: str, body: dict[str, str]
+    client: DevinClient, devin_api: FakeAPI, body: dict[str, str]
 ) -> None:
-    """These four spellings were what the models accepted before this audit, and all four were
-    invented. Accepting them again would let a fixture drift back to a shape the API never sends
-    and take the suite green with it — which is how the bootstrap shipped unable to record either
-    id it creates.
+    """Both spellings were what the model accepted before this audit, and both were invented.
+    Accepting them again would let a fixture drift back to a shape the API never sends and take the
+    suite green with it — which is how the bootstrap shipped unable to record the id it creates.
     """
-    devin_api.responds("POST", url, 201, body)
+    devin_api.responds("POST", KNOWLEDGE_URL, 201, body)
 
     with pytest.raises(DevinResponseError):
-        if url == KNOWLEDGE_URL:
-            await client.create_knowledge_note(name="n", body="b", trigger="t")
-        else:
-            await client.create_schedule(
-                name="sweep", prompt="…", frequency="0 3 * * *", tags=[pb.NAMESPACE_TAG]
-            )
+        await client.create_knowledge_note(name="n", body="b", trigger="t")
 
 
 async def test_an_unavailable_capability_is_logged_with_its_fallback(

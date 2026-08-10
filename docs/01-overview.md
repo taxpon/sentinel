@@ -67,16 +67,17 @@ flowchart LR
     G --> H["Metrics:<br/>MTTR · cost · autonomy rate"]
 ```
 
-The loop is closed on both ends. A scheduled Devin session sweeps for new dependency
-vulnerabilities and files issues, which re-enter the pipeline at step B ([05](./05-devin-integration.md)).
+The loop is closed on both ends. A vulnerability sweep, run on demand, resolves the target's
+dependency trees against OSV and files issues, which re-enter the pipeline at step B
+([05](./05-devin-integration.md#scheduled-sweep)).
 
 ## Scope
 
 **In scope**
 
 - A single target repository: `taxpon/superset` (fork of `apache/superset`).
-- Event sources: GitHub webhooks (issues, pull requests, reviews, check suites) and a scheduled
-  vulnerability sweep.
+- Event sources: GitHub webhooks (issues, pull requests, reviews, check suites) and a vulnerability
+  sweep run on demand.
 - Remediation across **eight distinct issue classes** (see table below) — deliberately varied, so
   the system is not just a dependency bumper.
 - Observability aimed at an engineering leader, not at a dashboard-shaped pile of counters.
