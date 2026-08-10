@@ -134,3 +134,32 @@ real `gh api` call, pasted in with the command that produced it. Then write down
 encodes ("one suite per SHA", "one failing run per commit"); if you cannot name the premise you have
 not found it yet. A fixture containing exactly one of anything deserves a second look, because
 cardinality is where this hides.
+
+## Never rewrite history in a worktree somebody else is reading
+
+Splitting one commit into two meant, for a few minutes, editing the working tree by hand: remove the
+second change, commit the first, restore the second, commit that. A reviewer ran `make ci` in the
+same directory during those minutes and saw two tests fail — the merge feature's own tests, against
+a `_stamp` that did not stamp. They quoted the code and the line numbers, and both were real.
+
+That state existed in **no commit**. `git show <sha>:src/sentinel/api/webhooks.py` was correct at
+every SHA on the branch, before and after the split, and `git diff` between them was empty. What
+they had read was the surgery: the half-second window in which the feature's code was removed and
+its tests were not yet.
+
+It is a nasty failure to receive, because everything about it looks like a genuine defect —
+plausible failures, real line numbers, a coherent explanation — and the reviewer did exactly the
+right thing with what was in front of them. Chasing "why did my run pass and theirs fail" as a test
+bug, or worse "fixing" already-correct code to make the report go away, both lead somewhere wrong.
+
+A related one landed the same hour: a `make ci` here reported 15 failures and 135 errors because the
+Postgres container had been removed underneath it. Same family — shared mutable state between agents
+— and the same tell, a failure count far outside anything the change could explain.
+
+**Rule:** a worktree with another agent in it is shared state. Do history rewrites and multi-step
+file surgery somewhere private — a scratch clone, or a second worktree — and move the finished ref
+across. If it has to happen in place, say so before starting and say when it is done. And on both
+sides: **a failure report about a shared tree must name a SHA**, and be verified with
+`git show <sha>:<path>` or a clean checkout, because "what is in the directory" and "what is in the
+commit" are different questions. Before believing any failure, check the count: one that no diff
+could explain is usually the ground moving, not the code.
