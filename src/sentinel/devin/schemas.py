@@ -81,9 +81,14 @@ _WORKING: Final = frozenset({SessionStatus.CLAIMED, SessionStatus.RUNNING, Sessi
 _TERMINAL: Final = frozenset({SessionStatus.EXIT, SessionStatus.ERROR})
 
 WAITING_FOR_USER: Final = "waiting_for_user"
-"""The `status_detail` that distinguishes a session working from one stalled on a question. A
-session `running` with this detail is how `docs/05-devin-integration.md` says a stall is detected;
-without it `running` covers both, and a stalled session would look busy for ever."""
+"""The `status_detail` that says the session has put a question to a human rather than working.
+Without it, `running` covers both and a session waiting on an answer would look busy for ever.
+
+**It does not say the session is stalled.** Devin sets the same detail when it cannot go on without
+an answer and when it has finished and is offering to do something further, and what tells those
+apart is whether a pull request exists — see `docs/05-devin-integration.md`, which states both
+readings, and `poller.blocked_reason`, which is where the judgement is made and the only place in
+Sentinel that makes it."""
 
 
 class Outcome(StrEnum):
@@ -154,8 +159,18 @@ def pull_request_number(url: str) -> int | None:
 class PullRequest(BaseModel):
     """One entry of `pull_requests[]`, as observed against the live API on 2026-08-10: `pr_url` and
     `pr_state`, and nothing else. `pr_url` is what links the remediation to the pull request and
-    what the dashboard's live table links out to; `pr_state` is not modelled because nothing reads
-    it.
+    what the dashboard's live table links out to.
+
+    **`pr_state` is still not modelled, and that is now load-bearing rather than incidental.** The
+    *existence* of an entry here is what `poller.pull_request_exists` reads, and it decides whether
+    a `waiting_for_user` session is escalated as stuck or read as an offer
+    (`docs/adr/2026-08-10-an-offer-after-the-pull-request-is-not-a-stall.md`). A closed or draft
+    pull request therefore counts the same as an open one. Modelling the field would make that
+    judgement finer and would mean branching on a vocabulary nobody has seen: the live call of
+    2026-08-10 recorded the field's name and type and not its values, and the v3 reference
+    enumerates none (B8). `tasks/lessons.md` records four defects that came from acting on a shape
+    taken second-hand, so the gate stays on entry-existence until a real response says what the
+    values are.
 
     **`url` is not accepted as an alias.** `_unwrap` below tolerates several list envelopes because
     the spec names none and no call had been made — the tolerance stands in for a fact nobody had.
@@ -216,7 +231,10 @@ class Session(BaseModel):
 
     @property
     def waiting_for_user(self) -> bool:
-        """Whether the session is stalled on a question rather than working."""
+        """Whether the session has put a question to a human rather than working.
+
+        Not by itself a stall: see `WAITING_FOR_USER`.
+        """
         return self.status_detail == WAITING_FOR_USER
 
     @property

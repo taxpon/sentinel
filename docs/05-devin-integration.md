@@ -104,10 +104,19 @@ epoch **integers**, and nothing here reads them.
 The observed shape of all of this is in [Response shapes](#response-shapes) below; the entries of
 `pull_requests[]` in particular are `pr_url` and `pr_state`, and carry **no pull request number**.
 
-`status_detail` distinguishes `working` from `waiting_for_user`, which is how a stalled session is
-detected. The reference enumerates fifteen values for it, so it is read as an open string and only
-`waiting_for_user` is branched on — a suspension reason Sentinel does not know about must not fail
-a poll.
+`status_detail` distinguishes `working` from `waiting_for_user`, which is how a session waiting on a
+human is detected. The reference enumerates fifteen values for it, so it is read as an open string
+and only `waiting_for_user` is branched on — a suspension reason Sentinel does not know about must
+not fail a poll.
+
+**`waiting_for_user` is not by itself a stall.** Devin sets it whenever the session has put a
+question to the user, and it ends a session by offering to do something further as readily as it
+raises a blocker mid-task. What the detail means therefore depends on whether the session has
+produced a pull request yet: before one, the session is stuck and the remediation escalates; after
+one, the work asked for has been delivered, the question is about an extra, and the remediation
+carries on through CI and review with the question recorded rather than escalated. The table is in
+[04](./04-state-machine.md#what-waiting_for_user-means) and the reasoning in its
+[ADR](./adr/2026-08-10-an-offer-after-the-pull-request-is-not-a-stall.md).
 
 `status` values the poller maps onto [the state machine](./04-state-machine.md): `new`, `claimed`,
 `running`, `exit`, `error`, `suspended`, `resuming`. That is the whole enum; there is no `blocked`

@@ -330,10 +330,20 @@ says what the API is documented to send, not what it sent. Exactly one call has 
 | `GET /v3/organizations/{org_id}/playbooks` | Verified separately, see [B6](#b6) |
 
 **What the verified call actually established, and what it did not.** Field *names* and *types* were
-recorded; field *values* were not. So the seven `status` values and the `waiting_for_user`
-`status_detail` remain unconfirmed — `status_detail` is a plain string, and whether it ever carries
-`waiting_for_user` has not been seen. `SessionStatus` still rejects an eighth status, which is the
-intended behaviour: an unknown status means our reading of the API is wrong and should fail loudly.
+recorded; field *values* were not. So the seven `status` values remain unconfirmed by that call.
+`SessionStatus` still rejects an eighth status, which is the intended behaviour: an unknown status
+means our reading of the API is wrong and should fail loudly.
+
+**`status_detail: waiting_for_user` is now observed, and it behaves differently from what was
+assumed.** On **2026-08-10** the live re-run of issue #5 produced a session reporting `running` with
+`status_detail: waiting_for_user` — the first time that value has been seen. It arrived *after* the
+session had opened its pull request and reported, because Devin ends a session by offering to do
+something further, and the question is what sets the detail. So the value is confirmed, and the
+reading of it that predated any observation was not: it is not by itself a stall.
+[ADR 2026-08-10](./adr/2026-08-10-an-offer-after-the-pull-request-is-not-a-stall.md) is the decision
+that follows, and it drives production behaviour. Still unseen: the other fourteen `status_detail`
+values the reference enumerates, and `pull_requests[].pr_state`'s vocabulary — the entry's name and
+type were recorded, its value was not, which is why nothing branches on it.
 
 **Two mismatches it found, one of them silent.** `pull_requests[].url` is really `pr_url`, which
 failed the parse outright and would have stalled every remediation holding a pull request. Worse,
