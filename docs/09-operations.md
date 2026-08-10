@@ -484,10 +484,41 @@ Step 5 is not optional. Unresolved and stalled work stays visible by design
 |---|---|---|
 | Webhook deliveries show `401` | Secret mismatch, or a proxy re-encoded the body | Confirm `GITHUB_WEBHOOK_SECRET`; verification runs on raw bytes, so any body rewriting breaks it |
 | Deliveries succeed, nothing happens | Label name mismatch, or the event was mapped to `ignored` | `select event, action, handler_result from webhook_delivery order by id desc limit 10;` |
-| Sessions created but state never advances | Poller is down, or the session is `waiting_for_user` | `docker compose logs poller`; check `status_detail` on the session |
+| Sessions created but state never advances | Poller is down, or the session is `waiting_for_user` **before it has opened a pull request** | `docker compose logs poller`; check `status_detail` on the session. That second cause escalates itself within a poll interval ([04](./04-state-machine.md#what-waiting_for_user-means)), so a remediation still sitting here means the poller is not running |
+| A remediation past `PR_OPENED` stops moving, and nothing is escalated | The session asked something after opening its pull request. That no longer escalates ([ADR](./adr/2026-08-10-an-offer-after-the-pull-request-is-not-a-stall.md)), so **no alarm fires and it appears in no failure breakdown** — usually a harmless offer, occasionally a real stall | The query below, then read the session in the Devin web app. An offer can be ignored; a blocking question has to be answered there, and answering it costs one `human_message_count` |
 | Jobs stuck in `deferred` | Concurrency cap or ACU budget | `select kind, status, count(*) from job group by 1,2;`, then check `acu_ledger` |
 | `422` creating a session | Tag not registered in the organisation vocabulary | This answers [B7](./blockers.md#b7) — record it there. Re-run `make bootstrap-devin` and read step 2's line: if it says the vocabulary was **not** registered, the registration is refused and re-running cannot fix it |
 | Cost panel labelled `derived` | Enterprise metrics endpoint unavailable | Expected without enterprise scope ([B5](./blockers.md)) — the figure is computed locally |
+
+### Remediations that have gone quiet
+
+The one failure this system does not raise for itself. A session that asks a question after opening
+its pull request is not escalated, by design, so the only way to find one that was a real stall is
+to look for remediations that have not moved. Two hours is a starting point, not a threshold
+anything enforces:
+
+```sql
+select r.id, r.issue_number, r.state, r.devin_status, r.pr_url,
+       now() - max(e.created_at) as quiet_for
+from remediation r
+join remediation_event e on e.remediation_id = r.id
+where r.state not in ('MERGED', 'BLOCKED', 'FAILED')
+group by r.id
+having now() - max(e.created_at) > interval '2 hours'
+order by quiet_for desc;
+```
+
+A row whose `devin_status` is `running` and whose log carries a `devin_call` event with
+`detail->>'note' = 'session_question_after_pull_request'` is one the poller saw asking something.
+That event names the fix cycle it was asked on:
+
+```sql
+select remediation_id, detail->>'cycle' as cycle, created_at
+from remediation_event
+where kind = 'devin_call'
+  and detail->>'note' = 'session_question_after_pull_request'
+order by created_at desc;
+```
 
 ## Before making the repository public
 

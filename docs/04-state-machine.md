@@ -162,7 +162,7 @@ want opposite treatment, and **the pull request is what tells them apart**.
 | Stage | What the question is | Treatment |
 |---|---|---|
 | No pull request exists | The session cannot proceed without an answer, and nothing in an unattended pipeline will give it one | `BLOCKED`, `blocked_reason = session_waiting_for_user`, escalated on the first observation |
-| A pull request exists — linked to the remediation, or reported by this very observation | The work asked for has been delivered; what is being asked about is something *further* | Not an escalation. The remediation carries on through CI and review, and the question is recorded once as an observation |
+| A pull request exists — linked to the remediation, or reported by this very observation | Most likely something *further*: the work asked for has been delivered | Not an escalation. The remediation carries on through CI and review, and the question is recorded once per fix cycle as an observation |
 
 Devin ends a session by offering to do something more — run the app end to end, take a related fix —
 and asking sets the same detail as being stuck. Reading the second as the first ends every
@@ -170,14 +170,27 @@ remediation at `BLOCKED` within a minute of its pull request opening, which is w
 issue #5 on the live re-run: `PR_OPENED -> BLOCKED` 41 seconds later, on `cycle: 0`, with no CI
 failure and no review.
 
-The record of the offer is a `remediation_event` of kind `devin_call` carrying
-`note: session_question_after_pull_request`, with `from_state = to_state` because nothing moved. It
-is written **once**: the condition persists — nobody answers the question — and the poller re-reads
-the same session every `POLL_INTERVAL_SECONDS`, so the log itself is what says the note is already
-there ([ADR](./adr/2026-08-10-an-offer-after-the-pull-request-is-not-a-stall.md)).
+**The second row is a proxy, and it is worth being exact about what it tests.** The condition is the
+existence of a pull request, not "the work is finished". From the second fix cycle onwards it also
+covers a session part-way through a fix, which has delivered nothing new and may genuinely be stuck;
+that case is no longer escalated either, and no alarm anywhere replaces it. The
+[ADR](./adr/2026-08-10-an-offer-after-the-pull-request-is-not-a-stall.md) sets out why that trade is
+accepted and what it costs, and [09](./09-operations.md#remediations-that-have-gone-quiet) carries
+the query that is now the only way to find one.
+
+The record of the question is a `remediation_event` of kind `devin_call` carrying
+`note: session_question_after_pull_request` and the `cycle` it was asked on, with
+`from_state = to_state` because nothing moved. It is written **once per fix cycle**: the condition
+persists — nobody answers the question — and the poller re-reads the same session every
+`POLL_INTERVAL_SECONDS`, so the log itself is what says the note is already there. Per cycle rather
+than per remediation because `pr_url` is never cleared, so a single note would swallow a different
+question asked on a later lap. An observation that *escalates* is not annotated at all: the note is
+the alternative to an escalation, not a companion to one.
 
 The other cause of `BLOCKED` is unconditional: `structured_output.outcome == "blocked"` is Devin
-saying outright that it cannot go on, and a pull request does not answer it.
+saying outright that it cannot go on, and a pull request does not answer it. Where a pre-pull-request
+session is both waiting and reporting `blocked`, the waiting reason wins and Devin's own words are
+not what `blocked_reason` records — the escalation is the same, the label is not.
 
 ## The review-fix loop
 

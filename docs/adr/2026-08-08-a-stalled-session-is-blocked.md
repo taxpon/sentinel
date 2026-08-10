@@ -12,6 +12,13 @@ supersedes:
 
 # A session that is running and waiting for a user is blocked, on the first observation
 
+> **Amended 2026-08-10 by
+> [an offer after the pull request is not a stall](./2026-08-10-an-offer-after-the-pull-request-is-not-a-stall.md).**
+> The rule below now applies **only while the session has no pull request**. Everything else stands
+> — the status set, the reasoning for it, and the escalation itself — which is why this record is
+> amended rather than superseded. The last row of
+> [Alternatives considered](#alternatives-considered) is where it went wrong.
+
 ## Context
 
 [`05`](../05-devin-integration.md) reads `status_detail` on every poll because it "distinguishes
@@ -69,6 +76,15 @@ it answers. `claimed`, `resuming`, `suspended` and `exit` with the same detail a
 | Answer the question automatically | Steering Devin line by line is what the prompt design explicitly avoids, and an answer invented by Sentinel would be worse than no answer |
 | A distinct `STALLED` state | A fourth terminal state that escalates identically to `BLOCKED`, differing only in the word. `blocked_reason` already carries the distinction, and the failure-breakdown panel groups on it |
 | Treat any `waiting_for_user` as a stall, whatever the status | Blocks every remediation the moment its session finishes a lap — which is every successful remediation, immediately after its pull request opens |
+
+**That last row saw the failure and named the wrong cause.** "Blocks every remediation … immediately
+after its pull request opens" is precisely what happened on 2026-08-10 — and it happened *inside*
+the narrowed status set, because Devin was `running` while it asked, not `suspended` or `exit`. The
+row attributed the failure to the status set, so narrowing the statuses looked like the answer to
+it. The actual discriminator is the pull request, which is what
+[the 2026-08-10 record](./2026-08-10-an-offer-after-the-pull-request-is-not-a-stall.md) keys on: a
+session that has produced one has delivered what it was asked for, whatever status it reports while
+asking about an extra.
 
 ## Consequences
 
