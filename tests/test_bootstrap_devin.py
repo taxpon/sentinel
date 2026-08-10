@@ -268,6 +268,102 @@ async def test_the_vocabulary_is_registered_again_on_a_second_run(
     }
 
 
+@pytest.mark.parametrize(("status_code", "reason"), [(403, "forbidden"), (404, "not_found")])
+async def test_a_refused_registration_is_reported_and_the_run_goes_on(
+    devin: DevinClient,
+    settings: Settings,
+    env: Any,
+    env_path: Path,
+    wired: FakeAPI,
+    status_code: int,
+    reason: str,
+) -> None:
+    """The organisation the owner ran this against answered `403` to the *read* of its allowed
+    tags, and allowed-tag management is documented as an enterprise feature — so a refused write is
+    an ordinary outcome here, not a fault. Failing on it would cost steps 3 and 4, whose product is
+    the knowledge notes and the nightly sweep, over a step nothing downstream reads: Sentinel
+    depends on *applying* tags to a session, not on the vocabulary being pre-registered."""
+    wired.responds("PUT", TAGS, status_code, {"detail": "no"})
+
+    report = await run(devin, settings, env)
+
+    assert len(wired.sent("POST", NOTES)) == 4
+    assert len(wired.sent("POST", SCHEDULES)) == 1
+    assert env_value(env_path, bootstrap_devin.SCHEDULE_ID) == SCHEDULE
+
+    tags = report.steps["tags"]
+    assert tags.startswith(f"NOT registered — Devin refused the PUT ({reason} ({status_code}))")
+    assert "Steps 3 and 4 continue" in tags
+
+
+@pytest.mark.parametrize("status_code", [403, 404])
+async def test_a_refused_registration_says_b7_is_unresolved_rather_than_fine(
+    devin: DevinClient, settings: Settings, env: Any, wired: FakeAPI, status_code: int
+) -> None:
+    """The one thing an operator must not read as "handled". Nothing replaces the registration, and
+    the question B7 has never been able to answer — whether Devin validates session tags against a
+    registered vocabulary — is now answered by the first `POST /sessions` instead, as a `422`."""
+    out = Out()
+    wired.responds("PUT", TAGS, status_code, {"detail": "no"})
+
+    report = await bootstrap_devin.bootstrap(devin, settings, env=env, out=out)
+
+    for said in (report.steps["tags"], out.text):
+        assert "422" in said
+        assert "POST /sessions" in said
+        assert "ManageEnterpriseSettings" in said
+
+    row = report.capability("tag_vocabulary")
+    assert (row.blocker, row.status) == ("B7", bootstrap_devin.DEGRADED)
+    assert "not registered, and nothing here replaces it" in row.detail
+
+
+@pytest.mark.parametrize(
+    ("status_code", "body", "remedy"),
+    [
+        (401, {"detail": "invalid token"}, "DEVIN_API_TOKEN"),
+        (422, {"detail": "bad tags"}, "docs/05-devin-integration.md"),
+        (500, {"detail": "boom"}, "docs/05-devin-integration.md"),
+    ],
+)
+async def test_a_registration_that_faults_still_fails_the_run(
+    devin: DevinClient,
+    settings: Settings,
+    env: Any,
+    wired: FakeAPI,
+    status_code: int,
+    body: dict[str, str],
+    remedy: str,
+) -> None:
+    """Only `403` and `404` degrade, because only those two are `client.DEGRADES`. A rejected token
+    is a fault to fix rather than a capability to work around, and turning every refusal of this
+    write into a degradation would swallow it — so the run stops at step 2 and creates nothing."""
+    wired.responds("PUT", TAGS, status_code, body)
+
+    with pytest.raises(bootstrap_devin.BootstrapError) as failure:
+        await run(devin, settings, env)
+
+    assert failure.value.step == "step 2 of 4 (tags)"
+    assert str(status_code) in failure.value.problem
+    assert remedy in failure.value.remedy
+    assert wired.sent("POST", NOTES) == [] and wired.sent("POST", SCHEDULES) == []
+
+
+async def test_a_registration_answered_with_something_that_is_not_json_still_fails_the_run(
+    devin: DevinClient, settings: Settings, env: Any, wired: FakeAPI
+) -> None:
+    """A body that will not parse is not an answer either, and it is not one of the two statuses
+    `DEGRADES` recognises — so it fails rather than being reported as a capability we lack."""
+    wired.route("PUT", TAGS).mock(return_value=httpx.Response(200, text="<html>nope</html>"))
+
+    with pytest.raises(bootstrap_devin.BootstrapError) as failure:
+        await run(devin, settings, env)
+
+    assert failure.value.step == "step 2 of 4 (tags)"
+    assert "not JSON" in failure.value.problem
+    assert wired.sent("POST", NOTES) == []
+
+
 # --- Step 3: the knowledge notes -----------------------------------------------------------------
 
 
@@ -530,7 +626,7 @@ async def test_a_dry_run_says_when_the_registration_would_remove_nothing(
 
 
 @pytest.mark.parametrize(("status_code", "reason"), [(403, "forbidden"), (404, "not_found")])
-async def test_a_vocabulary_that_cannot_be_read_is_reported_as_removals_nobody_can_name(
+async def test_a_refused_read_previews_a_write_that_is_likely_to_be_refused_too(
     devin: DevinClient,
     settings: Settings,
     env: Any,
@@ -538,10 +634,11 @@ async def test_a_vocabulary_that_cannot_be_read_is_reported_as_removals_nobody_c
     status_code: int,
     reason: str,
 ) -> None:
-    """The likely answer, since the documented permission is `ManageEnterpriseSettings`. Silence
-    here would be worse than no preview at all: the `PUT` still replaces the whole set, so what the
-    run cannot name is exactly what it would destroy. It is a refusal, so the preview still exits
-    0 and still previews the other three steps."""
+    """The answer the owner's own run got. The read and the write want the same enterprise
+    permission, so a refused read is evidence about step 2 and not merely a gap in the preview:
+    promising a replacement that will not happen would be worse than saying nothing. It stays a
+    refusal, so the preview exits 0 and still previews the other three steps — and it still says
+    what an accepted `PUT` would destroy, because that outcome is not ruled out."""
     devin_api.responds("GET", SESSIONS, 200, {"items": []})
     devin_api.responds("GET", CONSUMPTION, 200, a_consumption_body())
     devin_api.responds("GET", ALLOWED_TAGS, status_code, {"detail": "no"})
@@ -549,7 +646,8 @@ async def test_a_vocabulary_that_cannot_be_read_is_reported_as_removals_nobody_c
     report = await preview(devin, settings, env)
 
     tags = report.steps["tags"]
-    assert f"could not be read ({reason} ({status_code}))" in tags
+    assert f"likely to be refused as this read was ({reason} ({status_code}))" in tags
+    assert "NOT registered and B7 unresolved" in tags
     assert "may remove tags nothing here can name" in tags
     for tag in bootstrap_devin.VOCABULARY:
         assert tag in tags
@@ -557,6 +655,7 @@ async def test_a_vocabulary_that_cannot_be_read_is_reported_as_removals_nobody_c
     row = report.capability(Capability.TAG_DISCOVERY.value)
     assert row.status == bootstrap_devin.DEGRADED
     assert Capability.TAG_DISCOVERY.fallback in row.detail
+    assert "the write likely would be too" in report.capability("tag_vocabulary").detail
     assert "would create 4 note(s)" in report.steps["knowledge"]
 
 
@@ -804,15 +903,19 @@ async def test_the_failure_report_names_the_step_the_answer_and_the_remedy(
     devin: DevinClient, settings: Settings, env: Any, devin_api: FakeAPI
 ) -> None:
     """An operator at a terminal needs to know which step stopped and what to do; a traceback says
-    neither. The token must not appear anywhere in it."""
+    neither. The token must not appear anywhere in it.
+
+    On step 3 rather than step 2, because a `403` on step 2 is a refusal the run reports and
+    continues past — this is the same status where it is still a fault."""
     devin_api.responds("GET", SESSIONS, 200, {"items": []})
-    devin_api.responds("PUT", TAGS, 403, {"detail": "missing ManageOrgSessions"})
+    devin_api.responds("PUT", TAGS, 200, {})
+    devin_api.responds("POST", NOTES, 403, {"detail": "missing ManageOrgSessions"})
 
     with pytest.raises(bootstrap_devin.BootstrapError) as failure:
         await run(devin, settings, env)
 
     report = failure.value.report()
-    assert "step 2 of 4 (tags)" in report
+    assert "step 3 of 4 (knowledge)" in report
     assert "403" in report and "missing ManageOrgSessions" in report
     assert "ManageOrgSessions at the organisation level" in report.replace("`", "")
     assert "what to do:" in report
