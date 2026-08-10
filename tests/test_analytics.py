@@ -334,9 +334,7 @@ async def test_the_window_owns_its_first_instant_and_not_its_last(session: Async
     ]
 
 
-async def test_a_merge_after_an_escalation_still_counts_as_merged(
-    session: AsyncSession, settings: Settings
-) -> None:
+async def test_a_merge_after_an_escalation_still_counts_as_merged(session: AsyncSession) -> None:
     """The funnel counts merges from `merged_at`, not from `state`, and this is the case that makes
     the difference load-bearing rather than incidental.
 
@@ -363,7 +361,7 @@ async def test_a_merge_after_an_escalation_still_counts_as_merged(
         ),
     )
 
-    payload = await summarise(session, settings)
+    payload = await summarise(session)
 
     assert payload["funnel"]["merged"] == 1
     assert payload["funnel"]["pr_opened"] == 1
