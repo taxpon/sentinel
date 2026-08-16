@@ -8,9 +8,6 @@
 # There is deliberately no top-level `name:` — Compose already defaults the project name to the
 # directory, and older versions do not interpolate that field, which silently produces a project
 # literally called "compose_project_name-sentinel".
-#
-# `api`, `worker` and `poller` run commands that only exist once T26 has landed. Until then `make db`
-# is the useful target; `make up` will crash-loop those three services.
 
 x-app: &app
   build: .

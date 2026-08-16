@@ -62,15 +62,26 @@ The full reasoning, and what was rejected, is in [`docs/adr/`](./docs/adr/index.
 
 ## Quick start
 
-Requires Docker with Compose, and Node 20+ if you want to build the dashboard.
+Two paths, with different prerequisites. **Running the stack needs Docker with Compose and nothing
+else** — the image installs its own Python environment and builds the dashboard bundle, so the host
+needs no Python and no Node. Running the test suite locally needs
+[`uv`](https://docs.astral.sh/uv/), which fetches the right Python itself; Node 20+ matters only if
+you develop the dashboard outside Docker.
 
 ```bash
-cp .env.example .env      # then fill in the four required credentials
-make install              # uv sync
+# Run it — Docker only
+cp .env.example .env      # fill in the four credentials and DEVIN_PLAYBOOK_IDS
 make db                   # start Postgres and wait for it
+make migrate              # apply the schema
+make up                   # api, worker, poller — and the dashboard at /
+curl -s localhost:8000/healthz        # pipe through `jq` if you have it
+```
+
+```bash
+# Test and develop — requires uv, no credentials
+make install              # uv sync
+make db                   # the tests need Postgres; Devin and GitHub they fake
 make ci                   # lint, type-check, and the full test suite
-make up                   # api, worker, poller
-curl -s localhost:8000/healthz | jq
 ```
 
 `make ci` migrates the test database itself. `make migrate` is for the one `make up` serves.
@@ -80,11 +91,13 @@ passes with no credentials at all. Running it in a second checkout at the same t
 `POSTGRES_PORT` and `COMPOSE_PROJECT_NAME`: two runs sharing one database deadlock each other.
 
 Configuration is environment variables only; `.env.example` is the canonical list and
-[`docs/09-operations.md#configuration`](./docs/09-operations.md) explains each one. Four are
-required — a Devin token and organisation id, a GitHub fine-grained PAT, and the webhook secret.
+[`docs/09-operations.md#configuration`](./docs/09-operations.md) explains each one. Five are
+required — a Devin token and organisation id, a GitHub fine-grained PAT, the webhook secret, and
+`DEVIN_PLAYBOOK_IDS`, which `make devin-playbooks` prints ready to paste.
 
 Pointing it at a repository for the first time — enabling issues on the fork, creating the label
-set, registering the webhook, seeding Devin playbooks and knowledge notes — is scripted:
+set, registering the webhook, seeding Devin playbooks and knowledge notes — is scripted. These
+scripts run on the host and need `uv`, unlike the stack itself:
 
 ```bash
 make bootstrap            # both halves; each is idempotent and re-runnable
