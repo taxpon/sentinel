@@ -62,15 +62,26 @@ The full reasoning, and what was rejected, is in [`docs/adr/`](./docs/adr/index.
 
 ## Quick start
 
-Requires Docker with Compose, and Node 20+ if you want to build the dashboard.
+Two paths, with different prerequisites. **Running the stack needs Docker with Compose and nothing
+else** — the image installs its own Python environment and builds the dashboard bundle, so the host
+needs no Python and no Node. Running the test suite locally needs
+[`uv`](https://docs.astral.sh/uv/), which fetches the right Python itself; Node 20+ matters only if
+you develop the dashboard outside Docker.
 
 ```bash
+# Run it — Docker only
 cp .env.example .env      # then fill in the four required credentials
-make install              # uv sync
 make db                   # start Postgres and wait for it
+make migrate              # apply the schema
+make up                   # api, worker, poller — and the dashboard at /
+curl -s localhost:8000/healthz        # pipe through `jq` if you have it
+```
+
+```bash
+# Test and develop — requires uv, no credentials
+make install              # uv sync
+make db                   # the tests need Postgres; Devin and GitHub they fake
 make ci                   # lint, type-check, and the full test suite
-make up                   # api, worker, poller
-curl -s localhost:8000/healthz | jq
 ```
 
 `make ci` migrates the test database itself. `make migrate` is for the one `make up` serves.
