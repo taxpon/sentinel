@@ -13,6 +13,7 @@ CLAUDE.local.md
 .env
 .env.*
 !.env.example
+.envrc
 
 # Python
 __pycache__/

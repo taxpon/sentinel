@@ -1,72 +1,39 @@
-# Fly.io deployment. See docs/09-operations.md#deployment-flyio for what to set and in what order.
+# fly.toml app configuration file generated for sentinel-alpha on 2026-08-10T16:52:40+09:00
 #
-# This file has not been checked by flyctl — it is not installed on the machine it was written on.
-# Run `fly config validate` before the first `fly deploy`; a key this schema no longer has is a
-# deploy that stops rather than one that misbehaves.
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
-# The app name is global across Fly, and it decides the hostname: `sentinel.fly.dev` here. Change
-# it if it is taken, and register the webhook against whatever it becomes.
-app = "sentinel"
 
-# The nearest region to the operator. It should match the region the database is created in —
-# the poller and the worker talk to Postgres constantly, and a cross-region hop is on every query.
-primary_region = "nrt"
+app = 'sentinel-alpha'
+primary_region = 'nrt'
 
 [build]
-  # The same image Compose builds, and the same one the three processes below share.
-  dockerfile = "Dockerfile"
-
-# `api`, `worker` and `poller` differ only by command, exactly as in docker-compose.yml. Naming
-# them here replaces the image's CMD, and each name becomes its own group of machines.
-[processes]
-  api = "uvicorn sentinel.api.main:app --host 0.0.0.0 --port 8000"
-  worker = "python -m sentinel worker"
-  poller = "python -m sentinel poller"
+  dockerfile = 'Dockerfile'
 
 [deploy]
-  # Run before the new machines start, on one temporary machine with the app's secrets. A failure
-  # here aborts the deploy, so the schema is never behind the code that expects it.
-  release_command = "alembic upgrade head"
+  release_command = 'alembic upgrade head'
+
+[processes]
+  api = 'uvicorn sentinel.api.main:app --host 0.0.0.0 --port 8000'
+  poller = 'python -m sentinel poller'
+  worker = 'python -m sentinel worker'
 
 [http_service]
   internal_port = 8000
   force_https = true
-  # Only the api process is behind the proxy. The worker and the poller have no listener; they are
-  # not in this list, so nothing routes to them.
-  processes = ["api"]
-
-  # `fly launch` writes `auto_stop_machines = "stop"` and `min_machines_running = 0`, and both are
-  # wrong here.
-  #
-  # For `api`, a stopped machine is started by the proxy on the next request — but the request that
-  # pays for the cold start is a GitHub webhook delivery, which has its own timeout, and a delivery
-  # that times out is a remediation that never begins. Keeping one machine up removes that from the
-  # demo path entirely.
-  #
-  # It also keeps the setting off the `poller`, which is the process that cannot survive being
-  # stopped: it is the only thing that advances a remediation's state (Devin has no outbound
-  # webhook — docs/blockers.md B4), and a Devin session runs for tens of minutes with no inbound
-  # traffic at all. A stopped poller does not fail; every in-flight remediation simply freezes.
-  #
-  # UNVERIFIED: as read, these two keys belong to this service and so govern only `api`'s machines,
-  # and a process group behind no service is never a candidate for autostop in the first place —
-  # which would make the poller safe either way. That has not been checked against a running Fly
-  # app. Written to be correct under either reading.
-  auto_stop_machines = "off"
+  auto_stop_machines = 'off'
   auto_start_machines = true
   min_machines_running = 1
+  processes = ['api']
 
   [[http_service.checks]]
-    # /healthz checks the database round trip, so a machine that cannot reach Postgres is reported
-    # unhealthy instead of returning 500s. `grace_period` covers uvicorn's startup.
-    path = "/healthz"
-    method = "GET"
-    interval = "15s"
-    timeout = "5s"
-    grace_period = "20s"
+    interval = '15s'
+    timeout = '5s'
+    grace_period = '20s'
+    method = 'GET'
+    path = '/healthz'
 
-# One size for all three groups. 256MB is the platform default and is tight for SQLAlchemy plus
-# asyncpg plus uvicorn; an OOM here reads as an unexplained restart loop.
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "512mb"
+  size = 'shared-cpu-1x'
+  memory = '512mb'
+  cpus = 1
+  memory_mb = 512
