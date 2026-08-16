@@ -70,7 +70,7 @@ you develop the dashboard outside Docker.
 
 ```bash
 # Run it — Docker only
-cp .env.example .env      # then fill in the four required credentials
+cp .env.example .env      # fill in the four credentials and DEVIN_PLAYBOOK_IDS
 make db                   # start Postgres and wait for it
 make migrate              # apply the schema
 make up                   # api, worker, poller — and the dashboard at /
@@ -91,11 +91,13 @@ passes with no credentials at all. Running it in a second checkout at the same t
 `POSTGRES_PORT` and `COMPOSE_PROJECT_NAME`: two runs sharing one database deadlock each other.
 
 Configuration is environment variables only; `.env.example` is the canonical list and
-[`docs/09-operations.md#configuration`](./docs/09-operations.md) explains each one. Four are
-required — a Devin token and organisation id, a GitHub fine-grained PAT, and the webhook secret.
+[`docs/09-operations.md#configuration`](./docs/09-operations.md) explains each one. Five are
+required — a Devin token and organisation id, a GitHub fine-grained PAT, the webhook secret, and
+`DEVIN_PLAYBOOK_IDS`, which `make devin-playbooks` prints ready to paste.
 
 Pointing it at a repository for the first time — enabling issues on the fork, creating the label
-set, registering the webhook, seeding Devin playbooks and knowledge notes — is scripted:
+set, registering the webhook, seeding Devin playbooks and knowledge notes — is scripted. These
+scripts run on the host and need `uv`, unlike the stack itself:
 
 ```bash
 make bootstrap            # both halves; each is idempotent and re-runnable
